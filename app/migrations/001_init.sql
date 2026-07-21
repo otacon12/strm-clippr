@@ -1,5 +1,5 @@
 -- 001_init.sql — M0 schema: vods, poison_regions, beats, transcript_segments
-CREATE TABLE vods (
+CREATE TABLE IF NOT EXISTS vods (
  id INTEGER PRIMARY KEY,
  path TEXT NOT NULL UNIQUE,
  session_label TEXT NOT NULL, -- e.g. '2026-07-20' — groups multi-segment days
@@ -9,7 +9,7 @@ CREATE TABLE vods (
  CHECK (state IN ('ingested','transcribed','detected','done'))
 );
 
-CREATE TABLE poison_regions (
+CREATE TABLE IF NOT EXISTS poison_regions (
  id INTEGER PRIMARY KEY,
  vod_id INTEGER NOT NULL REFERENCES vods(id),
  start_s REAL NOT NULL,
@@ -18,14 +18,14 @@ CREATE TABLE poison_regions (
  reason TEXT NOT NULL
 );
 
-CREATE TABLE beats (
+CREATE TABLE IF NOT EXISTS beats (
  id INTEGER PRIMARY KEY,
  vod_id INTEGER REFERENCES vods(id),
  ts_utc TEXT NOT NULL, -- when the beat was marked, ISO8601
  note TEXT
 );
 
-CREATE TABLE transcript_segments (
+CREATE TABLE IF NOT EXISTS transcript_segments (
  id INTEGER PRIMARY KEY,
  vod_id INTEGER NOT NULL REFERENCES vods(id),
  start_s REAL NOT NULL,
