@@ -68,6 +68,7 @@ def main() -> int:
     inserted = 0
     skipped_recent = 0
     existing = 0
+    failed = 0
 
     with sqlite3.connect(db_path) as conn:
         conn.execute('PRAGMA foreign_keys = ON;')
@@ -79,41 +80,46 @@ def main() -> int:
                 if not p.is_file() or p.suffix.lower() not in VIDEO_EXTS:
                     continue
 
-                mtime_epoch = p.stat().st_mtime
-                age_seconds = now_epoch - mtime_epoch
-                if age_seconds < MIN_AGE_SECONDS:
-                    skipped_recent += 1
-                    print(f'SKIP_RECENT file="{p.name}" age_seconds={age_seconds:.1f} reason="modified <30m"')
-                    continue
+                try:
+                    mtime_epoch = p.stat().st_mtime
+                    age_seconds = now_epoch - mtime_epoch
+                    if age_seconds < MIN_AGE_SECONDS:
+                        skipped_recent += 1
+                        print(f'SKIP_RECENT file="{p.name}" age_seconds={age_seconds:.1f} reason="modified <30m"')
+                        continue
 
-                session_label = parse_session_label(p.name)
-                duration_raw = probe_duration_seconds(p)
-                duration_s = float(duration_raw)
-                ingested_at = utc_now_iso()
+                    session_label = parse_session_label(p.name)
+                    duration_raw = probe_duration_seconds(p)
+                    duration_s = float(duration_raw)
+                    ingested_at = utc_now_iso()
 
-                cur = conn.execute(
-                    '''
-                    INSERT OR IGNORE INTO vods(path, session_label, duration_s, ingested_at, state)
-                    VALUES (?, ?, ?, ?, 'ingested')
-                    ''',
-                    (str(p), session_label, duration_s, ingested_at),
-                )
-
-                vod_id_row = conn.execute('SELECT id FROM vods WHERE path = ?', (str(p),)).fetchone()
-                vod_id = vod_id_row[0] if vod_id_row else None
-
-                if cur.rowcount == 1:
-                    inserted += 1
-                    print(
-                        'INGESTED '
-                        f'id={vod_id} '
-                        f'path="{p}" '
-                        f'session_label="{session_label}" '
-                        f'duration_s={duration_s}'
+                    cur = conn.execute(
+                        '''
+                        INSERT OR IGNORE INTO vods(path, session_label, duration_s, ingested_at, state)
+                        VALUES (?, ?, ?, ?, 'ingested')
+                        ''',
+                        (str(p), session_label, duration_s, ingested_at),
                     )
-                else:
-                    existing += 1
-                    print(f'ALREADY_EXISTS id={vod_id} path="{p}"')
+
+                    vod_id_row = conn.execute('SELECT id FROM vods WHERE path = ?', (str(p),)).fetchone()
+                    vod_id = vod_id_row[0] if vod_id_row else None
+
+                    if cur.rowcount == 1:
+                        inserted += 1
+                        print(
+                            'INGESTED '
+                            f'id={vod_id} '
+                            f'path="{p}" '
+                            f'session_label="{session_label}" '
+                            f'duration_s={duration_s}'
+                        )
+                    else:
+                        existing += 1
+                        print(f'ALREADY_EXISTS id={vod_id} path="{p}"')
+                except Exception as exc:
+                    failed += 1
+                    print(f'FILE_FAILED path="{p}" reason="{exc}"')
+                    continue
 
             conn.commit()
         except Exception:
@@ -125,7 +131,7 @@ def main() -> int:
         for r in rows:
             print(f'VODS_ROW {r}')
 
-    print(f'RESULT ingest_vods ok=1 inserted={inserted} existing={existing} skipped_recent={skipped_recent} db_path="{db_path}"')
+    print(f'RESULT ingest_vods ok=1 inserted={inserted} existing={existing} skipped_recent={skipped_recent} failed={failed} db_path="{db_path}"')
     return 0
 
 
