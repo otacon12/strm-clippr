@@ -84,6 +84,7 @@ def transcribe(vod_id: int) -> int:
                 '-f', str(wav_path),
                 '-oj',
                 '-of', str(tmp_base),
+                '-ng',
             ]
             started = time.monotonic()
             whisper_proc = run_capture(whisper_cmd)
