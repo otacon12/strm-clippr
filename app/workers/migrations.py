@@ -39,7 +39,11 @@ def _run_statement(conn: sqlite3.Connection, statement: str) -> None:
 
 
 def apply_migrations(conn: sqlite3.Connection, migrations_dir: Path) -> None:
-    """Apply all .sql migrations in sorted filename order."""
+    """Apply all .sql migrations in sorted filename order.
+
+    Re-runnable by design. ALTER TABLE .. ADD COLUMN is guarded against
+    duplicate-column reruns.
+    """
     for path in sorted(migrations_dir.glob('*.sql')):
         sql = path.read_text(encoding='utf-8')
         for stmt in sql.split(';'):
