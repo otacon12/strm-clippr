@@ -11,6 +11,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from migrations import apply_migrations
+except ModuleNotFoundError:
+    from .migrations import apply_migrations
+
 VIDEO_ROOT = Path('/Volumes/GOLDMINE/vibecoder-recordings/')
 VIDEO_EXTS = {'.mov', '.mp4', '.mkv'}
 MIN_AGE_SECONDS = 30 * 60
@@ -25,9 +30,8 @@ def get_db_path() -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    schema_path = Path(__file__).resolve().parent.parent / 'migrations' / '001_init.sql'
-    sql = schema_path.read_text(encoding='utf-8')
-    conn.executescript(sql)
+    migrations_dir = Path(__file__).resolve().parent.parent / 'migrations'
+    apply_migrations(conn, migrations_dir)
 
 
 def parse_session_label(filename: str) -> str:
