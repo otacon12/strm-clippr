@@ -13,6 +13,7 @@
       --muted: #9aa6b2;
       --ok: #2ea043;
       --bad: #f85149;
+      --maybe: #d29922;
       --accent: #58a6ff;
     }
     html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; }
@@ -31,9 +32,13 @@
     .empty { padding: 12px; color: var(--muted); }
     .card { border: 1px solid #2d333b; border-radius: 10px; background: var(--panel); padding: 12px; }
     .actions { display: flex; gap: 8px; margin: 10px 0 12px; }
+    .tabs { display: flex; gap: 8px; margin-top: 8px; }
     button { border: 0; padding: 8px 12px; border-radius: 8px; color: white; cursor: pointer; font-weight: 600; }
     .approve { background: var(--ok); }
     .reject { background: var(--bad); }
+    .maybe { background: var(--maybe); }
+    .tab { background: #2d333b; color: var(--text); border: 1px solid #3d444d; }
+    .tab.active { background: var(--accent); border-color: var(--accent); color: #061326; }
     .hint { color: var(--muted); font-size: 12px; }
     video { width: 100%; max-height: 65vh; background: #000; border-radius: 8px; }
     pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; color: var(--muted); }
@@ -43,8 +48,12 @@
   <div class="wrap">
     <aside class="left">
       <div class="head">
-        <h1 class="title">Pending candidates</h1>
-        <div class="kbd">Keys: j/k or arrows = move | a = approve | r = reject</div>
+        <h1 id="queueTitle" class="title">Pending candidates</h1>
+        <div class="tabs">
+          <button id="tabPending" class="tab active">Pending</button>
+          <button id="tabMaybe" class="tab">Maybe</button>
+        </div>
+        <div class="kbd">Keys: j/k or arrows = move | a = approve | r = reject | m = maybe (Pending only)</div>
       </div>
       <div id="list" class="list"></div>
     </aside>
@@ -59,9 +68,13 @@
   <script>
     let candidates = [];
     let idx = 0;
+    let view = 'pending';
 
     const listEl = document.getElementById('list');
     const detailEl = document.getElementById('detail');
+    const queueTitleEl = document.getElementById('queueTitle');
+    const tabPendingEl = document.getElementById('tabPending');
+    const tabMaybeEl = document.getElementById('tabMaybe');
 
     function fmt(v, n = 3) {
       if (v === null || v === undefined) return 'null';
@@ -69,19 +82,34 @@
       return String(v);
     }
 
+    function endpointForView() {
+      return view === 'maybe' ? '/api/candidates/maybe' : '/api/candidates';
+    }
+
+    function titleForView() {
+      return view === 'maybe' ? 'Maybe candidates' : 'Pending candidates';
+    }
+
     async function loadCandidates() {
-      const res = await fetch('/api/candidates', { cache: 'no-store' });
+      const res = await fetch(endpointForView(), { cache: 'no-store' });
       const data = await res.json();
       candidates = Array.isArray(data) ? data : [];
       if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
+      renderTabs();
       renderList();
       renderDetail();
+    }
+
+    function renderTabs() {
+      queueTitleEl.textContent = titleForView();
+      tabPendingEl.classList.toggle('active', view === 'pending');
+      tabMaybeEl.classList.toggle('active', view === 'maybe');
     }
 
     function renderList() {
       listEl.innerHTML = '';
       if (!candidates.length) {
-        listEl.innerHTML = '<div class="empty">No pending candidates.</div>';
+        listEl.innerHTML = `<div class="empty">No ${view === 'maybe' ? 'maybe' : 'pending'} candidates.</div>`;
         return;
       }
       candidates.forEach((c, i) => {
@@ -102,7 +130,7 @@
 
     function renderDetail() {
       if (!candidates.length) {
-        detailEl.innerHTML = '<div class="empty">No pending candidates.</div>';
+        detailEl.innerHTML = `<div class="empty">No ${view === 'maybe' ? 'maybe' : 'pending'} candidates.</div>`;
         return;
       }
       const c = candidates[idx];
@@ -114,12 +142,15 @@
         <div class="actions">
           <button class="approve" id="btnApprove">Approve (a)</button>
           <button class="reject" id="btnReject">Reject (r)</button>
+          ${view === 'pending' ? '<button class="maybe" id="btnMaybe">Maybe (m)</button>' : ''}
         </div>
         <video controls preload="metadata" src="${videoSrc}"></video>
         <pre>score=${fmt(c.score)}\naudio=${fmt(c.signal_audio)} transcript=${fmt(c.signal_transcript)} chat=${fmt(c.signal_chat)} beat_boost=${fmt(c.signal_beat_boost)}\ncreated_at=${c.created_at}</pre>
       `;
       document.getElementById('btnApprove').onclick = () => decide('approve');
       document.getElementById('btnReject').onclick = () => decide('reject');
+      const maybeBtn = document.getElementById('btnMaybe');
+      if (maybeBtn) maybeBtn.onclick = () => decide('maybe');
     }
 
     async function decide(action) {
@@ -145,6 +176,18 @@
       renderDetail();
     }
 
+    function switchView(nextView) {
+      if (view === nextView) return;
+      view = nextView;
+      idx = 0;
+      loadCandidates().catch((err) => {
+        detailEl.innerHTML = `<pre>Failed to load candidates: ${String(err)}</pre>`;
+      });
+    }
+
+    tabPendingEl.onclick = () => switchView('pending');
+    tabMaybeEl.onclick = () => switchView('maybe');
+
     document.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowDown' || e.key === 'j') {
         e.preventDefault();
@@ -158,6 +201,9 @@
       } else if (e.key === 'r') {
         e.preventDefault();
         decide('reject');
+      } else if (e.key === 'm' && view === 'pending') {
+        e.preventDefault();
+        decide('maybe');
       }
     });
 

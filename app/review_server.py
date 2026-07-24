@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 HOST = '127.0.0.1'
 PORT = 8737
 UI_PATH = Path(__file__).resolve().parent / 'review_ui.html'
-POST_ACTION_RE = re.compile(r'^/api/candidates/(\d+)/(approve|reject)$')
+POST_ACTION_RE = re.compile(r'^/api/candidates/(\d+)/(approve|reject|maybe)$')
 
 
 def get_db_path() -> str:
@@ -94,7 +94,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_candidates(self) -> None:
+    def _serve_candidates(self, state: str = 'candidate') -> None:
         with db_connect() as conn:
             rows = conn.execute(
                 '''
@@ -113,9 +113,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                   c.created_at
                 FROM candidates c
                 JOIN vods v ON v.id = c.vod_id
-                WHERE c.state = 'candidate'
+                WHERE c.state = ?
                 ORDER BY c.score DESC, c.id ASC
-                '''
+                ''',
+                (state,),
             ).fetchall()
         self._send_json(HTTPStatus.OK, [dict(r) for r in rows])
 
@@ -203,13 +204,19 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def _transition_candidate(self, candidate_id: int, target_state: str) -> None:
+        allowed = {
+            'candidate': {'approved', 'rejected', 'maybe'},
+            'maybe': {'approved', 'rejected'},
+        }
+
         with db_connect() as conn:
             row = conn.execute('SELECT state FROM candidates WHERE id = ?', (candidate_id,)).fetchone()
             if not row:
                 self._send_json(HTTPStatus.NOT_FOUND, {'error': f'candidate not found: {candidate_id}'})
                 return
             current_state = str(row['state'])
-            if current_state != 'candidate':
+            allowed_targets = allowed.get(current_state, set())
+            if target_state not in allowed_targets:
                 self._send_json(
                     HTTPStatus.CONFLICT,
                     {
@@ -241,7 +248,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._serve_ui()
             return
         if path == '/api/candidates':
-            self._serve_candidates()
+            self._serve_candidates('candidate')
+            return
+        if path == '/api/candidates/maybe':
+            self._serve_candidates('maybe')
             return
         if path.startswith('/media/'):
             self._serve_media(path.split('/media/', 1)[1])
@@ -258,7 +268,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         candidate_id = int(m.group(1))
         action = m.group(2)
-        target_state = 'approved' if action == 'approve' else 'rejected'
+        if action == 'approve':
+            target_state = 'approved'
+        elif action == 'reject':
+            target_state = 'rejected'
+        else:
+            target_state = 'maybe'
 
         content_len = int(self.headers.get('Content-Length', '0') or '0')
         if content_len > 0:
