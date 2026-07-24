@@ -12,6 +12,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def get_db_path() -> str:
@@ -22,12 +23,19 @@ def parse_obs_filename_start_utc(path_value: str) -> dt.datetime:
     name = Path(path_value).name
     stem = Path(name).stem
     try:
-        base = dt.datetime.strptime(stem, '%Y-%m-%d %H-%M-%S')
+        base_local_naive = dt.datetime.strptime(stem, '%Y-%m-%d %H-%M-%S')
     except ValueError as exc:
         raise RuntimeError(
             f'vod filename does not match expected OBS pattern YYYY-MM-DD HH-MM-SS.ext: {name}'
         ) from exc
-    return base.replace(tzinfo=dt.timezone.utc)
+
+    try:
+        pacific = ZoneInfo('America/Los_Angeles')
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError('zoneinfo lookup failed for America/Los_Angeles') from exc
+
+    local_dt = base_local_naive.replace(tzinfo=pacific)
+    return local_dt.astimezone(dt.timezone.utc)
 
 
 def parse_iso_utc(s: str) -> dt.datetime:
