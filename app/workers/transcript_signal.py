@@ -143,8 +143,8 @@ def extract_json_payload(raw: str) -> str:
 
 
 def call_claude_structured(prompt: str) -> dict:
-    api_key = require_env('ANTHROPIC_API_KEY')
-    model = os.environ.get('ANTHROPIC_MODEL', 'claude-3-5-haiku-latest').strip() or 'claude-3-5-haiku-latest'
+    api_key = require_env('OPENROUTER_API_KEY')
+    model = os.environ.get('OPENROUTER_MODEL', 'anthropic/claude-haiku-4.5').strip() or 'anthropic/claude-haiku-4.5'
 
     body = {
         'model': model,
@@ -159,9 +159,8 @@ def call_claude_structured(prompt: str) -> dict:
     }
 
     cmd = [
-        'curl', '-sS', 'https://api.anthropic.com/v1/messages',
-        '-H', f'x-api-key: {api_key}',
-        '-H', 'anthropic-version: 2023-06-01',
+        'curl', '-sS', 'https://openrouter.ai/api/v1/chat/completions',
+        '-H', f'Authorization: Bearer {api_key}',
         '-H', 'content-type: application/json',
         '-d', json.dumps(body),
     ]
@@ -175,9 +174,11 @@ def call_claude_structured(prompt: str) -> dict:
     if 'error' in resp:
         raise RuntimeError(f'LLM API error: {resp["error"]}')
 
-    content = resp.get('content') or []
-    text_parts = [c.get('text', '') for c in content if c.get('type') == 'text']
-    raw_text = '\n'.join(text_parts).strip()
+    choices = resp.get('choices') or []
+    if not choices:
+        raise RuntimeError('LLM response missing choices')
+    message = (choices[0] or {}).get('message') or {}
+    raw_text = str(message.get('content') or '').strip()
     if not raw_text:
         raise RuntimeError('LLM returned no text content')
 
@@ -223,12 +224,12 @@ def detect_transcript_categories(chunks: list[list[Segment]], duration_s: float)
     for idx, chunk in enumerate(chunks, start=1):
         transcript_text = build_transcript_payload(chunk)
         prompt = (
-            'You are labeling transcript moments for clip candidacy.\\n'
-            'Allowed categories only: funny, inspirational, educational, showing-AI-off, context.\\n'
-            'Return JSON only with shape: {"candidates":[{"start_s":number,"end_s":number,"category":string,"reason":string,"confidence":number}]}.\\n'
-            'Rules: use only evidence present in transcript lines, do not invent quotes or timestamps, confidence 0.0-1.0.\\n'
-            f'Chunk index: {idx} of {len(chunks)}.\\n'
-            f'Transcript chunk:\\n{transcript_text}'
+            'You are labeling transcript moments for clip candidacy.\n'
+            'Allowed categories only: funny, inspirational, educational, showing-AI-off, context.\n'
+            'Return JSON only with shape: {"candidates":[{"start_s":number,"end_s":number,"category":string,"reason":string,"confidence":number}]}.\n'
+            'Rules: use only evidence present in transcript lines, do not invent quotes or timestamps, confidence 0.0-1.0.\n'
+            f'Chunk index: {idx} of {len(chunks)}.\n'
+            f'Transcript chunk:\n{transcript_text}'
         )
 
         data = call_claude_structured(prompt)
@@ -296,12 +297,12 @@ def detect_zebra_boundaries(
 
         if transcript_text.strip() != '':
             prompt = (
-                'Operator flagged a clip-worthy moment via trigger word at END of this window.\\n'
-                'Find where this specific story/topic/bit actually began.\\n'
-                'Return JSON only: {"start_s":number,"confidence":number,"reason":string}.\\n'
-                'Rules: choose a start inside the provided window; do not invent text or timestamps.\\n'
-                f'Window start={outer_start:.3f} end={outer_end:.3f} trigger_offset={trigger_offset:.3f}.\\n'
-                f'Transcript slice:\\n{transcript_text}'
+                'Operator flagged a clip-worthy moment via trigger word at END of this window.\n'
+                'Find where this specific story/topic/bit actually began.\n'
+                'Return JSON only: {"start_s":number,"confidence":number,"reason":string}.\n'
+                'Rules: choose a start inside the provided window; do not invent text or timestamps.\n'
+                f'Window start={outer_start:.3f} end={outer_end:.3f} trigger_offset={trigger_offset:.3f}.\n'
+                f'Transcript slice:\n{transcript_text}'
             )
             try:
                 data = call_claude_structured(prompt)
