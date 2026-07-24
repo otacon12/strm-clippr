@@ -53,6 +53,37 @@ def measure_duration_s(path: Path) -> float:
     return float(raw)
 
 
+def probe_source_resolution(path: str) -> tuple[int, int]:
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'csv=s=x:p=0',
+        path,
+    ]
+    proc = run_capture(cmd)
+    raw = proc.stdout.strip()
+    if raw == '':
+        raise RuntimeError(f'ffprobe returned empty resolution output for {path}')
+
+    parts = raw.split('x')
+    if len(parts) != 2:
+        raise RuntimeError(f'invalid resolution format from ffprobe for {path}: "{raw}"')
+
+    try:
+        width = int(parts[0])
+        height = int(parts[1])
+    except ValueError as exc:
+        raise RuntimeError(f'invalid integer resolution from ffprobe for {path}: "{raw}"') from exc
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f'non-positive source resolution for {path}: "{raw}"')
+
+    print(f'FFPROBE_SOURCE_RES path="{path}" output="{raw}"')
+    return width, height
+
+
 def fetch_candidate(conn: sqlite3.Connection, candidate_id: int) -> tuple[int, float, float, str, str, float]:
     row = conn.execute(
         '''
@@ -111,13 +142,25 @@ def render_clip(candidate_id: int) -> int:
         if out_path.exists():
             out_path.unlink()
 
+        source_w, source_h = probe_source_resolution(vod_path)
+        crop_h = source_h
+        crop_w = (source_h * 9) // 16
+        if crop_w <= 0:
+            raise RuntimeError(f'invalid computed crop width: source_h={source_h} crop_w={crop_w}')
+        if crop_w > source_w:
+            raise RuntimeError(
+                f'computed crop width exceeds source width: source_w={source_w} source_h={source_h} crop_w={crop_w}'
+            )
+
+        vf = f'crop={crop_w}:{crop_h}:(in_w-{crop_w})/2:0,scale=1080:1920:flags=lanczos,fps=30'
+
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',
             '-ss', f'{cut_start_s:.3f}',
             '-i', vod_path,
             '-t', f'{cut_duration_s:.3f}',
-            '-vf', 'crop=608:1080:(in_w-608)/2:0,scale=1080:1920:flags=lanczos,fps=30',
+            '-vf', vf,
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
             '-r', '30',
