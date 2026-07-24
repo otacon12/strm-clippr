@@ -15,6 +15,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    from obs_guard import require_obs_idle_or_raise
+except ModuleNotFoundError:
+    from .obs_guard import require_obs_idle_or_raise
+
 TS_RE = re.compile(r'^(\d{2}):(\d{2}):(\d{2}),(\d{3})$')
 
 
@@ -57,6 +62,8 @@ def run_capture(cmd: list[str]) -> subprocess.CompletedProcess:
 
 
 def transcribe(vod_id: int) -> int:
+    require_obs_idle_or_raise('transcribe')
+
     db_path = get_db_path()
     whisper_cli = require_env('WHISPER_CLI_PATH')
     whisper_model = require_env('WHISPER_MODEL_PATH')

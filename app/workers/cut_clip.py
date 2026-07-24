@@ -14,6 +14,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from obs_guard import require_obs_idle_or_raise
+except ModuleNotFoundError:
+    from .obs_guard import require_obs_idle_or_raise
+
 PAD_SECONDS = 1.5  # small default padding so cuts do not feel abrupt; tunable later.
 
 
@@ -109,6 +114,8 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 def render_clip(candidate_id: int) -> int:
+    require_obs_idle_or_raise('cut_clip')
+
     db_path = get_db_path()
     run_id = f'cut_clip_{dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
 

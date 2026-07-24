@@ -20,6 +20,11 @@ try:
 except ModuleNotFoundError:
     from .poison_gate import require_poison_reviewed_or_raise
 
+try:
+    from obs_guard import require_obs_idle_or_raise
+except ModuleNotFoundError:
+    from .obs_guard import require_obs_idle_or_raise
+
 LOUDNESS_RE = re.compile(r't:\s*([\d.]+).*?\bM:\s*(-?[\d.]+|-inf)')
 BUCKET_SECONDS = 5.0
 
@@ -64,6 +69,8 @@ def bucketize_max(readings: list[tuple[float, float]]) -> list[tuple[float, floa
 
 
 def audio_energy(vod_id: int) -> int:
+    require_obs_idle_or_raise('audio_energy')
+
     db_path = get_db_path()
     started = time.monotonic()
 
