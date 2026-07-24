@@ -83,7 +83,7 @@ def transcribe(vod_id: int) -> int:
                 '-m', whisper_model,
                 '-f', str(wav_path),
                 '-oj',
-                '-ml', '1',
+                '-ng',
                 '-of', str(tmp_base),
             ]
             started = time.monotonic()
