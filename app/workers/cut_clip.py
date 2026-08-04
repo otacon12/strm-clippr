@@ -121,7 +121,7 @@ def render_clip(candidate_id: int) -> int:
         filter_complex = (
             '[0:v]split=2[bg][fg];'
             '[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=20[bg2];'
-            '[fg]scale=1244:-2:flags=lanczos,crop=1080:ih[fg2];'
+            '[fg]scale=1080:-2:flags=lanczos[fg2];'
             '[bg2][fg2]overlay=(W-w)/2:(H-h)/2,fps=30[v]'
         )
 
