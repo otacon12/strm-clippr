@@ -165,7 +165,8 @@ def call_claude_structured(prompt: str) -> dict:
         '-d', json.dumps(body),
     ]
 
-    print(f'LLM_CMD {cmd[:6]} ...')
+    debug_cmd = [seg if str(seg).startswith('Authorization: Bearer') is False else 'Authorization: Bearer ***REDACTED***' for seg in cmd[:6]]
+    print(f'LLM_CMD {debug_cmd} ...')
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f'LLM call failed exit={proc.returncode} stderr="{(proc.stderr or "").strip()}"')
