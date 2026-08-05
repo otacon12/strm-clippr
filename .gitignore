@@ -1,2 +1,8 @@
 # run logs: runtime artifacts written by app/workers/run_pipeline.py, never committed
 app/logs/
+
+# git worktrees: nested working copies, never committed
+.claude-worktrees/
+
+# rendered clips: multi-MB mp4 output, delivered via Drive, not stored in the repo
+app/clips_out/
