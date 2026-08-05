@@ -133,6 +133,31 @@ def resolve_start_index(from_stage: Optional[str]) -> int:
     return STAGES.index(from_stage)
 
 
+def resolve_end_index(to_stage: Optional[str]) -> int:
+    """Index of the LAST stage to run, inclusive. None means run through the end."""
+    if to_stage is None:
+        return len(STAGES) - 1
+    if to_stage not in STAGES:
+        raise RuntimeError(
+            f'unknown stage for --to: {to_stage!r}. '
+            f'Valid stages, in pipeline order: {", ".join(STAGES)}'
+        )
+    return STAGES.index(to_stage)
+
+
+def resolve_stage_range(from_stage: Optional[str], to_stage: Optional[str]) -> tuple[int, int]:
+    """Resolve --from/--to into an inclusive [start, end] index pair, failing loudly."""
+    start_index = resolve_start_index(from_stage)
+    end_index = resolve_end_index(to_stage)
+    if end_index < start_index:
+        raise RuntimeError(
+            f'--to {to_stage!r} names a stage EARLIER than --from {from_stage!r}, '
+            f'so no stage would run. Pipeline order: {", ".join(STAGES)}. '
+            f'--to must name {from_stage!r} or a stage after it.'
+        )
+    return start_index, end_index
+
+
 def log_path_for(vod_id: int) -> Path:
     return app_dir() / 'logs' / f'run_vod{vod_id}_{utc_stamp()}.log'
 
@@ -197,13 +222,15 @@ def report_failure(outcome: StageOutcome) -> None:
     print(f'NOT RUN (pipeline stopped): stages after {outcome.stage} were skipped.', file=sys.stderr)
 
 
-def do_dry_run(vod_id: int, start_index: int) -> int:
-    planned = STAGES[start_index:]
+def do_dry_run(vod_id: int, start_index: int, end_index: int) -> int:
+    planned = STAGES[start_index:end_index + 1]
     print(f'DRY RUN vod={vod_id}: the following {len(planned)} command(s) WOULD run, in this order:')
     print(f'cwd: {app_dir()}')
     print(f'CLPR_DB_PATH: {get_db_path()}')
     if start_index > 0:
         print(f'skipped (before --from): {", ".join(STAGES[:start_index])}')
+    if end_index < len(STAGES) - 1:
+        print(f'skipped (after --to): {", ".join(STAGES[end_index + 1:])}')
     for i, stage in enumerate(planned, start=1):
         cmd = stage_command(stage, vod_id)
         print(f'{i}. {stage}: {" ".join(cmd)}')
@@ -211,14 +238,14 @@ def do_dry_run(vod_id: int, start_index: int) -> int:
     return 0
 
 
-def run(vod_id: int, from_stage: Optional[str], dry_run: bool) -> int:
-    start_index = resolve_start_index(from_stage)
+def run(vod_id: int, from_stage: Optional[str], to_stage: Optional[str], dry_run: bool) -> int:
+    start_index, end_index = resolve_stage_range(from_stage, to_stage)
 
     if dry_run:
-        return do_dry_run(vod_id, start_index)
+        return do_dry_run(vod_id, start_index, end_index)
 
     cwd = str(app_dir())
-    planned = STAGES[start_index:]
+    planned = STAGES[start_index:end_index + 1]
     skipped = start_index
 
     log_file = log_path_for(vod_id)
@@ -232,6 +259,11 @@ def run(vod_id: int, from_stage: Optional[str], dry_run: bool) -> int:
         write_log(handle, f'CLPR_DB_PATH: {get_db_path()}')
         write_log(handle, f'stages_planned: {", ".join(planned)}')
         write_log(handle, f'stages_skipped: {", ".join(STAGES[:start_index]) if skipped else "<none>"}')
+        write_log(
+            handle,
+            'stages_skipped_after_to: '
+            f'{", ".join(STAGES[end_index + 1:]) if end_index < len(STAGES) - 1 else "<none>"}',
+        )
 
         stages_run = 0
         for stage in planned:
@@ -281,6 +313,16 @@ def parse_args() -> argparse.Namespace:
         help=f'resume at this stage, skipping earlier ones. One of: {", ".join(STAGES)}',
     )
     parser.add_argument(
+        '--to',
+        dest='to_stage',
+        type=str,
+        default=None,
+        help=(
+            'stop AFTER this stage, skipping later ones. Must not name a stage earlier '
+            f'than --from. One of: {", ".join(STAGES)}'
+        ),
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='print the exact commands that would run, in order, and exit without running any',
@@ -290,7 +332,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    return run(args.vod_id, args.from_stage, args.dry_run)
+    return run(args.vod_id, args.from_stage, args.to_stage, args.dry_run)
 
 
 if __name__ == '__main__':
