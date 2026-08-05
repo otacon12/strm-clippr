@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.clpr.nightly - TEMPLATE ONLY. This file is NOT installed and NOT loaded.
+
+  It runs app/workers/nightly.py once a night at 03:00 LOCAL time.
+  __APP_DIR__ is a placeholder: it must be substituted with the absolute path of the
+  clpr `app` directory on this machine before the plist is installed. Nothing here
+  hardcodes a path.
+
+  INSTALL (run these by hand; APP_DIR is the absolute path to the repo's app dir):
+
+    APP_DIR="$(cd /path/to/strm-clippr/app && pwd)"
+    mkdir -p ~/Library/LaunchAgents
+    mkdir -p "$APP_DIR/logs"
+    sed "s|__APP_DIR__|$APP_DIR|g" \
+      "$APP_DIR/launchd/com.clpr.nightly.plist.template" \
+      > ~/Library/LaunchAgents/com.clpr.nightly.plist
+    plutil -lint ~/Library/LaunchAgents/com.clpr.nightly.plist
+    launchctl load ~/Library/LaunchAgents/com.clpr.nightly.plist
+
+  VERIFY:
+
+    launchctl list | grep com.clpr.nightly
+
+  UNINSTALL:
+
+    launchctl unload ~/Library/LaunchAgents/com.clpr.nightly.plist
+    rm ~/Library/LaunchAgents/com.clpr.nightly.plist
+
+  NOTE: nightly.py never sets poison_reviewed. VODs awaiting poison review are reported
+  in the digest and in the macOS notification; only a human can clear them.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.clpr.nightly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__APP_DIR__/workers/nightly.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__APP_DIR__</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__APP_DIR__/logs/nightly.launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__APP_DIR__/logs/nightly.launchd.err.log</string>
+</dict>
+</plist>
