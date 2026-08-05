@@ -6,3 +6,6 @@ app/logs/
 
 # rendered clips: multi-MB mp4 output, delivered via Drive, not stored in the repo
 app/clips_out/
+
+# nightly digests: per-run reports written by app/workers/nightly.py, never committed
+app/digests/
