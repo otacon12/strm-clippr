@@ -15,6 +15,12 @@ Phase 1 (automatic, no fence):
 Phase 2 (automatic, only for VODs the human has cleared):
   3. every VOD at state='transcribed' AND poison_reviewed=1 -> run_pipeline.py --vod-id N --from zebra_detect
 
+A VOD that completes detection is moved to state='detected' by score_fusion, so it drops out
+of the phase 2 query on its own and is never re-detected on later nights. --redetect VOD_ID
+(repeatable) forces phase 2 for one VOD anyway, for when the DETECTOR has improved and a
+re-run is genuinely wanted. It does NOT bypass the poison fence: a VOD with poison_reviewed=0
+is refused, reported as still waiting, and no detection stage is called for it.
+
 One VOD failing never aborts the others: each failure is recorded and the loop continues.
 An OBS-busy refusal (stderr contains 'Refusing') is an expected outcome, counted and
 reported separately from a real failure, and it does not make the run fail.
@@ -74,6 +80,22 @@ class WaitingVod:
     vod_id: int
     duration_s: Optional[float]
     filename: str
+
+
+@dataclass
+class DetectedVod:
+    """A VOD already at state='detected': detection is finished, nothing to do tonight."""
+    vod_id: int
+    duration_s: Optional[float]
+    filename: str
+
+
+@dataclass
+class RedetectDecision:
+    """What --redetect VOD_ID resolved to. `note` is always populated, refusals included."""
+    vod_id: int
+    forced: bool
+    note: str
 
 
 def get_db_path() -> str:
@@ -226,6 +248,112 @@ def query_waiting_poison_review(conn: sqlite3.Connection) -> list[WaitingVod]:
     return out
 
 
+def query_already_detected(conn: sqlite3.Connection) -> list[DetectedVod]:
+    """READ ONLY. VODs at state='detected': score_fusion already finished them.
+
+    They are excluded from the phase 2 query by that state alone, so nothing re-processes
+    them. They are listed so a night with nothing to do still SHOWS why it had nothing to do.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, duration_s, path
+        FROM vods
+        WHERE state = 'detected'
+        ORDER BY id
+        """
+    ).fetchall()
+    out: list[DetectedVod] = []
+    for vod_id, duration_s, path in rows:
+        out.append(
+            DetectedVod(
+                vod_id=int(vod_id),
+                duration_s=(None if duration_s is None else float(duration_s)),
+                filename=os.path.basename(str(path)),
+            )
+        )
+    return out
+
+
+def resolve_redetect(
+    conn: sqlite3.Connection, requested_ids: list[int], ready_ids: list[int]
+) -> list[RedetectDecision]:
+    """READ ONLY. Resolve --redetect ids into forced targets and explicit, stated refusals.
+
+    The poison fence is absolute here exactly as it is everywhere else: --redetect can
+    override a VOD's STATE, never its poison review. A VOD with poison_reviewed<>1 is
+    refused and stays in the waiting report.
+    """
+    decisions: list[RedetectDecision] = []
+    ready = set(ready_ids)
+    seen: set[int] = set()
+
+    for vod_id in requested_ids:
+        if vod_id in seen:
+            continue
+        seen.add(vod_id)
+
+        row = conn.execute(
+            'SELECT state, IFNULL(poison_reviewed, 0) FROM vods WHERE id = ?',
+            (vod_id,),
+        ).fetchone()
+
+        if row is None:
+            decisions.append(
+                RedetectDecision(
+                    vod_id=vod_id,
+                    forced=False,
+                    note='REFUSED: no VOD with this id exists in the database.',
+                )
+            )
+            continue
+
+        state = str(row[0])
+        reviewed = int(row[1] or 0) == 1
+
+        if not reviewed:
+            decisions.append(
+                RedetectDecision(
+                    vod_id=vod_id,
+                    forced=False,
+                    note=(
+                        f'REFUSED: state={state}, poison_reviewed=0. --redetect does NOT bypass '
+                        'the poison fence. This VOD is still WAITING ON YOUR POISON REVIEW and no '
+                        'detection stage will be called for it.'
+                    ),
+                )
+            )
+            continue
+
+        if vod_id in ready:
+            decisions.append(
+                RedetectDecision(
+                    vod_id=vod_id,
+                    forced=False,
+                    note=(
+                        f'redundant: state={state}, poison_reviewed=1 — phase 2 already schedules '
+                        'this VOD without --redetect. It runs once, not twice.'
+                    ),
+                )
+            )
+            continue
+
+        decisions.append(
+            RedetectDecision(
+                vod_id=vod_id,
+                forced=True,
+                note=(
+                    f'FORCED: state={state}, poison_reviewed=1 — detection will re-run for this VOD.'
+                ),
+            )
+        )
+
+    return decisions
+
+
+def forced_ids(decisions: list[RedetectDecision]) -> list[int]:
+    return [d.vod_id for d in decisions if d.forced]
+
+
 def duration_minutes(duration_s: Optional[float]) -> str:
     if duration_s is None:
         return 'unknown'
@@ -251,6 +379,8 @@ def build_digest(
     transcribed: list[VodOutcome],
     detected: list[VodOutcome],
     waiting: list[WaitingVod],
+    already_detected: list[DetectedVod],
+    redetect_decisions: list[RedetectDecision],
     failures: list[Failure],
     obs_busy: list[VodOutcome],
     ok: bool,
@@ -261,7 +391,8 @@ def build_digest(
     lines.append(
         f'SUMMARY: ok={1 if ok else 0} ingested={len(ingested_ids)} '
         f'transcribed={len(transcribed)} detected={len(detected)} '
-        f'waiting_poison_review={len(waiting)} failed={len(failures)} obs_busy={len(obs_busy)}'
+        f'waiting_poison_review={len(waiting)} already_detected={len(already_detected)} '
+        f'failed={len(failures)} obs_busy={len(obs_busy)}'
     )
     lines.append('')
     lines.append(f'- started_at: {started_at}')
@@ -317,6 +448,31 @@ def build_digest(
         lines.append('Nothing is waiting on your poison review.')
     lines.append('')
 
+    lines.append('## ALREADY DETECTED (skipped)')
+    lines.append('')
+    if already_detected:
+        lines.append(
+            f'{len(already_detected)} VOD(s) are at state=detected: detection already completed '
+            'for them on an earlier run, so they were skipped tonight. This is the healthy '
+            'steady state, not a fault. Nothing re-processes them, and nothing paid to '
+            're-derive what is already stored. Use --redetect VOD_ID to force one anyway.'
+        )
+        lines.append('')
+        for d in already_detected:
+            lines.append(
+                f'- vod {d.vod_id} | duration {duration_minutes(d.duration_s)} min | {d.filename}'
+            )
+    else:
+        lines.append('none: no VOD has completed detection yet.')
+    lines.append('')
+
+    if redetect_decisions:
+        lines.append('## --redetect requests')
+        lines.append('')
+        for d in redetect_decisions:
+            lines.append(f'- vod {d.vod_id}: {d.note}')
+        lines.append('')
+
     lines.append('## Failures')
     lines.append('')
     if failures:
@@ -357,12 +513,15 @@ def sanitize_for_osascript(text: str) -> str:
 
 
 def build_notification_message(
-    ingested: int, transcribed: int, detected: int, waiting: int, failed: int, obs_busy: int
+    ingested: int, transcribed: int, detected: int, waiting: int,
+    already_detected: int, failed: int, obs_busy: int
 ) -> str:
     parts = [f'ingested {ingested}, transcribed {transcribed}, detected {detected}']
     parts.append(
         f'{waiting} WAITING on poison review' if waiting else 'nothing waiting on poison review'
     )
+    if already_detected:
+        parts.append(f'{already_detected} already detected (skipped)')
     parts.append(f'{failed} FAILED' if failed else 'no failures')
     if obs_busy:
         parts.append(f'{obs_busy} OBS-busy skip(s)')
@@ -388,7 +547,7 @@ def notify(message: str) -> None:
     print(f'NOTIFY_SENT {message}')
 
 
-def do_dry_run() -> int:
+def do_dry_run(redetect_ids: list[int]) -> int:
     db_path = get_db_path()
     print('DRY RUN nightly: nothing will be executed, no digest written, no notification sent.')
     print(f'cwd: {app_dir()}')
@@ -399,6 +558,10 @@ def do_dry_run() -> int:
         ingested = query_ingested_vods(conn)
         ready = query_detection_ready_vods(conn)
         waiting = query_waiting_poison_review(conn)
+        already_detected = query_already_detected(conn)
+        redetect_decisions = resolve_redetect(conn, redetect_ids, ready)
+
+    forced = forced_ids(redetect_decisions)
 
     step = 0
     print('PHASE 1 (automatic, no fence):')
@@ -417,12 +580,36 @@ def do_dry_run() -> int:
     print('')
 
     print('PHASE 2 (automatic, ONLY for VODs with poison_reviewed=1):')
-    if ready:
+    if ready or forced:
         for vod_id in ready:
             step += 1
             print(f'{step}. vod {vod_id} (transcribed, poison_reviewed=1) -> {" ".join(detect_command(vod_id))}')
+        for vod_id in forced:
+            step += 1
+            print(
+                f'{step}. vod {vod_id} (FORCED by --redetect, poison_reviewed=1) -> '
+                f'{" ".join(detect_command(vod_id))}'
+            )
     else:
         print('   no VOD is cleared for detection, so no detection would run.')
+    print('')
+
+    if redetect_decisions:
+        print('--redetect REQUESTS:')
+        for d in redetect_decisions:
+            print(f'- vod {d.vod_id}: {d.note}')
+        print('')
+
+    print('ALREADY DETECTED (SKIPPED, detection already completed on an earlier run):')
+    if already_detected:
+        for d in already_detected:
+            forced_note = ' [FORCED by --redetect, will run anyway]' if d.vod_id in forced else ''
+            print(
+                f'- vod {d.vod_id} | duration {duration_minutes(d.duration_s)} min | '
+                f'{d.filename}{forced_note}'
+            )
+    else:
+        print('- none')
     print('')
 
     print('WAITING ON YOUR POISON REVIEW (SKIPPED, no worker would be called for these):')
@@ -439,7 +626,7 @@ def do_dry_run() -> int:
     return 0
 
 
-def run_nightly() -> int:
+def run_nightly(redetect_ids: list[int]) -> int:
     started_at = utc_now_iso()
     stamp = utc_stamp()
     cwd = str(app_dir())
@@ -529,8 +716,18 @@ def run_nightly() -> int:
             print(f'TRANSCRIBE FAILED vod={vod_id} exit_code={outcome.exit_code}', file=sys.stderr)
 
     # --- Phase 2: detection, ONLY for VODs the human has poison-reviewed ---
+    # A VOD that already completed detection is at state='detected' and is excluded by the
+    # query itself, so nothing re-runs it and nothing pays to re-derive stored results.
+    # --redetect overrides that state, never the poison fence.
     with sqlite3.connect(db_path) as conn:
-        to_detect = query_detection_ready_vods(conn)
+        ready = query_detection_ready_vods(conn)
+        redetect_decisions = resolve_redetect(conn, redetect_ids, ready)
+
+    forced = forced_ids(redetect_decisions)
+    to_detect = ready + forced
+
+    for d in redetect_decisions:
+        print(f'REDETECT vod={d.vod_id}: {d.note}')
 
     for vod_id in to_detect:
         cmd = detect_command(vod_id)
@@ -559,9 +756,13 @@ def run_nightly() -> int:
             )
             print(f'DETECT FAILED vod={vod_id} exit_code={outcome.exit_code}', file=sys.stderr)
 
-    # --- The fence report: read AFTER phase 1, so anything transcribed tonight shows up ---
+    # --- The fence report: read AFTER phase 1, so anything transcribed tonight shows up.
+    # already_detected is read AFTER phase 2 for the same reason: anything detected tonight
+    # has moved to state='detected' and belongs in that list. A VOD forced by --redetect is
+    # not reported as skipped, because it was not skipped.
     with sqlite3.connect(db_path) as conn:
         waiting = query_waiting_poison_review(conn)
+        already_detected = [d for d in query_already_detected(conn) if d.vod_id not in set(forced)]
 
     finished_at = utc_now_iso()
     ok = not failures
@@ -575,6 +776,8 @@ def run_nightly() -> int:
         transcribed=transcribed,
         detected=detected,
         waiting=waiting,
+        already_detected=already_detected,
+        redetect_decisions=redetect_decisions,
         failures=failures,
         obs_busy=obs_busy,
         ok=ok,
@@ -592,6 +795,7 @@ def run_nightly() -> int:
             transcribed=len(transcribed),
             detected=len(detected),
             waiting=len(waiting),
+            already_detected=len(already_detected),
             failed=len(failures),
             obs_busy=len(obs_busy),
         )
@@ -600,8 +804,8 @@ def run_nightly() -> int:
     print(
         f'RESULT nightly ok={1 if ok else 0} ingested={len(ingested_ids)} '
         f'transcribed={len(transcribed)} detected={len(detected)} '
-        f'waiting_poison_review={len(waiting)} failed={len(failures)} '
-        f'obs_busy={len(obs_busy)} digest="{digest_file}"'
+        f'waiting_poison_review={len(waiting)} already_detected={len(already_detected)} '
+        f'failed={len(failures)} obs_busy={len(obs_busy)} digest="{digest_file}"'
     )
     return 0 if ok else 1
 
@@ -618,14 +822,29 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='print exactly what would be done per VOD and exit, touching nothing',
     )
+    parser.add_argument(
+        '--redetect',
+        dest='redetect',
+        type=int,
+        action='append',
+        default=None,
+        metavar='VOD_ID',
+        help=(
+            'force phase 2 detection for this VOD id even if it is already at state=detected. '
+            'Repeatable. The escape hatch for when the DETECTOR has improved and a re-run is '
+            'genuinely wanted. It does NOT bypass the poison fence: a VOD with poison_reviewed=0 '
+            'is still refused, still skipped, and still reported as waiting on your review.'
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    redetect_ids: list[int] = list(args.redetect or [])
     if args.dry_run:
-        return do_dry_run()
-    return run_nightly()
+        return do_dry_run(redetect_ids)
+    return run_nightly(redetect_ids)
 
 
 if __name__ == '__main__':

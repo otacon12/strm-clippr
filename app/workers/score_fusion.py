@@ -233,6 +233,17 @@ def run(vod_id: int) -> int:
                             beat_written += 1
                         else:
                             signal_written += 1
+
+            # score_fusion is the last detection stage, so a successful run means this VOD is
+            # detected. The UPDATE lives INSIDE the candidate transaction on purpose: if the
+            # candidate write rolls back, this rolls back with it. A VOD marked 'detected'
+            # whose candidates were never written would be silently skipped forever.
+            # Scoped to state='transcribed' so a VOD already at 'done' (or any later state)
+            # is never dragged backwards.
+            conn.execute(
+                "UPDATE vods SET state = 'detected' WHERE id = ? AND state = 'transcribed'",
+                (vod_id,),
+            )
             conn.commit()
         except Exception:
             conn.rollback()
