@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """review_server: local operator-only review surface for clip candidates.
-Binds to loopback only. Reads CLPR_DB_PATH. No external dependencies.
+Binds to loopback by default; CLPR_REVIEW_HOST / CLPR_REVIEW_PORT can override.
+Reads CLPR_DB_PATH. No external dependencies.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
 import sqlite3
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,10 +18,60 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-HOST = '127.0.0.1'
-PORT = 8737
+DEFAULT_HOST = '127.0.0.1'
+DEFAULT_PORT = 8737
+LOOPBACK_HOSTS = frozenset({'127.0.0.1', 'localhost'})
+
+HOST = os.environ.get('CLPR_REVIEW_HOST', '').strip() or DEFAULT_HOST
+PORT = int(os.environ.get('CLPR_REVIEW_PORT', '').strip() or DEFAULT_PORT)
 UI_PATH = Path(__file__).resolve().parent / 'review_ui.html'
 POST_ACTION_RE = re.compile(r'^/api/candidates/(\d+)/(approve|reject|maybe)$')
+
+
+def is_loopback_bind(host: str) -> bool:
+    return host.strip().lower() in LOOPBACK_HOSTS
+
+
+def detect_lan_ip() -> Optional[str]:
+    """Best-effort LAN IPv4 for this machine, derived at runtime.
+
+    Returns None when no usable address can be determined; the caller must say
+    so plainly rather than print a placeholder.
+    """
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        return None
+
+    for info in infos:
+        addr = info[4][0]
+        try:
+            parsed = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if parsed.is_loopback or parsed.is_link_local or parsed.is_unspecified or parsed.is_multicast:
+            continue
+        return str(parsed)
+    return None
+
+
+def print_open_surface_warning(port: int) -> None:
+    banner = '*' * 72
+    for line in (
+        '',
+        banner,
+        'WARNING: this review surface is NOT bound to loopback.',
+        '',
+        '  It is now reachable by OTHER DEVICES on this network.',
+        '  It has NO AUTHENTICATION WHATSOEVER.',
+        '  Anyone who can reach this address can approve or reject clip',
+        '  candidates and can stream the source VODs in full.',
+        '',
+        '  Return it to loopback (unset CLPR_REVIEW_HOST) when not in use.',
+        banner,
+        '',
+    ):
+        print(line, flush=True)
 
 
 def get_db_path() -> str:
@@ -287,7 +340,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    print(f'Starting review server on http://{HOST}:{PORT} using CLPR_DB_PATH={get_db_path()}')
+    print(f'Starting review server on http://{HOST}:{PORT} using CLPR_DB_PATH={get_db_path()}', flush=True)
+    if not is_loopback_bind(HOST):
+        print_open_surface_warning(PORT)
+        lan_ip = detect_lan_ip()
+        if lan_ip:
+            print(f'On another device on this network (e.g. your phone), open: http://{lan_ip}:{PORT}', flush=True)
+        else:
+            print(
+                'Could not determine this machine\'s LAN IP address. Look it up manually '
+                f'(System Settings > Network) and open http://<that-address>:{PORT}',
+                flush=True,
+            )
     with ThreadingHTTPServer((HOST, PORT), ReviewHandler) as httpd:
         httpd.serve_forever()
 
