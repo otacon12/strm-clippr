@@ -16,11 +16,6 @@ import sys
 import time
 
 try:
-    from poison_gate import require_poison_reviewed_or_raise
-except ModuleNotFoundError:
-    from .poison_gate import require_poison_reviewed_or_raise
-
-try:
     from obs_guard import require_obs_idle_or_raise
 except ModuleNotFoundError:
     from .obs_guard import require_obs_idle_or_raise
@@ -76,7 +71,7 @@ def audio_energy(vod_id: int) -> int:
 
     with sqlite3.connect(db_path) as conn:
         conn.execute('PRAGMA foreign_keys = ON;')
-        require_poison_reviewed_or_raise(conn, vod_id)
+        # D-050: pre-detection poison gate removed — the operator's clip review (D-002) is the poison gate; M5 auto-publish must reinstate a mandatory mechanism.
         vod_path = fetch_vod_path(conn, vod_id)
 
         cmd = ['ffmpeg', '-i', vod_path, '-af', 'ebur128', '-f', 'null', '-']

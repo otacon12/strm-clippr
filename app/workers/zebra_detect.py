@@ -13,11 +13,6 @@ import re
 import sqlite3
 import sys
 
-try:
-    from poison_gate import require_poison_reviewed_or_raise
-except ModuleNotFoundError:
-    from .poison_gate import require_poison_reviewed_or_raise
-
 ZEBRA_RE = re.compile(r"\bzebra\b", re.IGNORECASE)
 
 
@@ -63,7 +58,7 @@ def detect(vod_id: int) -> int:
         conn.execute('PRAGMA foreign_keys = ON;')
 
         # Poison gate first, non-negotiable.
-        require_poison_reviewed_or_raise(conn, vod_id)
+        # D-050: pre-detection poison gate removed — the operator's clip review (D-002) is the poison gate; M5 auto-publish must reinstate a mandatory mechanism.
 
         state = fetch_vod_state(conn, vod_id)
         if not state_is_transcribed_or_later(state):

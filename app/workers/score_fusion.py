@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 try:
-    from poison_gate import require_poison_reviewed_or_raise, is_poisoned
+    from poison_gate import is_poisoned
 except ModuleNotFoundError:
-    from .poison_gate import require_poison_reviewed_or_raise, is_poisoned
+    from .poison_gate import is_poisoned
 
 
 @dataclass
@@ -163,7 +163,7 @@ def run(vod_id: int) -> int:
 
     with sqlite3.connect(db_path) as conn:
         conn.execute('PRAGMA foreign_keys = ON;')
-        require_poison_reviewed_or_raise(conn, vod_id)
+        # D-050: pre-detection poison gate removed — the operator's clip review (D-002) is the poison gate; M5 auto-publish must reinstate a mandatory mechanism.
         duration_s, _ = fetch_vod(conn, vod_id)
 
         raw_candidates = fetch_intermediate_candidates(conn, vod_id)

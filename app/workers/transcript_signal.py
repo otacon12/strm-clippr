@@ -17,11 +17,6 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
-try:
-    from poison_gate import require_poison_reviewed_or_raise
-except ModuleNotFoundError:
-    from .poison_gate import require_poison_reviewed_or_raise
-
 CATEGORIES = ['funny', 'inspirational', 'educational', 'showing-AI-off', 'context']
 CHUNK_CHAR_LIMIT = 12000
 CHUNK_OVERLAP_CHARS = 1500
@@ -332,7 +327,7 @@ def run(vod_id: int) -> int:
 
     with sqlite3.connect(db_path) as conn:
         conn.execute('PRAGMA foreign_keys = ON;')
-        require_poison_reviewed_or_raise(conn, vod_id)
+        # D-050: pre-detection poison gate removed — the operator's clip review (D-002) is the poison gate; M5 auto-publish must reinstate a mandatory mechanism.
         duration_s, _ = fetch_vod(conn, vod_id)
         segments = fetch_segments(conn, vod_id)
         ensure_intermediate_table(conn)
