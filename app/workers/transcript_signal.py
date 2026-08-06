@@ -213,21 +213,95 @@ def insert_signal_rows(conn: sqlite3.Connection, vod_id: int, rows: list[tuple[f
     return inserted
 
 
-def detect_transcript_categories(chunks: list[list[Segment]], duration_s: float) -> list[tuple[float, float, str, str, float, str, Optional[float]]]:
+def build_scan_prompt(chunk_index: int, chunk_total: int, transcript_text: str) -> str:
+    return (
+        'You are labeling transcript moments for clip candidacy.\n'
+        'Allowed categories only: funny, inspirational, educational, showing-AI-off, context.\n'
+        'Return JSON only with shape: {"candidates":[{"start_s":number,"end_s":number,"category":string,"reason":string,"confidence":number}]}.\n'
+        'Rules: use only evidence present in transcript lines, do not invent quotes or timestamps, confidence 0.0-1.0.\n'
+        f'Chunk index: {chunk_index} of {chunk_total}.\n'
+        f'Transcript chunk:\n{transcript_text}'
+    )
+
+
+def build_zebra_prompt(outer_start: float, outer_end: float, trigger_offset: float, transcript_text: str) -> str:
+    return (
+        'Operator flagged a clip-worthy moment via trigger word at END of this window.\n'
+        'Find where this specific story/topic/bit actually began.\n'
+        'Return JSON only: {"start_s":number,"confidence":number,"reason":string}.\n'
+        'Rules: choose a start inside the provided window; do not invent text or timestamps.\n'
+        f'Window start={outer_start:.3f} end={outer_end:.3f} trigger_offset={trigger_offset:.3f}.\n'
+        f'Transcript slice:\n{transcript_text}'
+    )
+
+
+def iter_scan_items(segments: list[Segment]):
+    """Yield (meta, prompt) for every chunk-scan LLM call this VOD requires.
+
+    Single source of truth for scan prompt construction: the LOCAL lane
+    (detect_transcript_categories) and the split lane (transcript_signal_prepare)
+    both consume this iterator.
+    """
+    chunks = chunk_segments(segments)
+    for idx, chunk in enumerate(chunks, start=1):
+        transcript_text = build_transcript_payload(chunk)
+        meta = {
+            'chunk_index': idx,
+            'chunk_total': len(chunks),
+            'window_start_s': chunk[0].start_s,
+            'window_end_s': chunk[-1].end_s,
+        }
+        yield meta, build_scan_prompt(idx, len(chunks), transcript_text)
+
+
+def fetch_zebra_triggers(conn: sqlite3.Connection, vod_id: int) -> list[float]:
+    rows = conn.execute(
+        '''
+        SELECT offset_s
+        FROM beats
+        WHERE vod_id = ?
+          AND source = 'zebra_trigger'
+          AND offset_s IS NOT NULL
+        ORDER BY offset_s
+        ''',
+        (vod_id,),
+    ).fetchall()
+    return [float(offset_raw) for (offset_raw,) in rows]
+
+
+def iter_zebra_items(triggers: list[float], duration_s: float, segments: list[Segment]):
+    """Yield (meta, prompt) for EVERY zebra trigger, in offset order.
+
+    prompt is None when the transcript slice is empty: no LLM call is made and
+    the consumer must emit the fallback row from meta alone. Single source of
+    truth for zebra prompt construction (LOCAL lane + split lane).
+    """
+    for trigger_offset in triggers:
+        outer_start = clamp(trigger_offset - 300.0, 0.0, duration_s)
+        outer_end = clamp(trigger_offset + 15.0, 0.0, duration_s)
+        if outer_end <= outer_start:
+            outer_end = clamp(outer_start + 1.0, 0.0, duration_s)
+
+        slice_segments = transcript_slice_for_window(segments, outer_start, outer_end)
+        transcript_text = build_transcript_payload(slice_segments)
+
+        meta = {
+            'trigger_offset_s': trigger_offset,
+            'outer_start_s': outer_start,
+            'outer_end_s': outer_end,
+            'fallback_start_s': clamp(trigger_offset - 60.0, 0.0, duration_s),
+        }
+        prompt = None
+        if transcript_text.strip() != '':
+            prompt = build_zebra_prompt(outer_start, outer_end, trigger_offset, transcript_text)
+        yield meta, prompt
+
+
+def detect_transcript_categories(segments: list[Segment], duration_s: float) -> list[tuple[float, float, str, str, float, str, Optional[float]]]:
     out: list[tuple[float, float, str, str, float, str, Optional[float]]] = []
     seen: set[tuple[int, int, str]] = set()
 
-    for idx, chunk in enumerate(chunks, start=1):
-        transcript_text = build_transcript_payload(chunk)
-        prompt = (
-            'You are labeling transcript moments for clip candidacy.\n'
-            'Allowed categories only: funny, inspirational, educational, showing-AI-off, context.\n'
-            'Return JSON only with shape: {"candidates":[{"start_s":number,"end_s":number,"category":string,"reason":string,"confidence":number}]}.\n'
-            'Rules: use only evidence present in transcript lines, do not invent quotes or timestamps, confidence 0.0-1.0.\n'
-            f'Chunk index: {idx} of {len(chunks)}.\n'
-            f'Transcript chunk:\n{transcript_text}'
-        )
-
+    for _meta, prompt in iter_scan_items(segments):
         data = call_claude_structured(prompt)
         candidates = data.get('candidates')
         if not isinstance(candidates, list):
@@ -264,42 +338,17 @@ def detect_zebra_boundaries(
 ) -> list[tuple[float, float, str, str, float, str, Optional[float]]]:
     out: list[tuple[float, float, str, str, float, str, Optional[float]]] = []
 
-    beats = conn.execute(
-        '''
-        SELECT offset_s
-        FROM beats
-        WHERE vod_id = ?
-          AND source = 'zebra_trigger'
-          AND offset_s IS NOT NULL
-        ORDER BY offset_s
-        ''',
-        (vod_id,),
-    ).fetchall()
+    triggers = fetch_zebra_triggers(conn, vod_id)
 
-    for (offset_raw,) in beats:
-        trigger_offset = float(offset_raw)
-        outer_start = clamp(trigger_offset - 300.0, 0.0, duration_s)
-        outer_end = clamp(trigger_offset + 15.0, 0.0, duration_s)
-        if outer_end <= outer_start:
-            outer_end = clamp(outer_start + 1.0, 0.0, duration_s)
-
-        slice_segments = transcript_slice_for_window(segments, outer_start, outer_end)
-        transcript_text = build_transcript_payload(slice_segments)
-
-        fallback_start = clamp(trigger_offset - 60.0, 0.0, duration_s)
+    for meta, prompt in iter_zebra_items(triggers, duration_s, segments):
+        trigger_offset = meta['trigger_offset_s']
+        outer_start = meta['outer_start_s']
+        fallback_start = meta['fallback_start_s']
         chosen_start = fallback_start
         chosen_conf = 0.0
         reason = 'fallback 60s lookback from zebra trigger'
 
-        if transcript_text.strip() != '':
-            prompt = (
-                'Operator flagged a clip-worthy moment via trigger word at END of this window.\n'
-                'Find where this specific story/topic/bit actually began.\n'
-                'Return JSON only: {"start_s":number,"confidence":number,"reason":string}.\n'
-                'Rules: choose a start inside the provided window; do not invent text or timestamps.\n'
-                f'Window start={outer_start:.3f} end={outer_end:.3f} trigger_offset={trigger_offset:.3f}.\n'
-                f'Transcript slice:\n{transcript_text}'
-            )
+        if prompt is not None:
             try:
                 data = call_claude_structured(prompt)
                 conf = clamp(float(data.get('confidence', 0.0)), 0.0, 1.0)
@@ -332,8 +381,7 @@ def run(vod_id: int) -> int:
         segments = fetch_segments(conn, vod_id)
         ensure_intermediate_table(conn)
 
-        chunks = chunk_segments(segments)
-        transcript_rows = detect_transcript_categories(chunks, duration_s)
+        transcript_rows = detect_transcript_categories(segments, duration_s)
         zebra_rows = detect_zebra_boundaries(conn, vod_id, duration_s, segments)
 
         conn.execute('BEGIN;')
