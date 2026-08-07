@@ -354,10 +354,16 @@ def ssh_run(host: str, script: str, check: bool = True) -> subprocess.CompletedP
     return proc
 
 
+# Same exit-status trap as remote_stats(): a trailing `[ test ] && echo` makes
+# the loop exit 1 whenever the LAST iteration's test is false, which here means
+# "the last docker volume happens not to hold a clpr dir" — true on this host.
+# `|| continue` keeps the loop's status 0 and reports only real ssh failures.
 VOLUME_PROBE = (
     'for v in $(docker volume ls -q); do '
     'mp=$(docker volume inspect -f "{{.Mountpoint}}" "$v" 2>/dev/null); '
-    '[ -n "$mp" ] && [ -d "$mp/clpr" ] && echo "$mp"; '
+    '[ -n "$mp" ] || continue; '
+    '[ -d "$mp/clpr" ] || continue; '
+    'echo "$mp"; '
     'done'
 )
 
@@ -456,9 +462,16 @@ def remote_stats(host: str, dest: str) -> dict[str, tuple[int, int, int]]:
     verification on purpose: two listers would be two formats, and the day they
     drift is the day the verify silently checks something the push never set."""
     q = shlex.quote(dest)
+    # `[ -f "$f" ] || continue` and NOT `[ -f "$f" ] && echo ...`: with the
+    # latter, the loop's exit status is the status of its LAST test, so an
+    # EMPTY directory (glob stays the literal `*`, the test is false) makes the
+    # whole script exit 1 and ssh_run raise. That is exactly what happened on
+    # the first real run against a freshly-created, still-empty slices dir.
+    # `continue` returns 0, so an empty listing now correctly reads as empty.
     script = (
         f'cd {q} 2>/dev/null || exit 0; '
-        'for f in *; do [ -f "$f" ] && echo "$(stat -c \'%u %g %s\' -- "$f") $f"; done'
+        'for f in *; do [ -f "$f" ] || continue; '
+        'echo "$(stat -c \'%u %g %s\' -- "$f") $f"; done'
     )
     proc = ssh_run(host, script)
     stats: dict[str, tuple[int, int, int]] = {}
