@@ -62,6 +62,85 @@
     .winline .orig { color: var(--muted); font-size: 12px; }
     video { width: 100%; max-height: 65vh; background: #000; border-radius: 8px; }
     pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; color: var(--muted); }
+
+    /* ---------------------------------------------------------------- D-061
+       THE POST KIT. The system SUGGESTS copy and NEVER burns text into video:
+       every hook below is a CSS overlay painted on top of a <video> element,
+       so what the operator sees is a MOCKUP of the post he is about to make,
+       and the delivered .mp4 in Drive is never touched. Nothing here writes to
+       a canvas, draws into the video, or produces a new media file. */
+    .kitgrid { display: grid; grid-template-columns: 320px 1fr; gap: 16px; align-items: start; }
+    @media (max-width: 1100px) { .kitgrid { grid-template-columns: 1fr; } }
+
+    /* The phone frame: a real 9:16 box, the aspect the platforms actually
+       render, so "is this frame majority text?" is judgeable by eye. */
+    .phone { position: relative; width: 300px; aspect-ratio: 9 / 16; background: #000;
+             border-radius: 22px; overflow: hidden; border: 2px solid #3d444d; }
+    .phone video { position: absolute; inset: 0; width: 100%; height: 100%;
+                   max-height: none; object-fit: cover; border-radius: 0; background: #000; }
+    .phone .missing { position: absolute; inset: 0; display: flex; align-items: center;
+                      justify-content: center; text-align: center; padding: 16px;
+                      color: var(--muted); font-size: 12px; }
+    /* Guides for the regions the platform's OWN UI covers. Dashed, subtle, and
+       toggleable — they are a judging aid, not part of the post. */
+    .guide { position: absolute; border: 1px dashed rgba(255,255,255,.28); pointer-events: none; }
+    .guide.top { left: 0; right: 0; top: 0; height: 12%; }
+    .guide.bottom { left: 0; right: 0; bottom: 0; height: 22%; }
+    .guide.rail { right: 0; top: 40%; bottom: 22%; width: 16%; }
+    .guidelabel { position: absolute; font-size: 9px; color: rgba(255,255,255,.5);
+                  pointer-events: none; letter-spacing: .04em; }
+    /* The overlay band the hook is painted in: inset from the right rail and
+       clear of the top bar, i.e. the platform safe area. */
+    .hookband { position: absolute; left: 6%; right: 20%; top: 16%; pointer-events: none;
+                display: flex; }
+    .hooktext { font-weight: 800; font-size: 17px; line-height: 1.22; color: #fff;
+                background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: 6px;
+                text-shadow: 0 1px 3px rgba(0,0,0,.9); word-break: break-word; }
+    .hooktext.empty { background: rgba(248,81,73,.25); color: #ffb4b0; font-weight: 600; font-size: 13px; }
+    /* The post as it reads below the video, so the caption is judged in place. */
+    .postmeta { width: 300px; margin-top: 10px; font-size: 12px; color: var(--text); }
+    .postmeta .handle { font-weight: 700; margin-bottom: 4px; }
+    .postmeta .cap { color: #d5dde5; white-space: pre-wrap; word-break: break-word; }
+    .postmeta .tags { color: var(--accent); margin-top: 4px; word-break: break-word; }
+    .coverage { margin-top: 8px; font-size: 12px; color: var(--muted); }
+    .coverage b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .coverage.warn b { color: var(--maybe); }
+    .coverage.bad b { color: var(--bad); }
+
+    .kitblock { border: 1px solid #2d333b; border-radius: 8px; background: var(--panel2);
+                padding: 10px; margin-bottom: 10px; }
+    .kitblock h3 { margin: 0 0 2px; font-size: 13px; }
+    .kitblock .why { color: var(--muted); font-size: 11px; margin: 0 0 8px; }
+    .variant { display: flex; align-items: flex-start; gap: 6px; margin-bottom: 6px; }
+    .variant .pick { background: #2d333b; border: 1px solid #3d444d; color: var(--text);
+                     padding: 6px 9px; font-size: 12px; }
+    .variant .pick.on { background: var(--accent); border-color: var(--accent); color: #061326; }
+    .copybtn { background: #2d333b; border: 1px solid #3d444d; color: var(--text);
+               padding: 6px 9px; font-size: 12px; }
+    .copybtn.done { background: var(--ok); color: #061326; border-color: var(--ok); }
+    textarea, input[type=text] { width: 100%; box-sizing: border-box; background: #10141a;
+        color: var(--text); border: 1px solid #3d444d; border-radius: 6px; padding: 6px;
+        font-family: inherit; font-size: 13px; resize: vertical; }
+    textarea.srt { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+    .kitmeta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+    .kitmeta.warn { color: var(--maybe); }
+    .kitmeta.bad { color: var(--bad); }
+    .stamp { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 4px;
+             padding: 1px 6px; }
+    .stamp.machine { background: var(--maybe); color: #061326; }
+    .stamp.operator { background: var(--ok); color: #061326; }
+    .stamp.none { background: #3d444d; color: var(--text); }
+    .stamp.failed { background: var(--bad); color: #fff; }
+    .emptykit { border: 1px dashed var(--bad); border-radius: 8px; padding: 14px;
+                color: var(--muted); font-size: 13px; }
+    .emptykit b { color: var(--text); }
+    .genrow { display: flex; align-items: center; gap: 6px; font-size: 12px;
+              color: var(--muted); margin: 0 0 10px; }
+    .genrow input { width: 14px; height: 14px; }
+    .ctxbox { border: 1px solid #2d333b; border-radius: 8px; background: var(--panel);
+              padding: 10px; margin-bottom: 10px; }
+    .histrow { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+               border-top: 1px solid #2d333b; padding: 4px 0; }
   </style>
 </head>
 <body>
@@ -73,8 +152,9 @@
           <button id="tabPending" class="tab active">Pending</button>
           <button id="tabMaybe" class="tab">Maybe</button>
           <button id="tabRejected" class="tab">Rejected</button>
+          <button id="tabDelivered" class="tab">Post kit</button>
         </div>
-        <div class="kbd">Keys: j/k or arrows = move | a = approve | r = reject (not in Rejected) | m = maybe (Pending/Rejected) | x = toggle Rejected queue</div>
+        <div class="kbd">Keys: j/k or arrows = move | a = approve | r = reject (not in Rejected) | m = maybe (Pending/Rejected) | x = toggle Rejected queue (keys are inert while typing in a field)</div>
       </div>
       <div id="list" class="list"></div>
     </aside>
@@ -104,6 +184,22 @@
     const tabPendingEl = document.getElementById('tabPending');
     const tabMaybeEl = document.getElementById('tabMaybe');
     const tabRejectedEl = document.getElementById('tabRejected');
+    const tabDeliveredEl = document.getElementById('tabDelivered');
+
+    // D-061 post kit state.
+    // kitDrafts: unsaved operator edits, keyed by candidate id. Same discipline
+    // as the D-055 window drafts — an unsaved edit blocks the actions that
+    // would destroy it, and a background poll never re-renders over it.
+    const kitDrafts = {};
+    // The selected on-video variant per candidate. LOCAL until saved: clicking
+    // between variants re-paints the overlay live and writes nothing. The
+    // choice is persisted only by Save, as part of the version he was reading
+    // (a ruling binds to what was DISPLAYED).
+    const hookPick = {};
+    // The chosen subject_kind per recording, LOCAL until saved.
+    const subjectPick = {};
+    let profileState = null;   // the ACTIVE creator_profile row, or null
+    let showGuides = true;
 
     function fmt(v, n = 3) {
       if (v === null || v === undefined) return 'null';
@@ -182,22 +278,28 @@
     function endpointForView() {
       if (view === 'maybe') return '/api/candidates/maybe';
       if (view === 'rejected') return '/api/candidates/rejected';
+      if (view === 'delivered') return '/api/candidates/delivered';
       return '/api/candidates';
     }
 
     function titleForView() {
       if (view === 'maybe') return 'Maybe candidates';
       if (view === 'rejected') return 'Rejected candidates';
+      if (view === 'delivered') return 'Post kit (delivered clips)';
       return 'Pending candidates';
     }
 
     function labelForView() {
       if (view === 'maybe') return 'maybe';
       if (view === 'rejected') return 'rejected';
+      if (view === 'delivered') return 'delivered';
       return 'pending';
     }
 
     async function loadCandidates() {
+      // The post kit view renders the standing profile next to the copy it
+      // produced, so it must be loaded before the first paint.
+      if (view === 'delivered' && profileState === null) await loadProfile();
       const res = await fetch(endpointForView(), { cache: 'no-store' });
       const data = await res.json();
       candidates = Array.isArray(data) ? data : [];
@@ -212,6 +314,7 @@
       tabPendingEl.classList.toggle('active', view === 'pending');
       tabMaybeEl.classList.toggle('active', view === 'maybe');
       tabRejectedEl.classList.toggle('active', view === 'rejected');
+      tabDeliveredEl.classList.toggle('active', view === 'delivered');
     }
 
     function renderList() {
@@ -231,10 +334,685 @@
           </div>
           <div class="meta">${c.session_label} | ${fmt(effectiveWindow(c).start,1)}s to ${fmt(effectiveWindow(c).end,1)}s${adjustedDiffers(c) ? ' | edited' : ''}</div>
           <div class="meta">audio ${fmt(c.signal_audio)} | transcript ${fmt(c.signal_transcript)} | chat ${fmt(c.signal_chat)} | beat ${fmt(c.signal_beat_boost)}</div>
-          ${deliveryBadgeHtml(c) ? `<div class="meta">${deliveryBadgeHtml(c)}</div>` : ''}
+          ${view === 'delivered'
+            ? `<div class="meta">${kitStampHtml(c)}${kitHasUnsaved(c) ? ' <span class="unsaved">unsaved</span>' : ''}</div>`
+            : (deliveryBadgeHtml(c) ? `<div class="meta">${deliveryBadgeHtml(c)}</div>` : '')}
+          ${view !== 'delivered' && c.post_kit_enabled === 0 ? '<div class="meta">post kit: OFF</div>' : ''}
         `;
         listEl.appendChild(el);
       });
+    }
+
+    // ------------------------------------------------------------- D-061/D-062
+    // THE POST KIT. Three distinct things per delivered clip, in the
+    // operator's own vocabulary:
+    //   on-video text  — the hook he types into the platform's text tool
+    //   captions       — the real speech transcription, as an SRT file
+    //   video caption  — the post descriptor, plus MINIMAL hashtags
+    // Nothing here is burned into the video and nothing auto-posts: the
+    // operator is the publish gate (D-002) and this surface only suggests.
+    // Field names are the schema's (migrations_pg/003_post_kits.sql), not
+    // invented ones, so the surface and the generator cannot drift apart.
+
+    function esc(s) {
+      return String(s === null || s === undefined ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // A kit EXISTS only when the server sent a version number. Null kit_version
+    // means no ACTIVE post_kits row at all, which the UI must render as
+    // MISSING — a kit whose fields are merely blank is a different thing, and
+    // the schema forbids it anyway (the hooks and caption are NOT NULL).
+    function hasKit(c) {
+      return c.kit_version !== null && c.kit_version !== undefined;
+    }
+
+    // A regenerate request is OUTSTANDING while no NEWER kit version has
+    // landed. Integer comparison against the version that was active when he
+    // asked — no timestamps are compared anywhere (charter gate 21).
+    function regenPending(c) {
+      if (c.request_state !== 'requested') return false;
+      const asked = Number(c.active_version_at_request ?? 0);
+      const now = Number(c.kit_version ?? 0);
+      return now <= asked;
+    }
+
+    function kitStampHtml(c) {
+      let parts = [];
+      if (!hasKit(c)) {
+        parts.push('<span class="stamp none">no kit yet</span>');
+      } else if (c.kit_origin === 'operator_edit') {
+        parts.push(`<span class="stamp operator">v${c.kit_version} EDITED BY YOU</span>`);
+      } else {
+        parts.push(`<span class="stamp machine">v${c.kit_version} MACHINE DRAFT, NOT REVIEWED</span>`);
+      }
+      if (c.request_state === 'failed') {
+        parts.push('<span class="stamp failed">generation FAILED</span>');
+      } else if (regenPending(c)) {
+        parts.push('<span class="stamp none">regenerate requested</span>');
+      }
+      return parts.join(' ');
+    }
+
+    // The editor's current values: the unsaved draft when one exists, else the
+    // active version's own fields.
+    function kitValues(c) {
+      const d = kitDrafts[c.id];
+      if (d) return d;
+      return {
+        hook_withheld: c.hook_withheld ?? '',
+        hook_domain: c.hook_domain ?? '',
+        hook_payoff: c.hook_payoff ?? '',
+        video_caption: c.video_caption ?? '',
+        hashtags: Array.isArray(c.hashtags) ? c.hashtags.join(' ') : (c.hashtags ?? ''),
+        srt_text: c.srt_text ?? '',
+      };
+    }
+
+    function kitSaved(c) {
+      return {
+        hook_withheld: c.hook_withheld ?? '',
+        hook_domain: c.hook_domain ?? '',
+        hook_payoff: c.hook_payoff ?? '',
+        video_caption: c.video_caption ?? '',
+        hashtags: Array.isArray(c.hashtags) ? c.hashtags.join(' ') : (c.hashtags ?? ''),
+        srt_text: c.srt_text ?? '',
+      };
+    }
+
+    function kitHasUnsaved(c) {
+      const d = kitDrafts[c.id];
+      if (!d) return false;
+      const saved = kitSaved(c);
+      return Object.keys(saved).some((k) => (d[k] ?? '') !== saved[k]);
+    }
+
+    const HOOK_FIELDS = {
+      withheld: 'hook_withheld',
+      domain: 'hook_domain',
+      payoff: 'hook_payoff',
+    };
+
+    function selectedHookKey(c) {
+      return hookPick[c.id] || 'withheld';
+    }
+
+    function hookTextFor(c, key) {
+      const v = kitValues(c);
+      return (v[HOOK_FIELDS[key]] || '').trim();
+    }
+
+    async function copyText(text, btn) {
+      let ok = false;
+      try {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } catch (_) {
+        // http://127.0.0.1 is a secure context, but keep a fallback rather
+        // than silently failing to copy the thing he came here to paste.
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+        } catch (__) { ok = false; }
+      }
+      if (btn) {
+        const old = btn.textContent;
+        btn.textContent = ok ? 'copied' : 'copy failed';
+        btn.classList.toggle('done', ok);
+        setTimeout(() => { btn.textContent = old; btn.classList.remove('done'); }, 1200);
+      }
+    }
+
+    // MEASURE what is actually painted, so "is this frame majority text?" is a
+    // number rather than a feeling. Instagram officially demotes reels that are
+    // majority text, so the mockup exists to make that judgeable BEFORE he
+    // posts. This measures the rendered hook box against the frame box — the
+    // DOM as drawn, not an estimate from character counts.
+    function updateCoverage() {
+      const frame = document.getElementById('phoneFrame');
+      const span = document.getElementById('hookText');
+      const out = document.getElementById('coverage');
+      if (!frame || !out) return;
+      const fr = frame.getBoundingClientRect();
+      const frameArea = fr.width * fr.height;
+      let pct = 0;
+      if (span && frameArea > 0) {
+        const sr = span.getBoundingClientRect();
+        pct = (sr.width * sr.height) / frameArea * 100;
+      }
+      out.classList.remove('warn', 'bad');
+      let verdict = 'well under the majority-text line';
+      if (pct >= 50) { out.classList.add('bad'); verdict = 'MAJORITY TEXT — Instagram demotes this'; }
+      else if (pct >= 30) { out.classList.add('warn'); verdict = 'getting text-heavy'; }
+      out.innerHTML = `hook covers <b>${pct.toFixed(1)}%</b> of the frame — ${esc(verdict)}`;
+    }
+
+    function repaintOverlay() {
+      const c = candidates[idx];
+      if (!c) return;
+      const span = document.getElementById('hookText');
+      if (!span) return;
+      const key = selectedHookKey(c);
+      const text = hookTextFor(c, key);
+      span.textContent = text || 'no hook in this variant';
+      span.classList.toggle('empty', !text);
+      const wordCount = text ? text.split(/\s+/).filter(Boolean).length : 0;
+      const wc = document.getElementById('hookWords');
+      if (wc) {
+        wc.className = 'kitmeta' + (wordCount > 20 ? ' bad' : (wordCount > 12 ? ' warn' : ''));
+        wc.textContent = text
+          ? `${wordCount} words. TikTok's own guidance is 5-10 words per second of reading, so a hook read in the first 2 seconds is 10-20 words MAXIMUM, and shorter is safer.`
+          : 'this variant is empty.';
+      }
+      document.querySelectorAll('.variant .pick').forEach((b) => {
+        b.classList.toggle('on', b.dataset.hook === key);
+      });
+      updateCoverage();
+    }
+
+    function captionsPanel(c) {
+      if (!c.srt_text) {
+        return `<div class="kitmeta bad">No captions in this kit. The builder writes no SRT rather
+          than an empty one when the window holds no transcript segments.</div>`;
+      }
+      const basis = c.srt_basis
+        ? `rebased from the <b>${esc(c.srt_basis)}</b> witness (clip t=0 at ${fmt(c.srt_clip_t0_abs_s, 1)}s of the recording)`
+        : 'basis not recorded';
+      return `
+        <div class="kitmeta">${c.srt_segment_count} segments | ${basis}</div>
+        <textarea class="srt" data-field="srt_text" rows="6" placeholder="captions">${esc(kitValues(c).srt_text)}</textarea>
+        <div class="kitmeta">Edit only if whisper misheard something. The timings were computed from the
+          renderer that actually shipped this file, not guessed.</div>`;
+    }
+
+    function profilePanel(c) {
+      const p = profileState;
+      const kitProfileV = c.kit_profile_version;
+      const kitCtxV = c.kit_recording_context_version;
+      // Staleness is an INTEGER comparison against the version this kit was
+      // written against, not a timestamp: post_kits records the exact profile
+      // and context versions it used.
+      const profileStale = (p && hasKit(c) && kitProfileV !== null && kitProfileV !== undefined
+                            && Number(p.version) > Number(kitProfileV));
+      const ctxStale = (c.context_version !== null && c.context_version !== undefined
+                        && hasKit(c) && kitCtxV !== null && kitCtxV !== undefined
+                        && Number(c.context_version) > Number(kitCtxV));
+      const f = (k) => esc(p ? (p[k] ?? '') : '');
+      const subjKind = c.subject_kind || '';
+      return `
+        <div class="ctxbox">
+          <h3 style="margin:0 0 2px;font-size:13px;">Context that produced this kit</h3>
+          <p class="why">The generator sees exactly this. If it is wrong or stale, the copy is wrong.</p>
+          <div class="kitmeta${profileStale ? ' warn' : ''}">
+            global profile ${p ? 'v' + esc(p.version) + ', saved ' + esc(p.created_at) : 'NEVER SET'}
+            ${hasKit(c) ? ' | this kit was written against ' + (kitProfileV === null || kitProfileV === undefined ? 'NO profile' : 'v' + esc(kitProfileV)) : ''}
+            ${profileStale ? ' — THE PROFILE CHANGED AFTER THIS KIT WAS GENERATED, so this copy predates it' : ''}
+          </div>
+          <input type="text" id="pfChannel" placeholder="channel name" value="${f('channel_name')}" />
+          <input type="text" id="pfHandle" placeholder="handle" value="${f('handle')}" />
+          <input type="text" id="pfPlatforms" placeholder="platforms, e.g. instagram reels, tiktok" value="${f('platforms')}" />
+          <textarea id="pfStyle" rows="2" placeholder="style and tone the copy should sound like">${f('style_notes')}</textarea>
+          <textarea id="pfDoNots" rows="2" placeholder="hard avoids, stated plainly">${f('do_nots')}</textarea>
+          <textarea id="pfExtra" rows="2" placeholder="anything else the writer should know">${f('extra_context')}</textarea>
+          <div class="editrow" style="margin-top:6px;">
+            <button class="savewin" id="btnSaveProfile">Save profile (new version)</button>
+            <span class="hint">edit once, applies to every clip</span>
+          </div>
+
+          <div class="kitmeta${ctxStale ? ' warn' : ''}" style="margin-top:12px;">
+            SUBJECT of recording ${c.vod_id} (${esc(c.session_label)}) — who the clip is about
+            ${c.context_version ? ' | context v' + esc(c.context_version) : ' | NOT SET (the generator treats this as UNKNOWN, never as you)'}
+            ${ctxStale ? ' — CHANGED AFTER THIS KIT WAS GENERATED' : ''}
+          </div>
+          <div class="editrow">
+            <button class="pick${subjKind === 'me' ? ' on' : ''}" id="btnSubjMe">me</button>
+            <button class="pick${subjKind === 'other' ? ' on' : ''}" id="btnSubjOther">someone else</button>
+            <input type="text" id="subjText" placeholder="who is on screen, e.g. a DJ guesting on the IRL stream"
+                   value="${esc(c.subject_text || '')}" />
+          </div>
+          <textarea id="ctxNotes" rows="2" placeholder="what this recording was, in your words">${esc(c.context_notes || '')}</textarea>
+          <div class="editrow" style="margin-top:6px;">
+            <button class="savewin" id="btnSaveSubj">Save subject (new version)</button>
+          </div>
+          <div class="kitmeta"><b>me</b> pulls your full profile in as the speaker. <b>someone else</b>
+            requires a description, so your personal profile is never applied to them.</div>
+        </div>`;
+    }
+
+    function renderKitDetail(c) {
+      const kit = hasKit(c);
+      const v = kitValues(c);
+      const key = selectedHookKey(c);
+      const hookText = hookTextFor(c, key);
+      const tagCount = (v.hashtags || '').split(/\s+/).filter(Boolean).length;
+      const variantLabel = {
+        withheld: 'A - withholds',
+        domain: 'B - names the domain',
+        payoff: 'C - names the payoff',
+      };
+
+      const missingPanel = `
+        <div class="emptykit">
+          ${c.request_state === 'failed'
+            ? `<b>GENERATION FAILED</b>${c.request_requested_at ? ' (requested ' + esc(c.request_requested_at) + ')' : ''}.<br />
+               <span class="kitmeta bad">${esc(c.request_error || 'no reason recorded')}</span><br />
+               Nothing was written: a failed run persists no partial kit. Regenerate to try again.`
+            : `<b>NO KIT YET.</b> This clip is delivered, but the generator has not produced copy for it.
+               This is missing, not empty.
+               ${c.post_kit_enabled === 0 ? '<br />Post kit generation is switched <b>OFF</b> for this clip.' : ''}
+               ${regenPending(c) ? '<br />A regenerate was requested at ' + esc(c.request_requested_at) + ' and has not been answered yet.' : ''}`}
+        </div>`;
+
+      const copyBlocks = !kit ? missingPanel : `
+        <div class="kitblock">
+          <h3>1. On-video text — the hook you type into the platform's text tool</h3>
+          <p class="why">One short line. Instagram officially demotes reels that are majority text, so the
+            mockup on the left is the check: if the frame reads as text, cut words.
+            The three variants are deliberately spread along the concreteness axis, not three rewordings
+            of one idea (a meta-analysis of 8,977 headline experiments found 50.9% of headlines got WORSE
+            when made more concrete and only 8.7% better, so the right level is not knowable in advance).
+            No controlled evidence exists on question-versus-statement hooks, so neither is preferred here.</p>
+          ${['withheld', 'domain', 'payoff'].map((k) => `
+            <div class="variant">
+              <button class="pick${k === key ? ' on' : ''}" data-hook="${k}" title="show this one in the mockup">${esc(variantLabel[k])}</button>
+              <textarea data-field="${HOOK_FIELDS[k]}" rows="2" placeholder="required">${esc(v[HOOK_FIELDS[k]])}</textarea>
+              <button class="copybtn" data-copy="${HOOK_FIELDS[k]}">copy</button>
+            </div>`).join('')}
+          <div class="kitmeta" id="hookWords"></div>
+        </div>
+
+        <div class="kitblock">
+          <h3>2. Captions — the real speech, as a subtitle file</h3>
+          <p class="why">Built from the whisper transcript already stored for this window. Platform
+            auto-captions mangle this project's vocabulary (n8n, psycopg2, Coolify) and whisper already
+            got it right. Upload the .srt with the clip.</p>
+          ${captionsPanel(c)}
+          <div class="editrow" style="margin-top:6px;">
+            <button class="copybtn" data-copy="srt_text">copy SRT text</button>
+            ${c.srt_text ? `<a class="copybtn" style="text-decoration:none;display:inline-block;"
+               href="/api/candidates/${c.id}/captions.srt" download>download .srt</a>` : ''}
+          </div>
+        </div>
+
+        <div class="kitblock">
+          <h3>3. Video caption — the post descriptor</h3>
+          <p class="why">What accompanies the clip in the post body.</p>
+          <textarea data-field="video_caption" rows="4" placeholder="required">${esc(v.video_caption)}</textarea>
+          <div class="editrow" style="margin-top:6px;">
+            <button class="copybtn" data-copy="video_caption">copy caption</button>
+          </div>
+          <div class="kitmeta" style="margin-top:8px;">hashtags (minimal on purpose, space separated)</div>
+          <input type="text" data-field="hashtags" value="${esc(v.hashtags)}" placeholder="none" />
+          <div class="kitmeta${tagCount > 3 ? ' warn' : ''}">${tagCount} tag${tagCount === 1 ? '' : 's'}.
+            Hashtags are near-dead as reach: Instagram caps at 5, and a study of 24.3M posts found posts
+            WITH hashtags got 31% FEWER views. Two or three, never a wall.</div>
+          <div class="editrow" style="margin-top:6px;">
+            <button class="copybtn" data-copy="hashtags">copy hashtags</button>
+            <button class="copybtn" data-copy="caption_tags">copy caption + hashtags</button>
+          </div>
+          ${c.quoted_line ? `<div class="kitmeta" style="margin-top:8px;">quoted from the transcript, verbatim:
+            <b>${esc(c.quoted_line)}</b></div>` : ''}
+        </div>
+
+        <div class="kitblock">
+          <div class="editrow">
+            <button class="savewin" id="btnSaveKit">Save my edits (new version)</button>
+            <button class="nudge" id="btnRegen">Regenerate</button>
+            <span class="unsaved" id="kitUnsaved" style="display:${kitHasUnsaved(c) ? 'inline' : 'none'};">unsaved</span>
+          </div>
+          <div class="kitmeta">Saving never overwrites: it writes v${(c.kit_version || 0) + 1} and keeps
+            every earlier version. Regenerating asks first if the active version is yours, and the server
+            refuses it outright without that confirmation.</div>
+          ${c.vision_model || c.writer_model ? `<div class="kitmeta">generated by ${esc(c.vision_model || 'no vision model')}
+            + ${esc(c.writer_model || 'no writer model')}${c.passthrough_degraded === 1
+              ? ' — QUALITY PARAMETERS WERE REFUSED by the provider, so this ran at defaults' : ''}</div>` : ''}
+          <div class="kitmeta" id="kitHistory"></div>
+        </div>`;
+
+      detailEl.innerHTML = `
+        <h2 style="margin:0 0 8px;">Candidate #${c.id} — post kit</h2>
+        <div class="hint">session ${esc(c.session_label)} | vod ${c.vod_id} | delivered ${esc(c.drive_synced_at)}</div>
+        <div class="winline">${kitStampHtml(c)}</div>
+        <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
+          generate a post kit for this clip (intent only, the generator reads this)</label>
+        <div class="kitgrid">
+          <div>
+            <div class="phone" id="phoneFrame">
+              <video id="kitVid" playsinline preload="metadata" src="/clipmedia/${c.id}"></video>
+              <div class="missing" id="clipMissing" style="display:none;">
+                clip file not reachable from this machine.<br />
+                The mockup still works for the copy, only the video is unavailable here.
+              </div>
+              <div class="guide top" style="display:${showGuides ? 'block' : 'none'};"></div>
+              <div class="guide bottom" style="display:${showGuides ? 'block' : 'none'};"></div>
+              <div class="guide rail" style="display:${showGuides ? 'block' : 'none'};"></div>
+              <div class="hookband"><span class="hooktext" id="hookText">${esc(hookText)}</span></div>
+            </div>
+            <div class="editrow" style="margin-top:8px;">
+              <button class="replaywin" id="btnPlayClip">Play</button>
+              <button class="nudge" id="btnGuides">${showGuides ? 'hide' : 'show'} platform guides</button>
+            </div>
+            <div class="coverage" id="coverage"></div>
+            <div class="postmeta">
+              <div class="handle">${esc(profileState && profileState.handle ? profileState.handle : 'your handle')}</div>
+              <div class="cap" id="postCaption">${esc(v.video_caption)}</div>
+              <div class="tags" id="postTags">${esc(v.hashtags)}</div>
+            </div>
+            <div class="kitmeta">Dashed regions are covered by the platform's own UI. The hook is a CSS
+              overlay on top of the video: the delivered file in Drive has no text burned into it and
+              never will.</div>
+          </div>
+          <div>
+            ${copyBlocks}
+            ${profilePanel(c)}
+          </div>
+        </div>`;
+
+      wireKitDetail(c);
+    }
+
+    function wireKitDetail(c) {
+      const vid = document.getElementById('kitVid');
+      const missing = document.getElementById('clipMissing');
+      if (vid && missing) {
+        // An unreachable clip is a STATE, said plainly — never a silently
+        // broken player that looks like the kit itself failed.
+        vid.onerror = () => { missing.style.display = 'flex'; vid.style.display = 'none'; };
+      }
+      const playBtn = document.getElementById('btnPlayClip');
+      if (playBtn && vid) {
+        playBtn.onclick = () => { if (vid.paused) { vid.play(); playBtn.textContent = 'Pause'; }
+                                  else { vid.pause(); playBtn.textContent = 'Play'; } };
+      }
+      const guidesBtn = document.getElementById('btnGuides');
+      if (guidesBtn) {
+        guidesBtn.onclick = () => { showGuides = !showGuides; renderDetail(); };
+      }
+      const genEl = document.getElementById('genKit');
+      if (genEl) genEl.onchange = () => setGenerate(c, genEl.checked);
+
+      detailEl.querySelectorAll('.variant .pick').forEach((b) => {
+        b.onclick = () => { hookPick[c.id] = b.dataset.hook; repaintOverlay(); };
+      });
+
+      // Typing updates the DRAFT and repaints the mockup live. Nothing is
+      // written to the database until Save.
+      detailEl.querySelectorAll('[data-field]').forEach((el) => {
+        el.oninput = () => {
+          const d = kitDrafts[c.id] || Object.assign({}, kitValues(c));
+          d[el.dataset.field] = el.value;
+          kitDrafts[c.id] = d;
+          const flag = document.getElementById('kitUnsaved');
+          if (flag) flag.style.display = kitHasUnsaved(c) ? 'inline' : 'none';
+          if (el.dataset.field === 'video_caption') {
+            const pc = document.getElementById('postCaption');
+            if (pc) pc.textContent = el.value;
+          }
+          if (el.dataset.field === 'hashtags') {
+            const pt = document.getElementById('postTags');
+            if (pt) pt.textContent = el.value;
+          }
+          repaintOverlay();
+        };
+      });
+
+      detailEl.querySelectorAll('.copybtn[data-copy]').forEach((b) => {
+        b.onclick = () => {
+          const vals = kitValues(c);
+          const what = b.dataset.copy;
+          let text = '';
+          if (what === 'caption_tags') text = [vals.video_caption, vals.hashtags].filter(Boolean).join('\n\n');
+          else text = vals[what] || '';
+          copyText(text, b);
+        };
+      });
+
+      const saveBtn = document.getElementById('btnSaveKit');
+      if (saveBtn) saveBtn.onclick = () => saveKit(c);
+      const regenBtn = document.getElementById('btnRegen');
+      if (regenBtn) regenBtn.onclick = () => requestRegenerate(c);
+      const pfBtn = document.getElementById('btnSaveProfile');
+      if (pfBtn) pfBtn.onclick = () => saveProfile();
+      const subjBtn = document.getElementById('btnSaveSubj');
+      if (subjBtn) subjBtn.onclick = () => saveSubject(c);
+      const meBtn = document.getElementById('btnSubjMe');
+      const otherBtn = document.getElementById('btnSubjOther');
+      if (meBtn && otherBtn) {
+        meBtn.onclick = () => { subjectPick[c.vod_id] = 'me'; meBtn.classList.add('on'); otherBtn.classList.remove('on'); };
+        otherBtn.onclick = () => { subjectPick[c.vod_id] = 'other'; otherBtn.classList.add('on'); meBtn.classList.remove('on'); };
+      }
+
+      repaintOverlay();
+      loadHistory(c);
+    }
+
+    async function loadHistory(c) {
+      const out = document.getElementById('kitHistory');
+      if (!out) return;
+      try {
+        const res = await fetch(`/api/candidates/${c.id}/kits`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        const rows = (data.versions || []).map((k) =>
+          `<div class="histrow">v${k.version} ${esc(k.origin)}${k.is_active === 1 ? ' ACTIVE' : ''} ${esc(k.created_at)}</div>`
+        ).join('');
+        const reqs = (data.requests || []).map((q) =>
+          `<div class="histrow">request ${esc(q.state)} ${esc(q.requested_at)}${q.force_over_operator_edit === 1 ? ' [confirmed over your edit]' : ''}${q.error ? ' — ' + esc(q.error) : ''}</div>`
+        ).join('');
+        out.innerHTML = (rows + reqs) || '<div class="histrow">no versions</div>';
+      } catch (_) { /* history is informational, never surface a transient error */ }
+    }
+
+    async function setGenerate(c, value) {
+      gen += 1;
+      try {
+        const res = await fetch(`/api/candidates/${c.id}/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ post_kit_enabled: value }),
+        });
+        if (!res.ok) {
+          let body = '';
+          try { body = JSON.stringify(await res.json()); } catch (_) {}
+          alert(`Failed: ${res.status} ${body}`);
+          await loadCandidates();
+          return;
+        }
+        const row = await res.json();
+        const j = indexOfRow(row.id);
+        if (j !== -1) { candidates[j] = mergeLocalFlags(candidates[j], row); idx = j; }
+        renderList();
+        renderDetail();
+      } catch (err) {
+        alert(`Failed: ${String(err)}`);
+      }
+    }
+
+    // The pending queue's rows do not carry kit columns, so a kit-endpoint
+    // response is a SUPERSET there. Merging keeps the local-only _webhook flag
+    // that D-056 sets on the card.
+    function mergeLocalFlags(oldRow, newRow) {
+      if (oldRow && oldRow._webhook && (newRow.clip_state === null || newRow.clip_state === undefined)) {
+        newRow._webhook = oldRow._webhook;
+      }
+      return newRow;
+    }
+
+    async function saveKit(c) {
+      if (!hasKit(c)) return;
+      const v = kitValues(c);
+      // The schema declares the three hooks and the caption NOT NULL, so the
+      // server refuses a blank one. Say so here rather than sending a request
+      // that is guaranteed to fail.
+      for (const f of ['hook_withheld', 'hook_domain', 'hook_payoff', 'video_caption']) {
+        if (!(v[f] || '').trim()) {
+          alert(`${f} cannot be empty: the schema requires all three hooks and the caption.`);
+          return;
+        }
+      }
+      gen += 1;
+      let res;
+      try {
+        res = await fetch(`/api/candidates/${c.id}/kit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            base_version: c.kit_version,
+            hook_withheld: v.hook_withheld,
+            hook_domain: v.hook_domain,
+            hook_payoff: v.hook_payoff,
+            video_caption: v.video_caption,
+            hashtags: (v.hashtags || '').split(/\s+/).filter(Boolean),
+            srt_text: v.srt_text || null,
+          }),
+        });
+      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      if (!res.ok) {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) {}
+        alert(`Save refused: ${res.status} ${body}`);
+        return;
+      }
+      const row = await res.json();
+      delete kitDrafts[row.id];
+      const j = indexOfRow(row.id);
+      if (j !== -1) { candidates[j] = row; idx = j; }
+      renderList();
+      renderDetail();
+    }
+
+    async function requestRegenerate(c) {
+      if (kitHasUnsaved(c)) {
+        alert('You have unsaved edits. Save them or reload the card before regenerating.');
+        return;
+      }
+      let confirmFlag = false;
+      if (hasKit(c) && c.kit_origin === 'operator_edit') {
+        // The server refuses this without confirm=true regardless of what the
+        // browser does. This dialog exists so the refusal is not a dead end.
+        if (!window.confirm(
+          `The active version (v${c.kit_version}) is YOUR edit.\n\n`
+          + 'Regenerating asks the generator to write a new machine draft on top of it. Your version is '
+          + 'kept forever and stays readable in the history, but the active kit will no longer be your '
+          + 'words.\n\nRegenerate anyway?')) {
+          return;
+        }
+        confirmFlag = true;
+      }
+      gen += 1;
+      let res;
+      try {
+        res = await fetch(`/api/candidates/${c.id}/kit/regenerate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: confirmFlag }),
+        });
+      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      if (!res.ok) {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) {}
+        alert(`Regenerate refused: ${res.status} ${body}`);
+        return;
+      }
+      const row = await res.json();
+      const j = indexOfRow(row.id);
+      if (j !== -1) { candidates[j] = row; idx = j; }
+      renderList();
+      renderDetail();
+      if (row.regenerate_command) {
+        alert('Regenerate requested. It is recorded for the generator lane.\n\n'
+          + 'To run it yourself right now:\n' + row.regenerate_command);
+      }
+    }
+
+    async function loadProfile() {
+      try {
+        const res = await fetch('/api/profile', { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        profileState = data.profile;
+      } catch (_) { /* the surface still works without it */ }
+    }
+
+    async function saveProfile() {
+      const get = (id) => {
+        const el = document.getElementById(id);
+        return el && el.value.trim() !== '' ? el.value : null;
+      };
+      let res;
+      try {
+        res = await fetch('/api/profile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            base_version: profileState ? profileState.version : null,
+            channel_name: get('pfChannel'),
+            handle: get('pfHandle'),
+            platforms: get('pfPlatforms'),
+            style_notes: get('pfStyle'),
+            do_nots: get('pfDoNots'),
+            extra_context: get('pfExtra'),
+          }),
+        });
+      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      if (!res.ok) {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) {}
+        alert(`Save refused: ${res.status} ${body}`);
+        return;
+      }
+      const data = await res.json();
+      profileState = data.profile;
+      renderDetail();
+    }
+
+    async function saveSubject(c) {
+      const kind = subjectPick[c.vod_id] || c.subject_kind;
+      if (!kind) {
+        alert('Choose "me" or "someone else" first. There is deliberately no default: a recording with '
+          + 'no subject is treated as UNKNOWN, never as you.');
+        return;
+      }
+      const textEl = document.getElementById('subjText');
+      const notesEl = document.getElementById('ctxNotes');
+      let res;
+      try {
+        res = await fetch(`/api/recordings/${c.vod_id}/subject`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            subject_kind: kind,
+            subject_text: textEl && textEl.value.trim() !== '' ? textEl.value : null,
+            context_notes: notesEl && notesEl.value.trim() !== '' ? notesEl.value : null,
+          }),
+        });
+      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      if (!res.ok) {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) {}
+        alert(`Save refused: ${res.status} ${body}`);
+        return;
+      }
+      const rec = await res.json();
+      // Every card from the same recording carries this context, so update all
+      // of them rather than only the visible one.
+      for (const row of candidates) {
+        if (row.vod_id === rec.recording_id) {
+          row.context_version = rec.version;
+          row.subject_kind = rec.subject_kind;
+          row.subject_text = rec.subject_text;
+          row.context_notes = rec.context_notes;
+        }
+      }
+      delete subjectPick[c.vod_id];
+      renderDetail();
     }
 
     function renderDetail() {
@@ -243,6 +1021,10 @@
         return;
       }
       const c = candidates[idx];
+      if (view === 'delivered') {
+        renderKitDetail(c);
+        return;
+      }
       // D-055: the video fragment and the window display use the EFFECTIVE
       // (saved) window — adjusted else original. Originals stay for reference.
       const eff = effectiveWindow(c);
@@ -298,6 +1080,9 @@
           ${edited ? `<span class="orig">(original ${fmt(c.start_s, 1)}s to ${fmt(c.end_s, 1)}s)</span>` : ''}
           ${deliveryBadgeHtml(c)}
         </div>
+        <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
+          generate a post kit for this clip (default on, flip it any time — it records intent only,
+          the copy is generated after the clip is delivered)</label>
         <div class="actions">
           <button class="approve" id="btnApprove">Approve (a)</button>
           ${view !== 'rejected' ? '<button class="reject" id="btnReject">Reject (r)</button>' : ''}
@@ -317,6 +1102,12 @@
       // panel), so it is wired outside the editable branch.
       const replayBtn = document.getElementById('btnReplay');
       if (replayBtn) replayBtn.onclick = () => replayWindow();
+      // D-061: the generate toggle. Records intent only — it fires no
+      // generation, touches no verdict, and is deliberately live in every
+      // state (see the server's _set_generate for why it is not locked on
+      // approved cards).
+      const genEl = document.getElementById('genKit');
+      if (genEl) genEl.onchange = () => setGenerate(c, genEl.checked);
       if (editable) {
         detailEl.querySelectorAll('.nudge').forEach((btn) => {
           btn.onclick = () => nudgeWindow(btn.dataset.field, Number(btn.dataset.delta));
@@ -535,6 +1326,7 @@
     tabPendingEl.onclick = () => switchView('pending');
     tabMaybeEl.onclick = () => switchView('maybe');
     tabRejectedEl.onclick = () => switchView('rejected');
+    tabDeliveredEl.onclick = () => switchView('delivered');
 
     // D-056 light polling: every 15s re-fetch the current queue and reconcile
     // IN PLACE — delivered cards disappear and badges update without resetting
@@ -592,6 +1384,10 @@
       // Re-render the detail pane ONLY when the selected card changed identity
       // or content — an unconditional re-render would reload the <video> on
       // every poll and stop whatever the operator is watching.
+      // D-061: and NEVER re-render over unsaved kit edits. A poll landing
+      // mid-sentence would replace the textareas he is typing into and throw
+      // his words away — the exact silent-overwrite this design forbids.
+      if (sel && kitHasUnsaved(sel)) return;
       if (!sel || sel.id !== selId || rowFingerprint(sel) !== selFp) {
         renderDetail();
       }
@@ -599,7 +1395,20 @@
 
     setInterval(() => { pollRefresh(); }, POLL_MS);
 
+    // D-061: the post kit view introduced the first EDITABLE FIELDS on this
+    // surface, and the shortcut map predates them. Without this guard, typing
+    // the letter "a" into a caption box would fire an approve, and "j" would
+    // jump to another card and abandon the draft. The map itself is unchanged;
+    // it is simply inert while the operator is typing.
+    function typingInField(e) {
+      const t = e.target;
+      if (!t) return false;
+      const tag = (t.tagName || '').toUpperCase();
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true;
+    }
+
     document.addEventListener('keydown', (e) => {
+      if (typingInField(e)) return;
       if (e.key === 'ArrowDown' || e.key === 'j') {
         e.preventDefault();
         move(1);
