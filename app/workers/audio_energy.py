@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """audio_energy: extract 5s loudness buckets for one VOD using ffmpeg ebur128.
-Reads CLPR_DB_PATH by env var name. Exits non-zero on any failure.
+Reads CLPR_DB_URL by env var name. Exits non-zero on any failure.
 Prints machine-parseable RESULT line last.
+
+PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
+(CLPR_DB_URL); tables per app/docs/naming-map.md (vods->recordings,
+audio_energy->audio_energy_buckets, vod_id->recording_id). The --vod-id CLI
+flag is an external contract and stays; it binds to recording_id internally.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
 import re
-import sqlite3
 import subprocess
 import sys
 import time
@@ -20,18 +23,17 @@ try:
 except ModuleNotFoundError:
     from .obs_guard import require_obs_idle_or_raise
 
+import db
+
 LOUDNESS_RE = re.compile(r't:\s*([\d.]+).*?\bM:\s*(-?[\d.]+|-inf)')
 BUCKET_SECONDS = 5.0
 
 
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
-
-
-def fetch_vod_path(conn: sqlite3.Connection, vod_id: int) -> str:
-    row = conn.execute('SELECT path FROM vods WHERE id = ?', (vod_id,)).fetchone()
+def fetch_recording_path(cur, recording_id: int) -> str:
+    cur.execute('SELECT path FROM recordings WHERE id = %s', (recording_id,))
+    row = cur.fetchone()
     if not row:
-        raise RuntimeError(f'vod_id not found: {vod_id}')
+        raise RuntimeError(f'recording_id not found: {recording_id}')
     return row[0]
 
 
@@ -63,18 +65,18 @@ def bucketize_max(readings: list[tuple[float, float]]) -> list[tuple[float, floa
     return rows
 
 
-def audio_energy(vod_id: int) -> int:
+def audio_energy(recording_id: int) -> int:
     require_obs_idle_or_raise('audio_energy')
 
-    db_path = get_db_path()
     started = time.monotonic()
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
         # D-050: pre-detection poison gate removed — the operator's clip review (D-002) is the poison gate; M5 auto-publish must reinstate a mandatory mechanism.
-        vod_path = fetch_vod_path(conn, vod_id)
+        recording_path = fetch_recording_path(cur, recording_id)
 
-        cmd = ['ffmpeg', '-i', vod_path, '-af', 'ebur128', '-f', 'null', '-']
+        cmd = ['ffmpeg', '-i', recording_path, '-af', 'ebur128', '-f', 'null', '-']
         print(f'CMD {cmd}')
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -93,25 +95,27 @@ def audio_energy(vod_id: int) -> int:
         if not buckets:
             raise RuntimeError('no 5-second buckets produced from parsed loudness readings')
 
-        conn.execute('BEGIN;')
-        try:
-            conn.execute('DELETE FROM audio_energy WHERE vod_id = ?', (vod_id,))
-            conn.executemany(
-                '''
-                INSERT INTO audio_energy(vod_id, start_s, end_s, loudness_lufs)
-                VALUES (?, ?, ?, ?)
-                ''',
-                [(vod_id, start_s, end_s, loudness) for start_s, end_s, loudness in buckets],
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        # autocommit is OFF: the reads above already opened the transaction
+        # implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
+        cur.execute('DELETE FROM audio_energy_buckets WHERE recording_id = %s', (recording_id,))
+        cur.executemany(
+            '''
+            INSERT INTO audio_energy_buckets(recording_id, start_s, end_s, loudness_lufs)
+            VALUES (%s, %s, %s, %s)
+            ''',
+            [(recording_id, start_s, end_s, loudness) for start_s, end_s, loudness in buckets],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     elapsed_s = time.monotonic() - started
     print(
-        f'RESULT audio_energy vod_id={vod_id} ok=1 buckets={len(buckets)} '
-        f'elapsed_s={elapsed_s:.3f} vod_path="{vod_path}"'
+        f'RESULT audio_energy recording={recording_id} ok=1 buckets={len(buckets)} '
+        f'elapsed_s={elapsed_s:.3f} vod_path="{recording_path}"'
     )
     return 0
 

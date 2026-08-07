@@ -2,8 +2,11 @@
 """sync_clip_to_drive: copy one rendered clip's local file into a locally-synced
 Google Drive Desktop folder (which uploads it automatically), and record that
 the copy happened.
-Reads CLPR_DB_PATH and exits non-zero on any failure.
-Prints machine-parseable RESULT line last.
+Connects via the shared adapter app/workers/db.py (CLPR_DB_URL) and exits
+non-zero on any failure. Prints machine-parseable RESULT line last.
+
+PostgreSQL port (D-052 P3): the clips table keeps its name; placeholders and
+transaction control per app/docs/PORTING_CHECKLIST.md.
 """
 
 from __future__ import annotations
@@ -12,13 +15,10 @@ import argparse
 import datetime as dt
 import os
 import shutil
-import sqlite3
 import sys
 from pathlib import Path
 
-
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
+import db
 
 
 def utc_now_iso() -> str:
@@ -35,15 +35,15 @@ def require_env(name: str) -> str:
 def sync_clip(candidate_id: int) -> int:
     drive_sync_dir = require_env('CLPR_DRIVE_SYNC_DIR')
 
-    db_path = get_db_path()
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-
-        row = conn.execute(
-            'SELECT candidate_id, file_path, state, drive_synced_at FROM clips WHERE candidate_id = ?',
+        cur.execute(
+            'SELECT candidate_id, file_path, state, drive_synced_at FROM clips WHERE candidate_id = %s',
             (candidate_id,),
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if not row:
             raise RuntimeError(f'no clips row for candidate_id={candidate_id}; render it first with cut_clip.py')
 
@@ -68,15 +68,16 @@ def sync_clip(candidate_id: int) -> int:
         if src_size != dst_size:
             raise RuntimeError(f'post-copy size mismatch: src={src_size} dst={dst_size}')
 
-        try:
-            conn.execute(
-                'UPDATE clips SET drive_synced_at = ?, drive_sync_path = ? WHERE candidate_id = ?',
-                (utc_now_iso(), str(dest_path), candidate_id),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        cur.execute(
+            'UPDATE clips SET drive_synced_at = %s, drive_sync_path = %s WHERE candidate_id = %s',
+            (utc_now_iso(), str(dest_path), candidate_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     print(f'RESULT sync_clip_to_drive candidate={candidate_id} ok=1 dest="{dest_path}" size={dst_size}')
     return 0

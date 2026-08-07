@@ -4,6 +4,12 @@
 Split lane, second half (n8n Basic LLM Chain redesign). Reads a responses file shaped
   {"vod_id": N, "items": [{"call_id", "kind", "meta", "response_text"}], "count": M}
 
+PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
+(CLPR_DB_URL); tables per app/docs/naming-map.md (rows land in
+llm_signal_candidates, schema-owned by 001_consolidated_schema.sql). The
+--vod-id CLI flag and the "vod_id" JSON key are external contracts (n8n) and
+stay; both bind to recording_id internally.
+
 HARD GATES before any write (any failure -> loud error, ZERO rows land):
   - file exists and parses as a JSON object
   - file vod_id == --vod-id
@@ -22,9 +28,9 @@ Then per item, validation/normalization mirrors transcript_signal.py exactly:
     try/except); confidence >= 0.5 gate; empty-slice triggers (no LLM item) produce
     the pure fallback row.
 
-Rows land via the same insert path (insert_signal_rows, INSERT OR IGNORE) with a fresh
-run_id. RESULT line last. Exits non-zero on any failure; failure verdict prints to
-stderr (D-047).
+Rows land via the same insert path (insert_signal_rows, ON CONFLICT ... DO NOTHING)
+with a fresh run_id. RESULT line last. Exits non-zero on any failure; failure verdict
+prints to stderr (D-047).
 """
 
 from __future__ import annotations
@@ -33,10 +39,10 @@ import argparse
 import datetime as dt
 import json
 import os
-import sqlite3
 import sys
 from typing import Optional
 
+import db
 import transcript_signal as ts
 from transcript_signal_prepare import scan_call_id, zebra_call_id
 
@@ -124,12 +130,12 @@ def collect_zebra_rows(zebra_items: list, responses: dict[str, str], duration_s:
     return out
 
 
-def run(vod_id: int, responses_path: str) -> int:
+def run(recording_id: int, responses_path: str) -> int:
     payload = load_responses(responses_path)
 
     file_vod = payload.get('vod_id')
-    if file_vod != vod_id:
-        raise RuntimeError(f'vod_id mismatch: --vod-id {vod_id} but responses file has vod_id={file_vod!r}')
+    if file_vod != recording_id:
+        raise RuntimeError(f'vod_id mismatch: --vod-id {recording_id} but responses file has vod_id={file_vod!r}')
 
     items = payload.get('items')
     if not isinstance(items, list):
@@ -141,15 +147,15 @@ def run(vod_id: int, responses_path: str) -> int:
         if not isinstance(item, dict) or 'call_id' not in item:
             raise RuntimeError('every responses item must be an object with a call_id')
 
-    db_path = ts.get_db_path()
     run_id = f'transcript_signal_ingest_{dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-        duration_s, _ = ts.fetch_vod(conn, vod_id)
-        segments = ts.fetch_segments(conn, vod_id)
-        triggers = ts.fetch_zebra_triggers(conn, vod_id)
-        ts.ensure_intermediate_table(conn)
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+        duration_s, _ = ts.fetch_recording(cur, recording_id)
+        segments = ts.fetch_segments(cur, recording_id)
+        triggers = ts.fetch_zebra_triggers(cur, recording_id)
+        # llm_signal_candidates is schema-owned (001_consolidated_schema.sql).
 
         scan_items = list(ts.iter_scan_items(segments))
         zebra_items = list(ts.iter_zebra_items(triggers, duration_s, segments))
@@ -171,19 +177,21 @@ def run(vod_id: int, responses_path: str) -> int:
         transcript_rows = collect_scan_rows(scan_items, responses, duration_s)
         zebra_rows = collect_zebra_rows(zebra_items, responses, duration_s)
 
-        conn.execute('BEGIN;')
-        try:
-            inserted_transcript = ts.insert_signal_rows(conn, vod_id, transcript_rows, run_id)
-            inserted_zebra = ts.insert_signal_rows(conn, vod_id, zebra_rows, run_id)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        # autocommit is OFF: the reads above already opened the transaction
+        # implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
+        inserted_transcript = ts.insert_signal_rows(cur, recording_id, transcript_rows, run_id)
+        inserted_zebra = ts.insert_signal_rows(cur, recording_id, zebra_rows, run_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     attempted = len(transcript_rows) + len(zebra_rows)
     inserted = inserted_transcript + inserted_zebra
     print(
-        f'RESULT transcript_signal_ingest vod={vod_id} items={len(items)} '
+        f'RESULT transcript_signal_ingest recording={recording_id} items={len(items)} '
         f'rows_inserted={inserted} rows_skipped_duplicate={attempted - inserted} '
         f'scan_rows={len(transcript_rows)} scan_inserted={inserted_transcript} '
         f'zebra_rows={len(zebra_rows)} zebra_inserted={inserted_zebra}'

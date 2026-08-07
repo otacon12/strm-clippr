@@ -8,16 +8,18 @@ live, same as run_pipeline's GATE C) never blocks delivery of existing files.
 
 The delivered copy gets a DESCRIPTIVE name (operator-approved naming ruling,
 2026-08-06): <session_label>_c<candidate_id>_<category>.mp4, where category is
-looked up from transcript_signal_candidates matching (vod_id, start_s), or
+looked up from llm_signal_candidates matching (recording_id, start_s), or
 'unknown' when absent. The local file in clips_out keeps its existing name.
 
 Idempotent: a candidate whose delivered copy already exists at the destination
 with matching byte size is skipped.
 
 Per-candidate failure isolation: one failure never aborts the batch.
-Reads CLPR_DB_PATH. Prints machine-parseable RESULT line last; failure details
-also go to stderr (D-047 host rule). Exit 0 iff nothing FAILED (obs_blocked is
-not failure).
+Connects via the shared adapter app/workers/db.py (CLPR_DB_URL). Prints
+machine-parseable RESULT line last; failure details also go to stderr (D-047
+host rule). Exit 0 iff nothing FAILED (obs_blocked is not failure).
+
+PostgreSQL port (D-052 P3): tables and columns per app/docs/naming-map.md.
 """
 
 from __future__ import annotations
@@ -26,9 +28,10 @@ import argparse
 import datetime as dt
 import os
 import shutil
-import sqlite3
 import sys
 from pathlib import Path
+
+import db
 
 try:
     import cut_clip
@@ -36,10 +39,6 @@ try:
 except ModuleNotFoundError:
     from . import cut_clip
     from .obs_guard import require_obs_idle_or_raise
-
-
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
 
 
 def utc_now_iso() -> str:
@@ -61,38 +60,41 @@ def delivered_name(session_label: str, candidate_id: int, category: str) -> str:
     return f'{session_label}_c{candidate_id}_{category}.mp4'
 
 
-def fetch_approved(conn: sqlite3.Connection) -> list[dict]:
-    """All approved candidates with vod session_label, clip row (if any) and
-    transcript_signal category ('unknown' when absent)."""
-    has_tsc = conn.execute(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='transcript_signal_candidates'"
-    ).fetchone()[0] == 1
+def fetch_approved(cur) -> list[dict]:
+    """All approved candidates with recording session_label, clip row (if any)
+    and llm_signal category ('unknown' when absent)."""
+    cur.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = 'llm_signal_candidates'"
+    )
+    has_llm_signal = cur.fetchone() is not None
 
     category_select = (
-        '(SELECT t.category FROM transcript_signal_candidates t '
-        ' WHERE t.vod_id = c.vod_id AND t.start_s = c.start_s '
+        '(SELECT t.category FROM llm_signal_candidates t '
+        ' WHERE t.recording_id = c.recording_id AND t.start_s = c.start_s '
         ' ORDER BY t.id LIMIT 1)'
-        if has_tsc else 'NULL'
+        if has_llm_signal else 'NULL'
     )
 
-    rows = conn.execute(
+    cur.execute(
         f'''
-        SELECT c.id, c.vod_id, c.start_s, v.session_label,
+        SELECT c.id, c.recording_id, c.start_s, r.session_label,
                cl.file_path, cl.state,
                {category_select} AS category
-        FROM candidates c
-        JOIN vods v ON v.id = c.vod_id
+        FROM clip_candidates c
+        JOIN recordings r ON r.id = c.recording_id
         LEFT JOIN clips cl ON cl.candidate_id = c.id
         WHERE c.state = 'approved'
         ORDER BY c.id
         '''
-    ).fetchall()
+    )
+    rows = cur.fetchall()
 
     out = []
     for r in rows:
         out.append({
             'candidate_id': int(r[0]),
-            'vod_id': int(r[1]),
+            'recording_id': int(r[1]),
             'start_s': float(r[2]),
             'session_label': str(r[3]),
             'clip_file_path': str(r[4]) if r[4] is not None else None,
@@ -125,7 +127,7 @@ def already_delivered(cand: dict, dest: Path) -> bool:
     )
 
 
-def sync_candidate(conn: sqlite3.Connection, cand: dict, dest: Path) -> None:
+def sync_candidate(conn, cur, cand: dict, dest: Path) -> None:
     """sync_clip_to_drive's mechanism (copy2, byte-size verification,
     drive_synced_at/drive_sync_path columns) with the descriptive dest name."""
     src_path = Path(cand['clip_file_path'])
@@ -139,8 +141,8 @@ def sync_candidate(conn: sqlite3.Connection, cand: dict, dest: Path) -> None:
         raise RuntimeError(f'post-copy size mismatch: src={src_size} dst={dst_size}')
 
     try:
-        conn.execute(
-            'UPDATE clips SET drive_synced_at = ?, drive_sync_path = ? WHERE candidate_id = ?',
+        cur.execute(
+            'UPDATE clips SET drive_synced_at = %s, drive_sync_path = %s WHERE candidate_id = %s',
             (utc_now_iso(), str(dest), cand['candidate_id']),
         )
         conn.commit()
@@ -153,11 +155,12 @@ def sync_candidate(conn: sqlite3.Connection, cand: dict, dest: Path) -> None:
     )
 
 
-def refresh_clip_fields(conn: sqlite3.Connection, cand: dict) -> None:
-    row = conn.execute(
-        'SELECT file_path, state FROM clips WHERE candidate_id = ?',
+def refresh_clip_fields(cur, cand: dict) -> None:
+    cur.execute(
+        'SELECT file_path, state FROM clips WHERE candidate_id = %s',
         (cand['candidate_id'],),
-    ).fetchone()
+    )
+    row = cur.fetchone()
     if row:
         cand['clip_file_path'] = str(row[0]) if row[0] is not None else None
         cand['clip_state'] = str(row[1]) if row[1] is not None else None
@@ -181,7 +184,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     drive_sync_dir = require_env('CLPR_DRIVE_SYNC_DIR')
-    db_path = get_db_path()
 
     rendered_now = 0
     synced_now = 0
@@ -189,9 +191,10 @@ def main() -> int:
     obs_blocked = 0
     failed = 0
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-        candidates = fetch_approved(conn)
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+        candidates = fetch_approved(cur)
         approved = len(candidates)
 
         if args.dry_run:
@@ -235,7 +238,7 @@ def main() -> int:
                     already += 1
                     print(f'SKIP_ALREADY_DELIVERED candidate={cid} dest="{dest}"')
                 elif is_sync_eligible(cand):
-                    sync_candidate(conn, cand, dest)
+                    sync_candidate(conn, cur, cand, dest)
                     synced_now += 1
                 elif cand['clip_file_path'] is not None and cand['clip_state'] == 'rendered':
                     # clips row says rendered but the file is gone: needs re-render.
@@ -247,6 +250,7 @@ def main() -> int:
                 else:
                     pending_render.append(cand)
             except Exception as exc:
+                conn.rollback()  # clear any aborted transaction before continuing the batch
                 failed += 1
                 report_failure(cid, 'sync', exc)
 
@@ -283,16 +287,19 @@ def main() -> int:
 
                     rendered_now += 1
                     try:
-                        refresh_clip_fields(conn, cand)
+                        refresh_clip_fields(cur, cand)
                         if not is_sync_eligible(cand):
                             raise RuntimeError(
                                 f'render reported ok but no syncable clip row/file for candidate={cid}'
                             )
-                        sync_candidate(conn, cand, dest_path_for(drive_sync_dir, cand))
+                        sync_candidate(conn, cur, cand, dest_path_for(drive_sync_dir, cand))
                         synced_now += 1
                     except Exception as exc:
+                        conn.rollback()  # clear any aborted transaction before continuing the batch
                         failed += 1
                         report_failure(cid, 'sync_after_render', exc)
+    finally:
+        conn.close()
 
     ok = 1 if failed == 0 else 0
     print(

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """cut_all_approved: render approved candidates in batch via cut_clip.render_clip.
-Reads CLPR_DB_PATH and exits non-zero only for wrapper-level failures.
+Connects via the shared adapter app/workers/db.py (CLPR_DB_URL); exits non-zero
+only for wrapper-level failures.
 Per-candidate render failures are isolated and reported; batch continues.
 Prints machine-parseable RESULT line last.
+
+PostgreSQL port (D-052 P3): tables and columns per app/docs/naming-map.md.
 """
 
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
+
+import db
 
 try:
     from cut_clip import render_clip
@@ -17,22 +21,17 @@ except ModuleNotFoundError:
     from .cut_clip import render_clip
 
 
-def get_db_path() -> str:
-    import os
-
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
-
-
-def fetch_approved_with_clip_presence(conn: sqlite3.Connection) -> list[tuple[int, int]]:
-    rows = conn.execute(
+def fetch_approved_with_clip_presence(cur) -> list[tuple[int, int]]:
+    cur.execute(
         '''
         SELECT c.id, CASE WHEN cl.id IS NULL THEN 0 ELSE 1 END AS has_clip
-        FROM candidates c
+        FROM clip_candidates c
         LEFT JOIN clips cl ON cl.candidate_id = c.id
         WHERE c.state = 'approved'
         ORDER BY c.id
         '''
-    ).fetchall()
+    )
+    rows = cur.fetchall()
     return [(int(r[0]), int(r[1])) for r in rows]
 
 
@@ -44,16 +43,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    db_path = get_db_path()
 
     processed = 0
     succeeded = 0
     failed = 0
     skipped_already_rendered = 0
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-        rows = fetch_approved_with_clip_presence(conn)
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+        rows = fetch_approved_with_clip_presence(cur)
+    finally:
+        conn.close()
 
     for candidate_id, has_clip in rows:
         processed += 1

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """review_server: local operator-only review surface for clip candidates.
-Binds to loopback only. Reads CLPR_DB_PATH. No external dependencies.
+Binds to loopback only. Connects to the consolidated PostgreSQL via the shared
+adapter app/workers/db.py (CLPR_DB_URL). No external dependencies beyond psycopg2.
+
+PostgreSQL port (D-052 P3): tables and columns per app/docs/naming-map.md.
+The JSON keys `vod_id`/`vod_path` and the /api/candidates + /media/<vod_id>
+URL paths are an external contract consumed by review_ui.html and stay as-is
+(SQL aliases map them onto the renamed schema). PG-only addition:
+`display_name` (recordings.display_name) rides along in candidate payloads.
 """
 
 from __future__ import annotations
@@ -8,42 +15,41 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
+import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+import psycopg2.extras
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'workers'))
+import db  # noqa: E402  (app/workers/db.py — the shared adapter)
+
 HOST = '127.0.0.1'
-PORT = 8737
+PORT = int(os.environ.get('CLPR_REVIEW_PORT', '8737'))
 UI_PATH = Path(__file__).resolve().parent / 'review_ui.html'
 POST_ACTION_RE = re.compile(r'^/api/candidates/(\d+)/(approve|reject|maybe)$')
 
 
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
-
-
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(get_db_path())
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA foreign_keys = ON;')
-    return conn
+def dict_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def json_bytes(obj: object) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode('utf-8')
 
 
-def fetch_candidate_row(conn: sqlite3.Connection, candidate_id: int) -> Optional[dict]:
-    row = conn.execute(
+def fetch_candidate_row(cur, candidate_id: int) -> Optional[dict]:
+    cur.execute(
         '''
         SELECT
           c.id,
-          c.vod_id,
-          v.path AS vod_path,
-          v.session_label,
+          c.recording_id AS vod_id,
+          r.path AS vod_path,
+          r.session_label,
+          r.display_name,
           c.start_s,
           c.end_s,
           c.score,
@@ -53,12 +59,13 @@ def fetch_candidate_row(conn: sqlite3.Connection, candidate_id: int) -> Optional
           c.signal_beat_boost,
           c.state,
           c.created_at
-        FROM candidates c
-        JOIN vods v ON v.id = c.vod_id
-        WHERE c.id = ?
+        FROM clip_candidates c
+        JOIN recordings r ON r.id = c.recording_id
+        WHERE c.id = %s
         ''',
         (candidate_id,),
-    ).fetchone()
+    )
+    row = cur.fetchone()
     return dict(row) if row else None
 
 
@@ -95,14 +102,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_candidates(self, state: str = 'candidate') -> None:
-        with db_connect() as conn:
-            rows = conn.execute(
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            cur.execute(
                 '''
                 SELECT
                   c.id,
-                  c.vod_id,
-                  v.path AS vod_path,
-                  v.session_label,
+                  c.recording_id AS vod_id,
+                  r.path AS vod_path,
+                  r.session_label,
+                  r.display_name,
                   c.start_s,
                   c.end_s,
                   c.score,
@@ -111,27 +121,35 @@ class ReviewHandler(BaseHTTPRequestHandler):
                   c.signal_chat,
                   c.signal_beat_boost,
                   c.created_at
-                FROM candidates c
-                JOIN vods v ON v.id = c.vod_id
-                WHERE c.state = ?
-                ORDER BY c.score DESC, c.id ASC
+                FROM clip_candidates c
+                JOIN recordings r ON r.id = c.recording_id
+                WHERE c.state = %s
+                ORDER BY c.score DESC NULLS LAST, c.id ASC
                 ''',
                 (state,),
-            ).fetchall()
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
         self._send_json(HTTPStatus.OK, [dict(r) for r in rows])
 
-    def _serve_media(self, vod_id_text: str) -> None:
+    def _serve_media(self, recording_id_text: str) -> None:
         try:
-            vod_id = int(vod_id_text)
+            recording_id = int(recording_id_text)
         except ValueError:
             self._send_text(HTTPStatus.BAD_REQUEST, 'Invalid vod_id')
             return
 
-        with db_connect() as conn:
-            row = conn.execute('SELECT path FROM vods WHERE id = ?', (vod_id,)).fetchone()
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            cur.execute('SELECT path FROM recordings WHERE id = %s', (recording_id,))
+            row = cur.fetchone()
+        finally:
+            conn.close()
 
         if not row:
-            self._send_text(HTTPStatus.NOT_FOUND, f'vod_id not found: {vod_id}')
+            self._send_text(HTTPStatus.NOT_FOUND, f'vod_id not found: {recording_id}')
             return
 
         file_path = Path(str(row['path']))
@@ -209,8 +227,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             'maybe': {'approved', 'rejected'},
         }
 
-        with db_connect() as conn:
-            row = conn.execute('SELECT state FROM candidates WHERE id = ?', (candidate_id,)).fetchone()
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            cur.execute('SELECT state FROM clip_candidates WHERE id = %s', (candidate_id,))
+            row = cur.fetchone()
             if not row:
                 self._send_json(HTTPStatus.NOT_FOUND, {'error': f'candidate not found: {candidate_id}'})
                 return
@@ -228,15 +249,19 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            conn.execute('BEGIN;')
             try:
-                conn.execute('UPDATE candidates SET state = ? WHERE id = ?', (target_state, candidate_id))
+                cur.execute(
+                    'UPDATE clip_candidates SET state = %s WHERE id = %s',
+                    (target_state, candidate_id),
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
 
-            updated = fetch_candidate_row(conn, candidate_id)
+            updated = fetch_candidate_row(cur, candidate_id)
+        finally:
+            conn.close()
 
         self._send_json(HTTPStatus.OK, updated)
 
@@ -287,7 +312,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    print(f'Starting review server on http://{HOST}:{PORT} using CLPR_DB_PATH={get_db_path()}')
+    # Validate the URL is set at startup (fail loudly now, not per-request);
+    # never print the URL itself — it may carry credentials.
+    db.get_db_url()
+    print(f'Starting review server on http://{HOST}:{PORT} using CLPR_DB_URL from environment')
     with ThreadingHTTPServer((HOST, PORT), ReviewHandler) as httpd:
         httpd.serve_forever()
 

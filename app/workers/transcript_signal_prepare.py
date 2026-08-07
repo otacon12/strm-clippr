@@ -6,7 +6,14 @@ prompts the LOCAL lane (transcript_signal.py) would send, using the SAME iterato
 (iter_scan_items / iter_zebra_items) so prompt construction exists exactly once.
 n8n executes the LLM calls; transcript_signal_ingest.py validates and lands responses.
 
-No API calls. No DB writes beyond ensure_intermediate_table (CREATE IF NOT EXISTS).
+PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
+(CLPR_DB_URL); tables per app/docs/naming-map.md. Read-only: the intermediate
+table is schema-owned now (001_consolidated_schema.sql), so the sqlite-era
+ensure_intermediate_table call is gone. The --vod-id CLI flag and the
+"vod_id" JSON key are external contracts (n8n) and stay; both bind to
+recording_id internally.
+
+No API calls. No DB writes.
 stdout is exactly ONE JSON object (sorted keys, deterministic — the downstream node
 parses stdout as JSON, so no RESULT line is printed on success):
   {"vod_id": N, "items": [{"call_id", "kind": "scan"|"zebra", "prompt", "meta"}], "count": M}
@@ -21,9 +28,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
 
+import db
 import transcript_signal as ts
 
 
@@ -35,10 +42,10 @@ def zebra_call_id(trigger_offset_s: float) -> str:
     return f'zebra:{trigger_offset_s:.3f}'
 
 
-def build_items(conn: sqlite3.Connection, vod_id: int) -> list[dict]:
-    duration_s, _ = ts.fetch_vod(conn, vod_id)
-    segments = ts.fetch_segments(conn, vod_id)
-    triggers = ts.fetch_zebra_triggers(conn, vod_id)
+def build_items(cur, recording_id: int) -> list[dict]:
+    duration_s, _ = ts.fetch_recording(cur, recording_id)
+    segments = ts.fetch_segments(cur, recording_id)
+    triggers = ts.fetch_zebra_triggers(cur, recording_id)
 
     items: list[dict] = []
     for meta, prompt in ts.iter_scan_items(segments):
@@ -60,14 +67,15 @@ def build_items(conn: sqlite3.Connection, vod_id: int) -> list[dict]:
     return items
 
 
-def run(vod_id: int) -> int:
-    db_path = ts.get_db_path()
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-        ts.ensure_intermediate_table(conn)
-        items = build_items(conn, vod_id)
+def run(recording_id: int) -> int:
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+        items = build_items(cur, recording_id)
+    finally:
+        conn.close()
 
-    payload = {'vod_id': vod_id, 'items': items, 'count': len(items)}
+    payload = {'vod_id': recording_id, 'items': items, 'count': len(items)}
     json.dump(payload, sys.stdout, sort_keys=True)
     sys.stdout.write('\n')
     return 0

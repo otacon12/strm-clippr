@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """transcript_signal: produce transcript + zebra boundary signal candidates for one VOD.
 Poison gate is enforced first. Exits non-zero on any failure.
-Writes intermediate rows to transcript_signal_candidates.
+Writes intermediate rows to llm_signal_candidates.
 Prints machine-parseable RESULT line last.
+
+PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
+(CLPR_DB_URL); tables per app/docs/naming-map.md (vods->recordings,
+beats->trigger_beats, transcript_signal_candidates->llm_signal_candidates,
+vod_id->recording_id). The intermediate table is schema-owned now
+(001_consolidated_schema.sql), so the worker no longer creates it. The
+--vod-id CLI flag is an external contract and stays; it binds to
+recording_id internally.
 """
 
 from __future__ import annotations
@@ -11,11 +19,12 @@ import argparse
 import datetime as dt
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Optional
+
+import db
 
 CATEGORIES = ['funny', 'inspirational', 'educational', 'showing-AI-off', 'context']
 CHUNK_CHAR_LIMIT = 12000
@@ -29,10 +38,6 @@ class Segment:
     text: str
 
 
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
-
-
 def utc_now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
@@ -44,49 +49,25 @@ def require_env(name: str) -> str:
     return value
 
 
-def ensure_intermediate_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        '''
-        CREATE TABLE IF NOT EXISTS transcript_signal_candidates (
-            id INTEGER PRIMARY KEY,
-            vod_id INTEGER NOT NULL REFERENCES vods(id),
-            start_s REAL NOT NULL,
-            end_s REAL NOT NULL,
-            category TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            source TEXT NOT NULL,
-            trigger_offset_s REAL,
-            run_id TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        '''
-    )
-    conn.execute(
-        '''
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_tsc_unique
-        ON transcript_signal_candidates(vod_id, start_s, end_s, category, source, IFNULL(trigger_offset_s, -1))
-        '''
-    )
-
-
-def fetch_vod(conn: sqlite3.Connection, vod_id: int) -> tuple[float, str]:
-    row = conn.execute('SELECT duration_s, state FROM vods WHERE id = ?', (vod_id,)).fetchone()
+def fetch_recording(cur, recording_id: int) -> tuple[float, str]:
+    cur.execute('SELECT duration_s, state FROM recordings WHERE id = %s', (recording_id,))
+    row = cur.fetchone()
     if not row:
-        raise RuntimeError(f'vod_id not found: {vod_id}')
+        raise RuntimeError(f'recording_id not found: {recording_id}')
     duration_s, state = row
     if duration_s is None:
-        raise RuntimeError(f'vod_id has null duration_s: {vod_id}')
+        raise RuntimeError(f'recording_id has null duration_s: {recording_id}')
     if str(state) not in {'transcribed', 'detected', 'done'}:
-        raise RuntimeError(f'vod_id={vod_id} must be transcribed or later; got state={state}')
+        raise RuntimeError(f'recording_id={recording_id} must be transcribed or later; got state={state}')
     return float(duration_s), str(state)
 
 
-def fetch_segments(conn: sqlite3.Connection, vod_id: int) -> list[Segment]:
-    rows = conn.execute(
-        'SELECT start_s, end_s, text FROM transcript_segments WHERE vod_id = ? ORDER BY start_s, id',
-        (vod_id,),
-    ).fetchall()
+def fetch_segments(cur, recording_id: int) -> list[Segment]:
+    cur.execute(
+        'SELECT start_s, end_s, text FROM transcript_segments WHERE recording_id = %s ORDER BY start_s, id',
+        (recording_id,),
+    )
+    rows = cur.fetchall()
     return [Segment(float(s), float(e), str(t or '')) for s, e, t in rows]
 
 
@@ -196,17 +177,18 @@ def normalize_window(start_s: float, end_s: float, duration_s: float) -> tuple[f
     return s, e
 
 
-def insert_signal_rows(conn: sqlite3.Connection, vod_id: int, rows: list[tuple[float, float, str, str, float, str, Optional[float]]], run_id: str) -> int:
+def insert_signal_rows(cur, recording_id: int, rows: list[tuple[float, float, str, str, float, str, Optional[float]]], run_id: str) -> int:
     inserted = 0
     now_iso = utc_now_iso()
     for start_s, end_s, category, reason, confidence, source, trigger_offset_s in rows:
-        cur = conn.execute(
+        cur.execute(
             '''
-            INSERT OR IGNORE INTO transcript_signal_candidates(
-                vod_id, start_s, end_s, category, reason, confidence, source, trigger_offset_s, run_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO llm_signal_candidates(
+                recording_id, start_s, end_s, category, reason, confidence, source, trigger_offset_s, run_id, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (recording_id, start_s, end_s, category, source, (COALESCE(trigger_offset_s, -1))) DO NOTHING
             ''',
-            (vod_id, start_s, end_s, category, reason, confidence, source, trigger_offset_s, run_id, now_iso),
+            (recording_id, start_s, end_s, category, reason, confidence, source, trigger_offset_s, run_id, now_iso),
         )
         if cur.rowcount == 1:
             inserted += 1
@@ -254,18 +236,19 @@ def iter_scan_items(segments: list[Segment]):
         yield meta, build_scan_prompt(idx, len(chunks), transcript_text)
 
 
-def fetch_zebra_triggers(conn: sqlite3.Connection, vod_id: int) -> list[float]:
-    rows = conn.execute(
+def fetch_zebra_triggers(cur, recording_id: int) -> list[float]:
+    cur.execute(
         '''
         SELECT offset_s
-        FROM beats
-        WHERE vod_id = ?
+        FROM trigger_beats
+        WHERE recording_id = %s
           AND source = 'zebra_trigger'
           AND offset_s IS NOT NULL
         ORDER BY offset_s
         ''',
-        (vod_id,),
-    ).fetchall()
+        (recording_id,),
+    )
+    rows = cur.fetchall()
     return [float(offset_raw) for (offset_raw,) in rows]
 
 
@@ -331,14 +314,14 @@ def transcript_slice_for_window(segments: list[Segment], w_start: float, w_end: 
 
 
 def detect_zebra_boundaries(
-    conn: sqlite3.Connection,
-    vod_id: int,
+    cur,
+    recording_id: int,
     duration_s: float,
     segments: list[Segment],
 ) -> list[tuple[float, float, str, str, float, str, Optional[float]]]:
     out: list[tuple[float, float, str, str, float, str, Optional[float]]] = []
 
-    triggers = fetch_zebra_triggers(conn, vod_id)
+    triggers = fetch_zebra_triggers(cur, recording_id)
 
     for meta, prompt in iter_zebra_items(triggers, duration_s, segments):
         trigger_offset = meta['trigger_offset_s']
@@ -370,32 +353,35 @@ def detect_zebra_boundaries(
     return out
 
 
-def run(vod_id: int) -> int:
-    db_path = get_db_path()
+def run(recording_id: int) -> int:
     run_id = f'transcript_signal_{dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
         # D-050: pre-detection poison gate removed — the operator's clip review (D-002) is the poison gate; M5 auto-publish must reinstate a mandatory mechanism.
-        duration_s, _ = fetch_vod(conn, vod_id)
-        segments = fetch_segments(conn, vod_id)
-        ensure_intermediate_table(conn)
+        duration_s, _ = fetch_recording(cur, recording_id)
+        segments = fetch_segments(cur, recording_id)
+        # llm_signal_candidates is schema-owned (001_consolidated_schema.sql);
+        # the sqlite-era ensure_intermediate_table is gone.
 
         transcript_rows = detect_transcript_categories(segments, duration_s)
-        zebra_rows = detect_zebra_boundaries(conn, vod_id, duration_s, segments)
+        zebra_rows = detect_zebra_boundaries(cur, recording_id, duration_s, segments)
 
-        conn.execute('BEGIN;')
-        try:
-            inserted_transcript = insert_signal_rows(conn, vod_id, transcript_rows, run_id)
-            inserted_zebra = insert_signal_rows(conn, vod_id, zebra_rows, run_id)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        # autocommit is OFF: the statements above already opened the
+        # transaction implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
+        inserted_transcript = insert_signal_rows(cur, recording_id, transcript_rows, run_id)
+        inserted_zebra = insert_signal_rows(cur, recording_id, zebra_rows, run_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     total_inserted = inserted_transcript + inserted_zebra
     print(
-        f'RESULT transcript_signal vod={vod_id} '
+        f'RESULT transcript_signal recording={recording_id} '
         f'transcript_candidates={inserted_transcript} zebra_candidates={inserted_zebra} total_inserted={total_inserted}'
     )
     return 0

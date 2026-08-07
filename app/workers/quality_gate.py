@@ -14,28 +14,30 @@ Prints machine-parseable RESULT line to stdout always; on failure, prints the
 RESULT line and the full verdict to stderr too (n8n's Execute Command discards
 a failing child's stdout — only stderr reaches the error). Exits non-zero on
 any failure.
+
+PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
+(CLPR_DB_URL); tables per app/docs/naming-map.md (vods->recordings,
+vod_id->recording_id). The --vod-id CLI flag is an external contract and
+stays; it binds to recording_id internally.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import re
-import sqlite3
 import sys
+
+import db
 
 NON_SPEECH_BRACKET_RE = re.compile(r'^\[[A-Za-z_ ]+\]$')
 MUSIC_NOTE = '♪'  # ♪
 
 
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
-
-
-def fetch_duration_s(conn: sqlite3.Connection, vod_id: int) -> float:
-    row = conn.execute('SELECT duration_s FROM vods WHERE id = ?', (vod_id,)).fetchone()
+def fetch_duration_s(cur, recording_id: int) -> float:
+    cur.execute('SELECT duration_s FROM recordings WHERE id = %s', (recording_id,))
+    row = cur.fetchone()
     if not row:
-        raise RuntimeError(f'vod_id not found: {vod_id}')
+        raise RuntimeError(f'recording_id not found: {recording_id}')
     return float(row[0]) if row[0] is not None else 0.0
 
 
@@ -69,21 +71,24 @@ def repetition_count(speech_texts: list[str]) -> int:
     return rep
 
 
-def gate(vod_id: int) -> int:
-    db_path = get_db_path()
-
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-        duration_s = fetch_duration_s(conn, vod_id)
-        rows = conn.execute(
+def gate(recording_id: int) -> int:
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+        duration_s = fetch_duration_s(cur, recording_id)
+        cur.execute(
             '''
             SELECT text
             FROM transcript_segments
-            WHERE vod_id = ?
+            WHERE recording_id = %s
             ORDER BY start_s, id
             ''',
-            (vod_id,),
-        ).fetchall()
+            (recording_id,),
+        )
+        rows = cur.fetchall()
+    finally:
+        # Read-only worker: close() discards the implicit read transaction.
+        conn.close()
 
     texts = [str(t or '').strip() for (t,) in rows]
     total = len(texts)
@@ -118,7 +123,7 @@ def gate(vod_id: int) -> int:
 
     verdict = 'FAIL' if failures else 'PASS'
     result_line = (
-        f'RESULT quality_gate {verdict} vod_id={vod_id} total={total} '
+        f'RESULT quality_gate {verdict} recording={recording_id} total={total} '
         f'blank_pct={blank_pct:.1f} non_speech_pct={non_speech_pct:.1f} speech={speech} '
         f'repetition_pct={rep_pct:.1f} segments_per_min={segments_per_min:.1f} duration_s={duration_s:.1f}'
     )
@@ -130,7 +135,7 @@ def gate(vod_id: int) -> int:
         # n8n's Execute Command DISCARDS a failing child's stdout; only stderr
         # reaches the error output — so the failure path repeats everything there.
         print(result_line, file=sys.stderr)
-        print(f'QUALITY GATE FAILED (D-028) for vod_id={vod_id}:', file=sys.stderr)
+        print(f'QUALITY GATE FAILED (D-028) for recording_id={recording_id}:', file=sys.stderr)
         for reason in failures:
             print(f'  - {reason}', file=sys.stderr)
         print(

@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """transcribe: run whisper.cpp for one VOD and persist transcript segments.
-Reads CLPR_DB_PATH, WHISPER_CLI_PATH, WHISPER_MODEL_PATH by env var name.
+Reads CLPR_DB_URL, WHISPER_CLI_PATH, WHISPER_MODEL_PATH by env var name.
 Exits non-zero on any failure and prints machine-parseable RESULT line last.
+
+PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
+(CLPR_DB_URL); tables per app/docs/naming-map.md (vods->recordings,
+vod_id->recording_id). The --vod-id CLI flag is an external contract and
+stays; it binds to recording_id internally.
 """
 
 import argparse
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -20,11 +24,9 @@ try:
 except ModuleNotFoundError:
     from .obs_guard import require_obs_idle_or_raise
 
+import db
+
 TS_RE = re.compile(r'^(\d{2}):(\d{2}):(\d{2}),(\d{3})$')
-
-
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
 
 
 def require_env(name: str) -> str:
@@ -42,10 +44,11 @@ def ts_to_seconds(ts: str) -> float:
     return hh * 3600 + mm * 60 + ss + ms / 1000.0
 
 
-def fetch_vod_path(conn: sqlite3.Connection, vod_id: int) -> str:
-    row = conn.execute('SELECT path FROM vods WHERE id = ?', (vod_id,)).fetchone()
+def fetch_recording_path(cur, recording_id: int) -> str:
+    cur.execute('SELECT path FROM recordings WHERE id = %s', (recording_id,))
+    row = cur.fetchone()
     if not row:
-        raise RuntimeError(f'vod_id not found: {vod_id}')
+        raise RuntimeError(f'recording_id not found: {recording_id}')
     return row[0]
 
 
@@ -61,24 +64,41 @@ def run_capture(cmd: list[str]) -> subprocess.CompletedProcess:
         ) from exc
 
 
-def transcribe(vod_id: int) -> int:
+def persist_segments(cur, recording_id: int, segments: list[tuple[float, float, str]]) -> None:
+    """Replace this recording's transcript segments and mark it transcribed.
+
+    Extracted so the DB-write conversion is testable without running whisper
+    (delete-then-insert is idempotent per recording; caller owns commit).
+    """
+    cur.execute('DELETE FROM transcript_segments WHERE recording_id = %s', (recording_id,))
+    cur.executemany(
+        '''
+        INSERT INTO transcript_segments(recording_id, start_s, end_s, text)
+        VALUES (%s, %s, %s, %s)
+        ''',
+        [(recording_id, s, e, t) for s, e, t in segments],
+    )
+    cur.execute("UPDATE recordings SET state = 'transcribed' WHERE id = %s", (recording_id,))
+
+
+def transcribe(recording_id: int) -> int:
     require_obs_idle_or_raise('transcribe')
 
-    db_path = get_db_path()
     whisper_cli = require_env('WHISPER_CLI_PATH')
     whisper_model = require_env('WHISPER_MODEL_PATH')
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-        vod_path = fetch_vod_path(conn, vod_id)
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+        recording_path = fetch_recording_path(cur, recording_id)
 
         with tempfile.TemporaryDirectory(prefix='clpr_transcribe_') as tmpdir:
-            tmp_base = Path(tmpdir) / f'vod_{vod_id}'
+            tmp_base = Path(tmpdir) / f'vod_{recording_id}'
             wav_path = tmp_base.with_suffix('.wav')
             json_path = Path(str(tmp_base) + '.json')
 
             ffmpeg_cmd = [
-                'ffmpeg', '-y', '-i', vod_path,
+                'ffmpeg', '-y', '-i', recording_path,
                 '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
                 str(wav_path),
             ]
@@ -118,26 +138,20 @@ def transcribe(vod_id: int) -> int:
                 end_s = ts_to_seconds(to_ts)
                 segments.append((start_s, end_s, text))
 
-            conn.execute('BEGIN;')
-            try:
-                conn.execute('DELETE FROM transcript_segments WHERE vod_id = ?', (vod_id,))
-                conn.executemany(
-                    '''
-                    INSERT INTO transcript_segments(vod_id, start_s, end_s, text)
-                    VALUES (?, ?, ?, ?)
-                    ''',
-                    [(vod_id, s, e, t) for s, e, t in segments],
-                )
-                conn.execute("UPDATE vods SET state = 'transcribed' WHERE id = ?", (vod_id,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            # autocommit is OFF: the reads above already opened the transaction
+            # implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
+            persist_segments(cur, recording_id, segments)
+            conn.commit()
 
             print(
-                f'RESULT transcribe vod_id={vod_id} ok=1 segments={len(segments)} '
-                f'elapsed_s={elapsed_s:.3f} vod_path="{vod_path}"'
+                f'RESULT transcribe recording={recording_id} ok=1 segments={len(segments)} '
+                f'elapsed_s={elapsed_s:.3f} vod_path="{recording_path}"'
             )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     return 0
 

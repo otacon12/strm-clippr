@@ -1,35 +1,31 @@
 #!/usr/bin/env python3
 """chat_capture: capture Twitch chat messages live into chat_raw.
-Reads CLPR_DB_PATH; exits non-zero on unexpected startup failure.
+Reads CLPR_DB_URL; exits non-zero on unexpected startup failure.
 Runs until killed; reconnects with backoff; commits each message row.
+
+PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
+(CLPR_DB_URL); table names per app/docs/naming-map.md (chat_raw unchanged).
+The sqlite-era ensure_schema/apply_migrations step is GONE: the PG schema is
+applied by psql from app/migrations_pg/ (checklist pattern 8 — psql-applied
+files stay files); workers never self-migrate.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import os
 import random
 import socket
-import sqlite3
 import ssl
 import sys
 import time
-from pathlib import Path
 from typing import Optional, BinaryIO, cast
 
-try:
-    from migrations import apply_migrations
-except ModuleNotFoundError:
-    from .migrations import apply_migrations
+import db
 
 IRC_HOST = 'irc.chat.twitch.tv'
 IRC_PORT = 6697
 CHANNEL = '#fif4pres'
 CAP_REQ = 'CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands'
-
-
-def get_db_path() -> str:
-    return os.environ.get('CLPR_DB_PATH', './clpr.db')
 
 
 def utc_now_iso() -> str:
@@ -90,11 +86,6 @@ def extract_privmsg_text(parts: list[str]) -> str:
     return parts[-1]
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    migrations_dir = Path(__file__).resolve().parent.parent / 'migrations'
-    apply_migrations(conn, migrations_dir)
-
-
 def open_irc_socket() -> tuple[socket.socket, BinaryIO]:
     raw = socket.create_connection((IRC_HOST, IRC_PORT), timeout=30)
     ctx = ssl.create_default_context()
@@ -117,11 +108,11 @@ def recv_line(stream: BinaryIO) -> str:
     return raw.decode('utf-8', errors='replace').rstrip('\r\n')
 
 
-def insert_message(conn: sqlite3.Connection, run_id: str, author: str, text: str) -> None:
-    conn.execute(
+def insert_message(conn, cur, run_id: str, author: str, text: str) -> None:
+    cur.execute(
         '''
         INSERT INTO chat_raw(session_label, ts_utc, author, text, captured_by_run)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
         ''',
         (today_session_label(), utc_now_iso(), author, text, run_id),
     )
@@ -129,13 +120,14 @@ def insert_message(conn: sqlite3.Connection, run_id: str, author: str, text: str
 
 
 def run_capture_loop() -> int:
-    db_path = get_db_path()
     run_id = make_run_id()
-    print(f'CHAT_CAPTURE_START db_path="{db_path}" run_id="{run_id}" channel="{CHANNEL}"', flush=True)
+    # db="clpr" is a fixed label, NOT the connection URL: CLPR_DB_URL may carry
+    # credentials and must never be printed (the sqlite port printed db_path).
+    print(f'CHAT_CAPTURE_START db="clpr" run_id="{run_id}" channel="{CHANNEL}"', flush=True)
 
-    with sqlite3.connect(db_path) as conn:
-        conn.execute('PRAGMA foreign_keys = ON;')
-        ensure_schema(conn)
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
 
         backoff_s = 1.0
         while True:
@@ -170,13 +162,19 @@ def run_capture_loop() -> int:
                         text = extract_privmsg_text(parts)
                         if text.strip() == '':
                             continue
-                        insert_message(conn, run_id, author, text)
+                        insert_message(conn, cur, run_id, author, text)
                         print(f'CHAT_RAW_INSERTED author="{author}" text="{text}"', flush=True)
             except KeyboardInterrupt:
                 print('CHAT_CAPTURE_STOP reason="keyboard interrupt"', flush=True)
                 return 0
             except Exception as exc:
                 print(f'IRC_DISCONNECT reason="{exc}" backoff_s={backoff_s:.1f}', flush=True)
+                # PostgreSQL: a failed INSERT leaves the transaction ABORTED and
+                # every later statement would fail ("current transaction is
+                # aborted") — roll back before reconnecting. Deliberately NOT
+                # swallowed: if rollback itself raises, the DB connection is
+                # dead, and dying loudly is better than capturing chat into a void.
+                conn.rollback()
                 time.sleep(backoff_s)
                 backoff_s = min(backoff_s * 2.0, 30.0)
             finally:
@@ -190,6 +188,8 @@ def run_capture_loop() -> int:
                         sock.close()
                 except Exception:
                     pass
+    finally:
+        conn.close()
 
 
 def main() -> int:
