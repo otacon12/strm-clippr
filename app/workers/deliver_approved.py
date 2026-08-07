@@ -71,8 +71,9 @@ def delivered_name(session_label: str, candidate_id: int, category: str) -> str:
 
 
 def fetch_approved(cur) -> list[dict]:
-    """All approved candidates with recording session_label, clip row (if any)
-    and llm_signal category ('unknown' when absent)."""
+    """All approved candidates with recording session_label, clip row (if any,
+    including drive_synced_at — the D-056 delivery witness) and llm_signal
+    category ('unknown' when absent)."""
     cur.execute(
         "SELECT table_name FROM information_schema.tables "
         "WHERE table_schema = 'public' AND table_name = 'llm_signal_candidates'"
@@ -89,7 +90,7 @@ def fetch_approved(cur) -> list[dict]:
     cur.execute(
         f'''
         SELECT c.id, c.recording_id, c.start_s, r.session_label,
-               cl.file_path, cl.state,
+               cl.file_path, cl.state, cl.drive_synced_at,
                {category_select} AS category
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
@@ -109,7 +110,8 @@ def fetch_approved(cur) -> list[dict]:
             'session_label': str(r[3]),
             'clip_file_path': str(r[4]) if r[4] is not None else None,
             'clip_state': str(r[5]) if r[5] is not None else None,
-            'category': str(r[6]) if r[6] is not None else 'unknown',
+            'drive_synced_at': str(r[6]) if r[6] is not None else None,
+            'category': str(r[7]) if r[7] is not None else 'unknown',
         })
     return out
 
@@ -128,13 +130,97 @@ def dest_path_for(drive_sync_dir: str, cand: dict) -> Path:
     )
 
 
+def delivery_file_check(cand: dict, dest: Path) -> tuple[bool, str]:
+    """Re-verify the FILE-PROXY claim of delivery, and say why it failed.
+
+    ONE truth for "the delivered copy is really sitting at dest" (charter gate
+    1): already_delivered() below and the D-056 witness backfill both ask this
+    single question. Matched is True only when the destination exists AND its
+    byte size equals the source clip's — an absent, unreadable or size-
+    mismatched destination is NEVER evidence of a delivery, because a witness
+    that can be forged from a bad file is not a witness (charter gate 22).
+    """
+    src = cand['clip_file_path']
+    if src is None:
+        return False, 'no_clip_file_path'
+    src_path = Path(src)
+    if not src_path.exists():
+        return False, 'source_missing'
+    if not dest.exists():
+        return False, 'dest_missing'
+    src_size = src_path.stat().st_size
+    dst_size = dest.stat().st_size
+    if src_size != dst_size:
+        return False, f'size_mismatch_src={src_size}_dst={dst_size}'
+    return True, 'match'
+
+
 def already_delivered(cand: dict, dest: Path) -> bool:
-    return (
-        cand['clip_file_path'] is not None
-        and Path(cand['clip_file_path']).exists()
-        and dest.exists()
-        and dest.stat().st_size == Path(cand['clip_file_path']).stat().st_size
-    )
+    """Unchanged semantics (source exists, dest exists, byte sizes equal),
+    now derived from delivery_file_check so there is only one copy of the
+    predicate to drift."""
+    matched, _reason = delivery_file_check(cand, dest)
+    return matched
+
+
+def write_witness(conn, cur, candidate_id: int, dest: Path) -> str:
+    """Write the D-056 delivery witness (clips.drive_synced_at + drive_sync_path)
+    and return the timestamp written. ONE truth for the witness write: a fresh
+    sync and the backfill below both go through here.
+
+    D-056 fixer (charter gate 9 — a failed write must never look like a
+    success): the UPDATE must match EXACTLY one clips row. Without this
+    assertion a rowcount of 0 (the clips row deleted or re-keyed under the run)
+    committed happily and printed SYNCED while leaving NO witness — which is
+    exactly the state that pins an approved card in the operator's Pending
+    queue forever. Mirrors the n8n "Mark Delivered" node's assertion in
+    clpr/n8n/clpr-verdicts.json (rowcount != 1 -> rollback, error, exit 1).
+    Raising keeps per-candidate failure isolation: main() counts it FAILED and
+    the batch continues.
+    """
+    ts = utc_now_iso()
+    try:
+        cur.execute(
+            'UPDATE clips SET drive_synced_at = %s, drive_sync_path = %s WHERE candidate_id = %s',
+            (ts, str(dest), candidate_id),
+        )
+        rowcount = cur.rowcount
+        if rowcount != 1:
+            conn.rollback()
+            raise RuntimeError(
+                f'delivery-witness UPDATE matched {rowcount} clips rows for '
+                f'candidate_id={candidate_id} (expected exactly 1); nothing committed'
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return ts
+
+
+def backfill_witness(conn, cur, cand: dict, dest: Path) -> None:
+    """D-056 fixer (charter gate 1: ONE truth per thing).
+
+    already_delivered() skipped on a byte-matched destination file WITHOUT
+    touching the witness, so idempotency ran on the file proxy while the review
+    surface ran on clips.drive_synced_at. If a previous run copied the file but
+    died before the UPDATE committed, every later run printed
+    SKIP_ALREADY_DELIVERED while the witness stayed NULL — pinning that
+    approved card in the operator's Pending queue as "awaiting delivery"
+    FOREVER while this worker reported it delivered. Two proxies for one
+    property, disagreeing in silence.
+
+    This is witness REPAIR, not a policy change: CLPR_DRIVE_SYNC_DIR *is* the
+    locally-mounted Drive folder, so a byte-matched file sitting in it means
+    the delivery really did happen. The caller has already re-verified the
+    bytes via delivery_file_check — this is never reached from an absent or
+    size-mismatched destination.
+    """
+    if cand['drive_synced_at'] is not None:
+        return
+    ts = write_witness(conn, cur, cand['candidate_id'], dest)
+    cand['drive_synced_at'] = ts
+    print(f'WITNESS_BACKFILLED candidate={cand["candidate_id"]} path="{dest}"')
 
 
 def sync_candidate(conn, cur, cand: dict, dest: Path) -> None:
@@ -150,15 +236,7 @@ def sync_candidate(conn, cur, cand: dict, dest: Path) -> None:
     if src_size != dst_size:
         raise RuntimeError(f'post-copy size mismatch: src={src_size} dst={dst_size}')
 
-    try:
-        cur.execute(
-            'UPDATE clips SET drive_synced_at = %s, drive_sync_path = %s WHERE candidate_id = %s',
-            (utc_now_iso(), str(dest), cand['candidate_id']),
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    write_witness(conn, cur, cand['candidate_id'], dest)
 
     print(
         f'SYNCED candidate={cand["candidate_id"]} dest="{dest}" size={dst_size}'
@@ -380,7 +458,12 @@ def main() -> int:
             planned_render = 0
             for cand in candidates:
                 dest = dest_path_for(drive_sync_dir, cand)
-                if already_delivered(cand, dest):
+                if cand['drive_synced_at'] is not None:
+                    # D-056: the delivery witness is set — this candidate is
+                    # delivered, full stop. Never re-rendered, never re-synced.
+                    action = 'skip_delivered'
+                    already += 1
+                elif already_delivered(cand, dest):
                     action = 'already_delivered'
                     already += 1
                 elif is_sync_eligible(cand):
@@ -412,10 +495,43 @@ def main() -> int:
             cid = cand['candidate_id']
             dest = dest_path_for(drive_sync_dir, cand)
             try:
-                if already_delivered(cand, dest):
+                if cand['drive_synced_at'] is not None:
+                    # D-056 cross-lane rule: a clips row with drive_synced_at
+                    # set IS the delivery witness (written by the n8n Mark
+                    # Delivered node or by sync_candidate below). Skip FIRST —
+                    # before any file check — so a delivered candidate whose
+                    # local clip file is gone can never fall through to a
+                    # re-render/re-sync (double delivery).
+                    already += 1
+                    print(
+                        f'SKIP_DELIVERED candidate={cid} '
+                        f'drive_synced_at={cand["drive_synced_at"]}'
+                    )
+                    continue
+
+                matched, reason = delivery_file_check(cand, dest)
+                if matched:
                     already += 1
                     print(f'SKIP_ALREADY_DELIVERED candidate={cid} dest="{dest}"')
-                elif is_sync_eligible(cand):
+                    # D-056 fixer: the file proxy says delivered and the bytes
+                    # agree, so make the WITNESS agree too — otherwise this
+                    # candidate is skipped here on every future run while the
+                    # review surface keeps it in Pending forever.
+                    backfill_witness(conn, cur, cand, dest)
+                    continue
+
+                if dest.exists():
+                    # A destination file exists but does NOT byte-match the
+                    # source. It is not evidence of a delivery, so: do not
+                    # skip, do not backfill (the witness must stay unforgeable
+                    # — charter gate 22). Say so loudly and fall through to the
+                    # normal deliver path below, i.e. treat it as undelivered.
+                    print(
+                        f'WITNESS_MISMATCH candidate={cid} dest="{dest}" reason={reason} '
+                        'treated_as=undelivered no_witness_written=1'
+                    )
+
+                if is_sync_eligible(cand):
                     sync_candidate(conn, cur, cand, dest)
                     synced_now += 1
                 elif cand['clip_file_path'] is not None and cand['clip_state'] == 'rendered':

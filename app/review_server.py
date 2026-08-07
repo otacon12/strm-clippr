@@ -43,6 +43,10 @@ POST_WINDOW_RE = re.compile(r'^/api/candidates/(\d+)/window$')
 # (null when unset); originals start_s/end_s are immutable. `state` rides
 # along too (D-055 fixer) so the UI's editable backstop (c.state !==
 # 'approved') keys on a value that actually exists in the payload.
+# D-056: clip_state (the clips row's state, null when no row) and
+# drive_synced_at (null when unset/no row) ride along additively — the
+# delivery witness the UI badges on. clips has UNIQUE(candidate_id), so the
+# LEFT JOIN in CANDIDATE_PAYLOAD_FROM can never fan a candidate into two rows.
 CANDIDATE_PAYLOAD_COLUMNS = '''
           c.id,
           c.recording_id AS vod_id,
@@ -59,7 +63,16 @@ CANDIDATE_PAYLOAD_COLUMNS = '''
           c.signal_transcript,
           c.signal_chat,
           c.signal_beat_boost,
-          c.created_at'''
+          c.created_at,
+          cl.state AS clip_state,
+          cl.drive_synced_at'''
+
+# One truth for the payload FROM clause (every query that SELECTs
+# CANDIDATE_PAYLOAD_COLUMNS uses exactly these joins).
+CANDIDATE_PAYLOAD_FROM = '''
+        FROM clip_candidates c
+        JOIN recordings r ON r.id = c.recording_id
+        LEFT JOIN clips cl ON cl.candidate_id = c.id'''
 
 
 def dict_cursor(conn):
@@ -109,9 +122,7 @@ def fetch_candidate_payload(cur, candidate_id: int) -> Optional[dict]:
     CANDIDATE_PAYLOAD_COLUMNS carries it since the D-055 fixer)."""
     cur.execute(
         f'''
-        SELECT{CANDIDATE_PAYLOAD_COLUMNS}
-        FROM clip_candidates c
-        JOIN recordings r ON r.id = c.recording_id
+        SELECT{CANDIDATE_PAYLOAD_COLUMNS}{CANDIDATE_PAYLOAD_FROM}
         WHERE c.id = %s
         ''',
         (candidate_id,),
@@ -159,18 +170,32 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_candidates(self, state: str = 'candidate') -> None:
+        # D-056 ruling (operator verbatim 2026-08-06): "an approved clip
+        # should not be removed from pending unless the webhook workflow
+        # successfully saves it to drive." The delivery witness is a clips row
+        # with drive_synced_at NOT NULL, so pending serves state='candidate'
+        # rows PLUS state='approved' rows whose clips row (if any) has
+        # drive_synced_at NULL. With the LEFT JOIN, cl.drive_synced_at IS NULL
+        # covers both "no clips row" and "row present, witness unset".
+        # Maybe/rejected queues are unchanged. Approve itself stays instant
+        # and terminal (D-050); only this queue VIEW is delivery-gated.
+        if state == 'candidate':
+            where = ("(c.state = 'candidate' OR "
+                     "(c.state = 'approved' AND cl.drive_synced_at IS NULL))")
+            params: tuple = ()
+        else:
+            where = 'c.state = %s'
+            params = (state,)
         conn = db.connect()
         try:
             cur = dict_cursor(conn)
             cur.execute(
                 f'''
-                SELECT{CANDIDATE_PAYLOAD_COLUMNS}
-                FROM clip_candidates c
-                JOIN recordings r ON r.id = c.recording_id
-                WHERE c.state = %s
+                SELECT{CANDIDATE_PAYLOAD_COLUMNS}{CANDIDATE_PAYLOAD_FROM}
+                WHERE {where}
                 ORDER BY c.score DESC NULLS LAST, c.id ASC
                 ''',
-                (state,),
+                params,
             )
             rows = cur.fetchall()
         finally:

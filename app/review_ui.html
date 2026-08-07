@@ -17,9 +17,13 @@
       --accent: #58a6ff;
     }
     html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; }
-    .wrap { display: grid; grid-template-columns: 380px 1fr; min-height: 100vh; }
-    .left { border-right: 1px solid #2d333b; overflow: auto; }
-    .right { padding: 16px; }
+    /* D-056 scroll fix: the layout is pinned to the viewport (height + an
+       explicit 100% row so the single grid row cannot grow past it); each
+       pane scrolls independently, so the player pane stays on screen while
+       the list scrolls. The page itself never scrolls. */
+    .wrap { display: grid; grid-template-columns: 380px 1fr; grid-template-rows: 100%; height: 100vh; }
+    .left { border-right: 1px solid #2d333b; overflow-y: auto; }
+    .right { padding: 16px; overflow-y: auto; }
     .head { position: sticky; top: 0; background: var(--panel); z-index: 2; padding: 12px; border-bottom: 1px solid #2d333b; }
     .title { margin: 0; font-size: 16px; }
     .kbd { color: var(--muted); font-size: 12px; margin-top: 6px; }
@@ -51,6 +55,8 @@
     .savewin { background: var(--accent); color: #061326; }
     .resetwin { background: #2d333b; border: 1px solid #3d444d; color: var(--text); }
     .badge { background: var(--maybe); color: #061326; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 6px; vertical-align: middle; }
+    .dbadge { background: var(--ok); color: #061326; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 6px; vertical-align: middle; }
+    .dbadge.warn { background: var(--bad); color: #fff; }
     .unsaved { color: var(--maybe); font-size: 12px; font-weight: 700; }
     .winline { font-size: 13px; margin: 0 0 10px; }
     .winline .orig { color: var(--muted); font-size: 12px; }
@@ -84,11 +90,15 @@
     let candidates = [];
     let idx = 0;
     let view = 'pending';
+    // D-056: mutation generation — bumped by every user-driven mutation so an
+    // in-flight background poll can never clobber what the operator just did.
+    let gen = 0;
     // D-055: local (unsaved) window edits, keyed by candidate id: {start, end}.
     // A draft exists only while nudged-but-not-saved; Save/Reset clears it.
     const drafts = {};
 
     const listEl = document.getElementById('list');
+    const leftEl = document.querySelector('.left');
     const detailEl = document.getElementById('detail');
     const queueTitleEl = document.getElementById('queueTitle');
     const tabPendingEl = document.getElementById('tabPending');
@@ -134,6 +144,39 @@
       if (!d) return false;
       const eff = effectiveWindow(c);
       return d.start !== eff.start || d.end !== eff.end;
+    }
+
+    // D-056: pending now carries approved-but-undelivered cards (the server
+    // keeps them in the pending payload until a clips row gains drive_synced_at,
+    // the delivery witness). The badge keys on clip_state/drive_synced_at plus
+    // the local-only _webhook flag decide() sets when the verdict response
+    // reported the delivery webhook failed/unconfigured. Precedence: a clips
+    // row means delivery has started, so it outranks a stale webhook flag.
+    // D-056 fixer (charter under-claim default): the badge NEVER asserts an
+    // upload is in progress — nothing in the payload witnesses a running
+    // upload. A clips row only proves the render lane reached this candidate,
+    // so report the clip_state itself: 'rendered' means the file exists and
+    // delivery has not been witnessed yet ("awaiting upload"), and any other
+    // clip_state is reported verbatim rather than narrated. The old text
+    // ("APPROVED — {clip_state} — uploading") over-claimed in both
+    // directions: 'published — uploading' was incoherent, and 'rendered —
+    // uploading' asserted an upload nobody had observed.
+    function deliveryBadge(c) {
+      if (c.state !== 'approved') return '';
+      if (c.clip_state !== null && c.clip_state !== undefined) {
+        if (c.clip_state === 'rendered') return 'rendered — awaiting upload';
+        return `approved — ${c.clip_state}`;
+      }
+      if (c._webhook === 'failed') return 'delivery not started — webhook failed';
+      if (c._webhook === 'unconfigured') return 'delivery not started — webhook unconfigured';
+      return 'approved — awaiting delivery';
+    }
+
+    function deliveryBadgeHtml(c) {
+      const text = deliveryBadge(c);
+      if (!text) return '';
+      const warn = text.startsWith('delivery not started');
+      return `<span class="dbadge${warn ? ' warn' : ''}">${text}</span>`;
     }
 
     function endpointForView() {
@@ -188,6 +231,7 @@
           </div>
           <div class="meta">${c.session_label} | ${fmt(effectiveWindow(c).start,1)}s to ${fmt(effectiveWindow(c).end,1)}s${adjustedDiffers(c) ? ' | edited' : ''}</div>
           <div class="meta">audio ${fmt(c.signal_audio)} | transcript ${fmt(c.signal_transcript)} | chat ${fmt(c.signal_chat)} | beat ${fmt(c.signal_beat_boost)}</div>
+          ${deliveryBadgeHtml(c) ? `<div class="meta">${deliveryBadgeHtml(c)}</div>` : ''}
         `;
         listEl.appendChild(el);
       });
@@ -204,10 +248,10 @@
       const eff = effectiveWindow(c);
       const edited = adjustedDiffers(c);
       const ed = editorValues(c);
-      // The three queues serve only non-approved states, so approved cards
-      // never appear here; the state check is a defensive backstop (the server
-      // 409s approved edits anyway). `state` is real in every payload since
-      // the D-055 fixer, so this backstop actually evaluates.
+      // D-056: pending now really does carry approved (awaiting-delivery)
+      // cards, so this check is live routing, not just a backstop: approved
+      // cards get no edit panel and locked verdict buttons (the server 409s
+      // both anyway). Replay stays available via the replay-only panel below.
       const editable = c.state !== 'approved';
       const videoSrc = `/media/${c.vod_id}#t=${encodeURIComponent(eff.start)},${encodeURIComponent(eff.end)}`;
       const nudges = (field) => ['-5', '-1', '+1', '+5'].map((d) =>
@@ -234,6 +278,15 @@
             <span class="unsaved" id="unsavedFlag" style="display:${hasUnsaved(c) ? 'inline' : 'none'};">unsaved</span>
           </div>
         </div>`;
+      // D-056: approved (awaiting-delivery) cards keep Replay — the one edit
+      // control that stays live — in a reduced panel; nudges/Save/Reset are gone.
+      const replayPanel = editable ? '' : `
+        <div class="editpanel">
+          <div class="editrow">
+            <button class="replaywin" id="btnReplay">Replay</button>
+            <span class="hint">window locked — approved</span>
+          </div>
+        </div>`;
       // Action buttons per queue (D-050 upgrade paths):
       // pending: Approve/Reject/Maybe | maybe: Approve/Reject | rejected: Approve/Maybe
       detailEl.innerHTML = `
@@ -243,6 +296,7 @@
         <div class="winline">window ${fmt(eff.start, 1)}s to ${fmt(eff.end, 1)}s
           ${edited ? '<span class="badge">edited</span>' : ''}
           ${edited ? `<span class="orig">(original ${fmt(c.start_s, 1)}s to ${fmt(c.end_s, 1)}s)</span>` : ''}
+          ${deliveryBadgeHtml(c)}
         </div>
         <div class="actions">
           <button class="approve" id="btnApprove">Approve (a)</button>
@@ -250,7 +304,7 @@
           ${view === 'pending' || view === 'rejected' ? '<button class="maybe" id="btnMaybe">Maybe (m)</button>' : ''}
           <span class="hint" id="verdictLock" style="display:none;">save or reset the window first</span>
         </div>
-        ${editPanel}
+        ${editPanel}${replayPanel}
         <video id="vid" controls preload="metadata" src="${videoSrc}"></video>
         <pre>score=${fmt(c.score)}\naudio=${fmt(c.signal_audio)} transcript=${fmt(c.signal_transcript)} chat=${fmt(c.signal_chat)} beat_boost=${fmt(c.signal_beat_boost)}\ncreated_at=${c.created_at}</pre>
       `;
@@ -259,11 +313,14 @@
       if (rejectBtn) rejectBtn.onclick = () => decide('reject');
       const maybeBtn = document.getElementById('btnMaybe');
       if (maybeBtn) maybeBtn.onclick = () => decide('maybe');
+      // Replay exists in BOTH panels (edit panel and the locked replay-only
+      // panel), so it is wired outside the editable branch.
+      const replayBtn = document.getElementById('btnReplay');
+      if (replayBtn) replayBtn.onclick = () => replayWindow();
       if (editable) {
         detailEl.querySelectorAll('.nudge').forEach((btn) => {
           btn.onclick = () => nudgeWindow(btn.dataset.field, Number(btn.dataset.delta));
         });
-        document.getElementById('btnReplay').onclick = () => replayWindow();
         document.getElementById('btnSaveWin').onclick = () => saveWindow();
         const resetBtn = document.getElementById('btnResetWin');
         if (resetBtn) resetBtn.onclick = () => resetWindow();
@@ -279,13 +336,17 @@
     // inert via the same hasUnsaved() guard in decide(). Replay stays live so
     // the operator can preview before saving. No modal dialogs.
     function updateVerdictLock(c) {
-      const locked = hasUnsaved(c);
+      // D-056: approved (awaiting-delivery) cards are verdict-locked too —
+      // approved is terminal (D-050), the delivery badge explains why. The
+      // "save or reset" hint shows only for the unsaved-edit lock.
+      const unsaved = hasUnsaved(c);
+      const locked = unsaved || c.state === 'approved';
       for (const id of ['btnApprove', 'btnReject', 'btnMaybe']) {
         const b = document.getElementById(id);
         if (b) b.disabled = locked;
       }
       const lockEl = document.getElementById('verdictLock');
-      if (lockEl) lockEl.style.display = locked ? 'inline' : 'none';
+      if (lockEl) lockEl.style.display = unsaved ? 'inline' : 'none';
     }
 
     // D-055: nudges edit LOCAL (unsaved) state only; Save persists. The spans
@@ -326,6 +387,20 @@
       v.play();
     }
 
+    // D-056 fixer (poll/verdict splice race). EVERY mutation of `candidates`
+    // that runs AFTER an await must locate its row by IDENTITY, never by an
+    // index captured before the await. The 15s pollRefresh can land mid-flight
+    // — the verdict response is held open by the synchronous delivery-webhook
+    // fire, so the window is wide — and it REPLACES the array, so a captured
+    // `idx` can be pointing at a different card by the time the continuation
+    // runs. Splicing that index removed the WRONG card and showed another
+    // card's detail. (Same bug in the pre-existing two-rapid-verdicts case.)
+    // Returns -1 when the row is already gone from the current queue; callers
+    // then leave the array alone and just re-render.
+    function indexOfRow(id) {
+      return candidates.findIndex((x) => x.id === id);
+    }
+
     async function postWindow(c, startVal, endVal) {
       const res = await fetch(`/api/candidates/${c.id}/window`, {
         method: 'POST',
@@ -345,10 +420,16 @@
       if (!candidates.length) return;
       const c = candidates[idx];
       const ed = editorValues(c);
+      gen += 1;
       const row = await postWindow(c, ed.start, ed.end);
       if (!row) return;
-      candidates[idx] = row;
+      // Post-await: locate by identity, never by the captured idx.
       delete drafts[row.id];
+      const j = indexOfRow(row.id);
+      if (j !== -1) {
+        candidates[j] = row;
+        idx = j;
+      }
       renderList();
       renderDetail();
     }
@@ -356,10 +437,16 @@
     async function resetWindow() {
       if (!candidates.length) return;
       const c = candidates[idx];
+      gen += 1;
       const row = await postWindow(c, null, null);
       if (!row) return;
-      candidates[idx] = row;
+      // Post-await: locate by identity, never by the captured idx.
       delete drafts[row.id];
+      const j = indexOfRow(row.id);
+      if (j !== -1) {
+        candidates[j] = row;
+        idx = j;
+      }
       renderList();
       renderDetail();
     }
@@ -367,12 +454,16 @@
     async function decide(action) {
       if (!candidates.length) return;
       const c = candidates[idx];
+      // D-056: approved (awaiting-delivery) cards are verdict-locked — covers
+      // the a/r/m keys; the buttons are already disabled (server 409s anyway).
+      if (c.state === 'approved') return;
       // D-055 fixer (gate 17): unsaved window edits block every verdict —
       // this single guard covers both the buttons and the a/r/m keys.
       if (hasUnsaved(c)) {
         updateVerdictLock(c);
         return;
       }
+      gen += 1; // invalidate any in-flight poll result
       const res = await fetch(`/api/candidates/${c.id}/${action}`, { method: 'POST' });
       if (!res.ok) {
         let body = '';
@@ -381,8 +472,45 @@
         return;
       }
       delete drafts[c.id];
-      candidates.splice(idx, 1);
-      if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
+      if (action === 'approve' && view === 'pending') {
+        // D-056: an approved card STAYS in pending until the delivery witness
+        // (clips.drive_synced_at) lands — replace it in place with the
+        // server's updated row. The verdict response's webhook outcome badges
+        // the card immediately when delivery will not start on its own.
+        let row = null;
+        try { row = await res.json(); } catch (_) {}
+        if (!row || typeof row !== 'object' || row.id === null || row.id === undefined) {
+          // D-056 fixer: the verdict LANDED (res.ok) but its body did not
+          // parse. Falling back to the stale pre-verdict object left the card
+          // rendering as state 'candidate' — editable, verdict buttons live —
+          // until the next poll, i.e. the UI showing a candidate the server
+          // has already approved. Re-fetch the queue for the server's truth
+          // instead of trusting the object we held before the POST.
+          gen += 1;
+          await loadCandidates().catch((err) => {
+            detailEl.innerHTML = `<pre>Failed to load candidates: ${String(err)}</pre>`;
+          });
+          return;
+        }
+        const wh = row.webhook;
+        delete row.webhook;
+        if (wh === 'failed' || wh === 'unconfigured') row._webhook = wh;
+        // Post-await: locate by identity, never by the captured idx.
+        const j = indexOfRow(c.id);
+        if (j !== -1) {
+          candidates[j] = row;
+          idx = j;
+        }
+      } else {
+        // Post-await: locate by identity, never by the captured idx. -1 means
+        // a poll already removed the card — nothing left to splice.
+        const j = indexOfRow(c.id);
+        if (j !== -1) {
+          candidates.splice(j, 1);
+          idx = j;
+          if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
+        }
+      }
       renderList();
       renderDetail();
     }
@@ -396,6 +524,7 @@
 
     function switchView(nextView) {
       if (view === nextView) return;
+      gen += 1;
       view = nextView;
       idx = 0;
       loadCandidates().catch((err) => {
@@ -406,6 +535,69 @@
     tabPendingEl.onclick = () => switchView('pending');
     tabMaybeEl.onclick = () => switchView('maybe');
     tabRejectedEl.onclick = () => switchView('rejected');
+
+    // D-056 light polling: every 15s re-fetch the current queue and reconcile
+    // IN PLACE — delivered cards disappear and badges update without resetting
+    // the operator's scroll position, selected card, or a playing video.
+    const POLL_MS = 15000;
+
+    function rowFingerprint(c) {
+      // _webhook rides along deliberately: a webhook-flag change must re-render.
+      return JSON.stringify(c);
+    }
+
+    function listFingerprint(list) {
+      return list.map(rowFingerprint).join('\n');
+    }
+
+    async function pollRefresh() {
+      const myGen = gen;
+      const myView = view;
+      let fresh;
+      try {
+        const res = await fetch(endpointForView(), { cache: 'no-store' });
+        if (!res.ok) return;
+        const data = await res.json();
+        fresh = Array.isArray(data) ? data : [];
+      } catch (_) {
+        return; // background refresh only — never surface a transient fetch error
+      }
+      // The operator acted (verdict/save/reset/tab) while this poll was in
+      // flight: discard the stale snapshot; the next tick re-fetches.
+      if (myGen !== gen || myView !== view) return;
+      // Carry the local-only webhook flags onto fresh rows — dropped the
+      // moment a clips row appears (delivery has started, flag is stale).
+      const flags = {};
+      for (const c of candidates) {
+        if (c._webhook) flags[c.id] = c._webhook;
+      }
+      for (const r of fresh) {
+        if (flags[r.id] && (r.clip_state === null || r.clip_state === undefined)) {
+          r._webhook = flags[r.id];
+        }
+      }
+      if (listFingerprint(fresh) === listFingerprint(candidates)) return; // nothing changed
+      const selId = candidates.length ? candidates[idx].id : null;
+      const selFp = candidates.length ? rowFingerprint(candidates[idx]) : null;
+      const scrollTop = leftEl.scrollTop;
+      candidates = fresh;
+      // Selection follows the CARD (by id), not the index — the existing
+      // click/move mechanics stay idx-based on the reconciled array.
+      let newIdx = selId === null ? 0 : candidates.findIndex((c) => c.id === selId);
+      if (newIdx === -1) newIdx = Math.min(idx, Math.max(0, candidates.length - 1));
+      idx = newIdx;
+      renderList();
+      leftEl.scrollTop = scrollTop;
+      const sel = candidates.length ? candidates[idx] : null;
+      // Re-render the detail pane ONLY when the selected card changed identity
+      // or content — an unconditional re-render would reload the <video> on
+      // every poll and stop whatever the operator is watching.
+      if (!sel || sel.id !== selId || rowFingerprint(sel) !== selFp) {
+        renderDetail();
+      }
+    }
+
+    setInterval(() => { pollRefresh(); }, POLL_MS);
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowDown' || e.key === 'j') {
