@@ -484,7 +484,12 @@ def remote_size_of(stat: tuple[int, int, int] | None) -> int | None:
 def rsync_push(host: str, dest: str, files: list[Path], label: str) -> None:
     if not files:
         return
-    cmd = ['rsync', '-a', '--info=stats2', '-e', 'ssh -o BatchMode=yes']
+    # NO --info=/--stats: macOS ships openrsync ("rsync version 2.6.9
+    # compatible"), which rejects --info= outright and whose flag set differs
+    # from modern rsync's. Only the portable core (-a, -e) is used; the
+    # post-push stat verification below is what proves the transfer, so no
+    # rsync-reported statistic is load-bearing anyway.
+    cmd = ['rsync', '-a', '-e', 'ssh -o BatchMode=yes']
     cmd += [str(f) for f in files]
     cmd += [f'{host}:{shlex.quote(dest)}/']
     print(f'RSYNC[{label}] {len(files)} file(s) -> {host}:{dest}/')
