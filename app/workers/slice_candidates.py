@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""slice_candidates: stream-copy per-candidate slices from the archive video (D-053 workflow A tail).
+
+For every clip_candidates row of one recording in state candidate/maybe/approved
+(never rejected/poisoned) that does not already have a slice file, cut a padded
+window from the archive video with `ffmpeg -c copy` (no re-encode) into
+$CLPR_SLICES_DIR/c<candidate_id>.mp4. Idempotent: an existing nonzero-size
+slice is skipped; slices are written via a .part temp file + atomic rename so a
+killed run can never leave a truncated file that a later run would skip as done.
+
+Connects via the shared adapter app/workers/db.py (CLPR_DB_URL). CLPR_SLICES_DIR
+is REQUIRED (fail loudly when unset); the n8n node exports it, local tests set a
+temp dir. Per-candidate failure isolation: one bad candidate never aborts the
+rest. Prints machine-parseable RESULT line last; on nonzero exit the RESULT and
+ERROR lines also go to stderr (D-047: n8n discards a failing child's stdout).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import db
+
+PAD_SECONDS = 1.5  # same padding as cut_clip.py so slices never feel abrupt.
+SLICE_STATES = ('candidate', 'maybe', 'approved')
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def measure_duration_s(path: Path) -> float:
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        str(path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f'ffprobe failed exit={proc.returncode} path={path} stderr="{(proc.stderr or "").strip()}"'
+        )
+    raw = proc.stdout.strip()
+    if raw == '':
+        raise RuntimeError(f'ffprobe returned empty duration output for {path}')
+    return float(raw)
+
+
+def slices_dir_from_env() -> Path:
+    raw = os.environ.get('CLPR_SLICES_DIR', '').strip()
+    if not raw:
+        raise RuntimeError(
+            'CLPR_SLICES_DIR is not set (required: the slices output directory; '
+            'the n8n node exports it, local tests set a temp dir)'
+        )
+    return Path(raw)
+
+
+def slice_one(video: Path, video_duration_s: float, candidate_id: int,
+              start_s: float, end_s: float, out_path: Path) -> None:
+    cut_start_s = clamp(start_s - PAD_SECONDS, 0.0, video_duration_s)
+    cut_end_s = clamp(end_s + PAD_SECONDS, 0.0, video_duration_s)
+    if cut_end_s <= cut_start_s:
+        raise RuntimeError(
+            f'invalid cut window after padding/clamp: candidate_id={candidate_id} '
+            f'cut_start_s={cut_start_s} cut_end_s={cut_end_s}'
+        )
+
+    part_path = out_path.with_name(out_path.name + '.part')
+    if part_path.exists():
+        part_path.unlink()
+
+    cmd = [
+        'ffmpeg',
+        '-v', 'error',
+        '-y',
+        '-ss', f'{cut_start_s:.3f}',
+        '-to', f'{cut_end_s:.3f}',
+        '-i', str(video),
+        '-c', 'copy',
+        '-f', 'mp4',
+        str(part_path),
+    ]
+    print(f'CMD {cmd}')
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        if part_path.exists():
+            part_path.unlink()
+        raise RuntimeError(
+            f'ffmpeg failed exit={proc.returncode} candidate_id={candidate_id} '
+            f'stderr="{(proc.stderr or "").strip()}"'
+        )
+    if not part_path.exists() or part_path.stat().st_size == 0:
+        if part_path.exists():
+            part_path.unlink()
+        raise RuntimeError(
+            f'ffmpeg reported success but produced no bytes: candidate_id={candidate_id} path={part_path}'
+        )
+    os.replace(part_path, out_path)
+
+
+def run(vod_id: int, video: Path) -> int:
+    slices_dir = slices_dir_from_env()
+
+    if not video.is_file():
+        raise RuntimeError(f'video file not found: {video}')
+    video_duration_s = measure_duration_s(video)
+    print(f'VIDEO {video} duration_s={video_duration_s:.3f}')
+
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM recordings WHERE id = %s', (vod_id,))
+        if cur.fetchone() is None:
+            raise RuntimeError(f'recording not found: vod_id={vod_id}')
+        cur.execute(
+            'SELECT id, start_s, end_s, state FROM clip_candidates '
+            'WHERE recording_id = %s AND state IN %s ORDER BY id',
+            (vod_id, SLICE_STATES),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    slices_dir.mkdir(parents=True, exist_ok=True)
+
+    sliced = 0
+    skipped_existing = 0
+    failed = 0
+    for candidate_id, start_s, end_s, state in rows:
+        out_path = slices_dir / f'c{int(candidate_id)}.mp4'
+        if out_path.exists() and out_path.stat().st_size > 0:
+            skipped_existing += 1
+            print(f'SKIP_EXISTING candidate={int(candidate_id)} path={out_path}')
+            continue
+        try:
+            slice_one(video, video_duration_s, int(candidate_id),
+                      float(start_s), float(end_s), out_path)
+            sliced += 1
+            print(
+                f'SLICED candidate={int(candidate_id)} state={state} '
+                f'path={out_path} bytes={out_path.stat().st_size}'
+            )
+        except Exception as exc:  # per-candidate isolation: log, count, continue
+            failed += 1
+            print(f'ERROR: slice failed candidate={int(candidate_id)}: {exc}', file=sys.stderr)
+
+    result_line = (
+        f'RESULT slice_candidates recording={vod_id} '
+        f'sliced={sliced} skipped_existing={skipped_existing} failed={failed}'
+    )
+    print(result_line)
+    if failed > 0:
+        # D-047: n8n discards a failing child's stdout — verdict to stderr too.
+        print(result_line, file=sys.stderr)
+        print(f'ERROR: {failed} candidate slice(s) failed for recording={vod_id}', file=sys.stderr)
+        return 1
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description='Stream-copy padded per-candidate slices from the archive video'
+    )
+    parser.add_argument('--vod-id', type=int, required=True)
+    parser.add_argument('--video', type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    return run(args.vod_id, args.video)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f'ERROR: {exc}', file=sys.stderr)
+        sys.exit(1)

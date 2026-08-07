@@ -52,8 +52,9 @@
         <div class="tabs">
           <button id="tabPending" class="tab active">Pending</button>
           <button id="tabMaybe" class="tab">Maybe</button>
+          <button id="tabRejected" class="tab">Rejected</button>
         </div>
-        <div class="kbd">Keys: j/k or arrows = move | a = approve | r = reject | m = maybe (Pending only)</div>
+        <div class="kbd">Keys: j/k or arrows = move | a = approve | r = reject (not in Rejected) | m = maybe (Pending/Rejected) | x = toggle Rejected queue</div>
       </div>
       <div id="list" class="list"></div>
     </aside>
@@ -75,6 +76,7 @@
     const queueTitleEl = document.getElementById('queueTitle');
     const tabPendingEl = document.getElementById('tabPending');
     const tabMaybeEl = document.getElementById('tabMaybe');
+    const tabRejectedEl = document.getElementById('tabRejected');
 
     function fmt(v, n = 3) {
       if (v === null || v === undefined) return 'null';
@@ -83,11 +85,21 @@
     }
 
     function endpointForView() {
-      return view === 'maybe' ? '/api/candidates/maybe' : '/api/candidates';
+      if (view === 'maybe') return '/api/candidates/maybe';
+      if (view === 'rejected') return '/api/candidates/rejected';
+      return '/api/candidates';
     }
 
     function titleForView() {
-      return view === 'maybe' ? 'Maybe candidates' : 'Pending candidates';
+      if (view === 'maybe') return 'Maybe candidates';
+      if (view === 'rejected') return 'Rejected candidates';
+      return 'Pending candidates';
+    }
+
+    function labelForView() {
+      if (view === 'maybe') return 'maybe';
+      if (view === 'rejected') return 'rejected';
+      return 'pending';
     }
 
     async function loadCandidates() {
@@ -104,12 +116,13 @@
       queueTitleEl.textContent = titleForView();
       tabPendingEl.classList.toggle('active', view === 'pending');
       tabMaybeEl.classList.toggle('active', view === 'maybe');
+      tabRejectedEl.classList.toggle('active', view === 'rejected');
     }
 
     function renderList() {
       listEl.innerHTML = '';
       if (!candidates.length) {
-        listEl.innerHTML = `<div class="empty">No ${view === 'maybe' ? 'maybe' : 'pending'} candidates.</div>`;
+        listEl.innerHTML = `<div class="empty">No ${labelForView()} candidates.</div>`;
         return;
       }
       candidates.forEach((c, i) => {
@@ -130,25 +143,28 @@
 
     function renderDetail() {
       if (!candidates.length) {
-        detailEl.innerHTML = `<div class="empty">No ${view === 'maybe' ? 'maybe' : 'pending'} candidates.</div>`;
+        detailEl.innerHTML = `<div class="empty">No ${labelForView()} candidates.</div>`;
         return;
       }
       const c = candidates[idx];
       const videoSrc = `/media/${c.vod_id}#t=${encodeURIComponent(c.start_s)},${encodeURIComponent(c.end_s)}`;
+      // Action buttons per queue (D-050 upgrade paths):
+      // pending: Approve/Reject/Maybe | maybe: Approve/Reject | rejected: Approve/Maybe
       detailEl.innerHTML = `
         <h2 style="margin:0 0 8px;">Candidate #${c.id}</h2>
         <div class="hint">session ${c.session_label} | vod ${c.vod_id}</div>
         <div class="hint">${c.vod_path}</div>
         <div class="actions">
           <button class="approve" id="btnApprove">Approve (a)</button>
-          <button class="reject" id="btnReject">Reject (r)</button>
-          ${view === 'pending' ? '<button class="maybe" id="btnMaybe">Maybe (m)</button>' : ''}
+          ${view !== 'rejected' ? '<button class="reject" id="btnReject">Reject (r)</button>' : ''}
+          ${view === 'pending' || view === 'rejected' ? '<button class="maybe" id="btnMaybe">Maybe (m)</button>' : ''}
         </div>
         <video controls preload="metadata" src="${videoSrc}"></video>
         <pre>score=${fmt(c.score)}\naudio=${fmt(c.signal_audio)} transcript=${fmt(c.signal_transcript)} chat=${fmt(c.signal_chat)} beat_boost=${fmt(c.signal_beat_boost)}\ncreated_at=${c.created_at}</pre>
       `;
       document.getElementById('btnApprove').onclick = () => decide('approve');
-      document.getElementById('btnReject').onclick = () => decide('reject');
+      const rejectBtn = document.getElementById('btnReject');
+      if (rejectBtn) rejectBtn.onclick = () => decide('reject');
       const maybeBtn = document.getElementById('btnMaybe');
       if (maybeBtn) maybeBtn.onclick = () => decide('maybe');
     }
@@ -187,6 +203,7 @@
 
     tabPendingEl.onclick = () => switchView('pending');
     tabMaybeEl.onclick = () => switchView('maybe');
+    tabRejectedEl.onclick = () => switchView('rejected');
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowDown' || e.key === 'j') {
@@ -198,12 +215,16 @@
       } else if (e.key === 'a') {
         e.preventDefault();
         decide('approve');
-      } else if (e.key === 'r') {
+      } else if (e.key === 'r' && view !== 'rejected') {
         e.preventDefault();
         decide('reject');
-      } else if (e.key === 'm' && view === 'pending') {
+      } else if (e.key === 'm' && (view === 'pending' || view === 'rejected')) {
         e.preventDefault();
         decide('maybe');
+      } else if (e.key === 'x') {
+        // x toggles the Rejected queue: into it from anywhere, back to Pending from it.
+        e.preventDefault();
+        switchView(view === 'rejected' ? 'pending' : 'rejected');
       }
     });
 

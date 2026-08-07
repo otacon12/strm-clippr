@@ -16,6 +16,9 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,6 +42,40 @@ def dict_cursor(conn):
 
 def json_bytes(obj: object) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode('utf-8')
+
+
+def fire_verdict_webhook(candidate_id: int, recording_id: int, old_state: str, new_state: str) -> str:
+    """POST the verdict to CLPR_VERDICT_WEBHOOK_URL (D-053). Fire-and-forget:
+    a webhook failure NEVER fails the verdict HTTP response (the verdict is the
+    money action; the webhook is bookkeeping) but is logged loudly to stderr.
+    Returns 'ok' | 'failed' | 'unconfigured' for the response JSON."""
+    url = os.environ.get('CLPR_VERDICT_WEBHOOK_URL', '').strip()
+    if not url:
+        return 'unconfigured'
+    payload = {
+        'candidate_id': candidate_id,
+        'recording_id': recording_id,
+        'old_state': old_state,
+        'new_state': new_state,
+        'ts': datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json_bytes(payload),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=3):
+            pass
+        return 'ok'
+    except Exception as exc:  # noqa: BLE001 — any failure is bookkeeping, never blocks the verdict
+        print(
+            f'WEBHOOK_FAILED candidate_id={candidate_id} recording_id={recording_id} '
+            f'old_state={old_state} new_state={new_state} error={exc!r}',
+            file=sys.stderr,
+        )
+        return 'failed'
 
 
 def fetch_candidate_row(cur, candidate_id: int) -> Optional[dict]:
@@ -222,9 +259,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def _transition_candidate(self, candidate_id: int, target_state: str) -> None:
+        # D-050 ruling (operator verbatim): statuses upgradeable any time —
+        # rejected can move back up to maybe/approved. approved stays terminal
+        # (the publish gate): no entry, so every transition off it 409s.
         allowed = {
             'candidate': {'approved', 'rejected', 'maybe'},
             'maybe': {'approved', 'rejected'},
+            'rejected': {'maybe', 'approved'},
         }
 
         conn = db.connect()
@@ -263,6 +304,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+        # Webhook fires only AFTER the commit succeeded (the verdict is durable);
+        # its outcome rides along in the response so the UI could surface it.
+        webhook_status = fire_verdict_webhook(
+            candidate_id,
+            int(updated['vod_id']) if updated else -1,
+            current_state,
+            target_state,
+        )
+        if updated is not None:
+            updated['webhook'] = webhook_status
         self._send_json(HTTPStatus.OK, updated)
 
     def do_GET(self) -> None:
@@ -277,6 +328,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         if path == '/api/candidates/maybe':
             self._serve_candidates('maybe')
+            return
+        if path == '/api/candidates/rejected':
+            self._serve_candidates('rejected')
             return
         if path.startswith('/media/'):
             self._serve_media(path.split('/media/', 1)[1])
