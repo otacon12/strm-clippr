@@ -102,7 +102,15 @@ def fire_verdict_webhook(candidate_id: int, recording_id: int, old_state: str, n
         req = urllib.request.Request(
             url,
             data=json_bytes(payload),
-            headers={'Content-Type': 'application/json'},
+            headers={
+                'Content-Type': 'application/json',
+                # The edge in front of n8n (Cloudflare) 403s urllib's default
+                # `Python-urllib/<ver>` User-Agent as a bot signature. Measured
+                # 2026-08-07 against the live endpoint: identical POST bodies,
+                # UA=Python-urllib/3.9 -> 403, UA=curl -> 200. Every verdict
+                # webhook silently "failed" until this header existed.
+                'User-Agent': 'clpr-review-server/1.0',
+            },
             method='POST',
         )
         with urllib.request.urlopen(req, timeout=3):
