@@ -34,12 +34,26 @@
     .actions { display: flex; gap: 8px; margin: 10px 0 12px; }
     .tabs { display: flex; gap: 8px; margin-top: 8px; }
     button { border: 0; padding: 8px 12px; border-radius: 8px; color: white; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
     .approve { background: var(--ok); }
     .reject { background: var(--bad); }
     .maybe { background: var(--maybe); }
     .tab { background: #2d333b; color: var(--text); border: 1px solid #3d444d; }
     .tab.active { background: var(--accent); border-color: var(--accent); color: #061326; }
     .hint { color: var(--muted); font-size: 12px; }
+    .editpanel { border: 1px solid #2d333b; border-radius: 8px; background: var(--panel2); padding: 10px; margin: 0 0 12px; }
+    .editrow { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+    .editrow:last-child { margin-bottom: 0; }
+    .editlabel { color: var(--muted); font-size: 12px; width: 40px; }
+    .editval { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 76px; text-align: center; }
+    .nudge { background: #2d333b; border: 1px solid #3d444d; color: var(--text); padding: 6px 10px; font-weight: 600; }
+    .replaywin { background: #2d333b; border: 1px solid #3d444d; color: var(--text); }
+    .savewin { background: var(--accent); color: #061326; }
+    .resetwin { background: #2d333b; border: 1px solid #3d444d; color: var(--text); }
+    .badge { background: var(--maybe); color: #061326; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 6px; vertical-align: middle; }
+    .unsaved { color: var(--maybe); font-size: 12px; font-weight: 700; }
+    .winline { font-size: 13px; margin: 0 0 10px; }
+    .winline .orig { color: var(--muted); font-size: 12px; }
     video { width: 100%; max-height: 65vh; background: #000; border-radius: 8px; }
     pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; color: var(--muted); }
   </style>
@@ -70,6 +84,9 @@
     let candidates = [];
     let idx = 0;
     let view = 'pending';
+    // D-055: local (unsaved) window edits, keyed by candidate id: {start, end}.
+    // A draft exists only while nudged-but-not-saved; Save/Reset clears it.
+    const drafts = {};
 
     const listEl = document.getElementById('list');
     const detailEl = document.getElementById('detail');
@@ -82,6 +99,41 @@
       if (v === null || v === undefined) return 'null';
       if (typeof v === 'number') return v.toFixed(n);
       return String(v);
+    }
+
+    // D-055 window helpers. EFFECTIVE window = COALESCE(adjusted, original);
+    // originals are immutable and only ever shown for reference.
+    function hasAdjustment(c) {
+      return (c.adjusted_start_s !== null && c.adjusted_start_s !== undefined)
+          || (c.adjusted_end_s !== null && c.adjusted_end_s !== undefined);
+    }
+
+    function effectiveWindow(c) {
+      return {
+        start: (c.adjusted_start_s ?? c.start_s),
+        end: (c.adjusted_end_s ?? c.end_s),
+      };
+    }
+
+    function adjustedDiffers(c) {
+      if (!hasAdjustment(c)) return false;
+      const eff = effectiveWindow(c);
+      return eff.start !== c.start_s || eff.end !== c.end_s;
+    }
+
+    // The editor's current values: the unsaved draft when one exists,
+    // else the saved effective window.
+    function editorValues(c) {
+      const d = drafts[c.id];
+      if (d) return { start: d.start, end: d.end };
+      return effectiveWindow(c);
+    }
+
+    function hasUnsaved(c) {
+      const d = drafts[c.id];
+      if (!d) return false;
+      const eff = effectiveWindow(c);
+      return d.start !== eff.start || d.end !== eff.end;
     }
 
     function endpointForView() {
@@ -134,7 +186,7 @@
             <div>#${c.id} | vod ${c.vod_id}</div>
             <div class="score">${fmt(c.score)}</div>
           </div>
-          <div class="meta">${c.session_label} | ${fmt(c.start_s,1)}s to ${fmt(c.end_s,1)}s</div>
+          <div class="meta">${c.session_label} | ${fmt(effectiveWindow(c).start,1)}s to ${fmt(effectiveWindow(c).end,1)}s${adjustedDiffers(c) ? ' | edited' : ''}</div>
           <div class="meta">audio ${fmt(c.signal_audio)} | transcript ${fmt(c.signal_transcript)} | chat ${fmt(c.signal_chat)} | beat ${fmt(c.signal_beat_boost)}</div>
         `;
         listEl.appendChild(el);
@@ -147,19 +199,59 @@
         return;
       }
       const c = candidates[idx];
-      const videoSrc = `/media/${c.vod_id}#t=${encodeURIComponent(c.start_s)},${encodeURIComponent(c.end_s)}`;
+      // D-055: the video fragment and the window display use the EFFECTIVE
+      // (saved) window — adjusted else original. Originals stay for reference.
+      const eff = effectiveWindow(c);
+      const edited = adjustedDiffers(c);
+      const ed = editorValues(c);
+      // The three queues serve only non-approved states, so approved cards
+      // never appear here; the state check is a defensive backstop (the server
+      // 409s approved edits anyway). `state` is real in every payload since
+      // the D-055 fixer, so this backstop actually evaluates.
+      const editable = c.state !== 'approved';
+      const videoSrc = `/media/${c.vod_id}#t=${encodeURIComponent(eff.start)},${encodeURIComponent(eff.end)}`;
+      const nudges = (field) => ['-5', '-1', '+1', '+5'].map((d) =>
+        `<button class="nudge" data-field="${field}" data-delta="${d}">${d}s</button>`
+      );
+      const editPanel = !editable ? '' : `
+        <div class="editpanel">
+          <div class="editrow">
+            <span class="editlabel">start</span>
+            ${nudges('start')[0]}${nudges('start')[1]}
+            <span class="editval" id="valStart">${fmt(ed.start, 1)}s</span>
+            ${nudges('start')[2]}${nudges('start')[3]}
+          </div>
+          <div class="editrow">
+            <span class="editlabel">end</span>
+            ${nudges('end')[0]}${nudges('end')[1]}
+            <span class="editval" id="valEnd">${fmt(ed.end, 1)}s</span>
+            ${nudges('end')[2]}${nudges('end')[3]}
+          </div>
+          <div class="editrow">
+            <button class="replaywin" id="btnReplay">Replay</button>
+            <button class="savewin" id="btnSaveWin">Save</button>
+            ${hasAdjustment(c) ? '<button class="resetwin" id="btnResetWin">Reset</button>' : ''}
+            <span class="unsaved" id="unsavedFlag" style="display:${hasUnsaved(c) ? 'inline' : 'none'};">unsaved</span>
+          </div>
+        </div>`;
       // Action buttons per queue (D-050 upgrade paths):
       // pending: Approve/Reject/Maybe | maybe: Approve/Reject | rejected: Approve/Maybe
       detailEl.innerHTML = `
         <h2 style="margin:0 0 8px;">Candidate #${c.id}</h2>
         <div class="hint">session ${c.session_label} | vod ${c.vod_id}</div>
         <div class="hint">${c.vod_path}</div>
+        <div class="winline">window ${fmt(eff.start, 1)}s to ${fmt(eff.end, 1)}s
+          ${edited ? '<span class="badge">edited</span>' : ''}
+          ${edited ? `<span class="orig">(original ${fmt(c.start_s, 1)}s to ${fmt(c.end_s, 1)}s)</span>` : ''}
+        </div>
         <div class="actions">
           <button class="approve" id="btnApprove">Approve (a)</button>
           ${view !== 'rejected' ? '<button class="reject" id="btnReject">Reject (r)</button>' : ''}
           ${view === 'pending' || view === 'rejected' ? '<button class="maybe" id="btnMaybe">Maybe (m)</button>' : ''}
+          <span class="hint" id="verdictLock" style="display:none;">save or reset the window first</span>
         </div>
-        <video controls preload="metadata" src="${videoSrc}"></video>
+        ${editPanel}
+        <video id="vid" controls preload="metadata" src="${videoSrc}"></video>
         <pre>score=${fmt(c.score)}\naudio=${fmt(c.signal_audio)} transcript=${fmt(c.signal_transcript)} chat=${fmt(c.signal_chat)} beat_boost=${fmt(c.signal_beat_boost)}\ncreated_at=${c.created_at}</pre>
       `;
       document.getElementById('btnApprove').onclick = () => decide('approve');
@@ -167,11 +259,120 @@
       if (rejectBtn) rejectBtn.onclick = () => decide('reject');
       const maybeBtn = document.getElementById('btnMaybe');
       if (maybeBtn) maybeBtn.onclick = () => decide('maybe');
+      if (editable) {
+        detailEl.querySelectorAll('.nudge').forEach((btn) => {
+          btn.onclick = () => nudgeWindow(btn.dataset.field, Number(btn.dataset.delta));
+        });
+        document.getElementById('btnReplay').onclick = () => replayWindow();
+        document.getElementById('btnSaveWin').onclick = () => saveWindow();
+        const resetBtn = document.getElementById('btnResetWin');
+        if (resetBtn) resetBtn.onclick = () => resetWindow();
+      }
+      // Drafts persist across card navigation — returning to a card with
+      // unsaved edits must re-lock its verdict buttons (D-055 fixer, gate 17).
+      updateVerdictLock(c);
+    }
+
+    // D-055 fixer (charter gate 17: a ruling binds to what was DISPLAYED):
+    // while a candidate has UNSAVED window edits, every verdict action on it
+    // is blocked — buttons disabled with a visible hint, and the a/r/m keys
+    // inert via the same hasUnsaved() guard in decide(). Replay stays live so
+    // the operator can preview before saving. No modal dialogs.
+    function updateVerdictLock(c) {
+      const locked = hasUnsaved(c);
+      for (const id of ['btnApprove', 'btnReject', 'btnMaybe']) {
+        const b = document.getElementById(id);
+        if (b) b.disabled = locked;
+      }
+      const lockEl = document.getElementById('verdictLock');
+      if (lockEl) lockEl.style.display = locked ? 'inline' : 'none';
+    }
+
+    // D-055: nudges edit LOCAL (unsaved) state only; Save persists. The spans
+    // are updated in place so the video element is not reloaded per nudge.
+    function nudgeWindow(field, delta) {
+      if (!candidates.length) return;
+      const c = candidates[idx];
+      const cur = editorValues(c);
+      const next = { start: cur.start, end: cur.end };
+      next[field] = Math.round((next[field] + delta) * 1000) / 1000;
+      if (field === 'start') next.start = Math.max(0, next.start);
+      drafts[c.id] = next;
+      const valEl = document.getElementById(field === 'start' ? 'valStart' : 'valEnd');
+      if (valEl) valEl.textContent = `${fmt(next[field], 1)}s`;
+      const flag = document.getElementById('unsavedFlag');
+      if (flag) flag.style.display = hasUnsaved(c) ? 'inline' : 'none';
+      // Nudges update in place (no re-render, so the video does not reload) —
+      // the verdict lock must follow the draft state in place too.
+      updateVerdictLock(c);
+    }
+
+    // Replay plays across the CURRENT effective window — including unsaved
+    // nudges, so the operator previews before saving. Our timeupdate handler
+    // owns the stop (the #t fragment end is not assumed to do it).
+    function replayWindow() {
+      if (!candidates.length) return;
+      const c = candidates[idx];
+      const ed = editorValues(c);
+      const v = document.getElementById('vid');
+      if (!v) return;
+      v.currentTime = ed.start;
+      v.ontimeupdate = () => {
+        if (v.currentTime >= ed.end) {
+          v.pause();
+          v.ontimeupdate = null;
+        }
+      };
+      v.play();
+    }
+
+    async function postWindow(c, startVal, endVal) {
+      const res = await fetch(`/api/candidates/${c.id}/window`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ start_s: startVal, end_s: endVal }),
+      });
+      if (!res.ok) {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) {}
+        alert(`Failed: ${res.status} ${body}`);
+        return null;
+      }
+      return res.json();
+    }
+
+    async function saveWindow() {
+      if (!candidates.length) return;
+      const c = candidates[idx];
+      const ed = editorValues(c);
+      const row = await postWindow(c, ed.start, ed.end);
+      if (!row) return;
+      candidates[idx] = row;
+      delete drafts[row.id];
+      renderList();
+      renderDetail();
+    }
+
+    async function resetWindow() {
+      if (!candidates.length) return;
+      const c = candidates[idx];
+      const row = await postWindow(c, null, null);
+      if (!row) return;
+      candidates[idx] = row;
+      delete drafts[row.id];
+      renderList();
+      renderDetail();
     }
 
     async function decide(action) {
       if (!candidates.length) return;
       const c = candidates[idx];
+      // D-055 fixer (gate 17): unsaved window edits block every verdict —
+      // this single guard covers both the buttons and the a/r/m keys.
+      if (hasUnsaved(c)) {
+        updateVerdictLock(c);
+        return;
+      }
       const res = await fetch(`/api/candidates/${c.id}/${action}`, { method: 'POST' });
       if (!res.ok) {
         let body = '';
@@ -179,6 +380,7 @@
         alert(`Failed: ${res.status} ${body}`);
         return;
       }
+      delete drafts[c.id];
       candidates.splice(idx, 1);
       if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
       renderList();

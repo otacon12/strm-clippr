@@ -14,6 +14,15 @@ looked up from llm_signal_candidates matching (recording_id, start_s), or
 Idempotent: a candidate whose delivered copy already exists at the destination
 with matching byte size is skipped.
 
+D-055: every cut honors the EFFECTIVE window COALESCE(adjusted_start_s,
+start_s) .. COALESCE(adjusted_end_s, end_s), originals never overwritten. The
+real render path here is cut_clip.render_clip (which reads only the original
+window and is deliberately untouched — it is the operator-proven D-023 path),
+so rendering dispatches: unedited candidates keep cut_clip.render_clip
+byte-identical behavior; adjusted candidates render via render_adjusted_clip
+below, which mirrors cut_clip exactly but cuts the effective window with
+slice_geometry.PUBLISH_PAD_S breathing room (one truth for the pad).
+
 Per-candidate failure isolation: one failure never aborts the batch.
 Connects via the shared adapter app/workers/db.py (CLPR_DB_URL). Prints
 machine-parseable RESULT line last; failure details also go to stderr (D-047
@@ -32,6 +41,7 @@ import sys
 from pathlib import Path
 
 import db
+import slice_geometry
 
 try:
     import cut_clip
@@ -166,6 +176,174 @@ def refresh_clip_fields(cur, cand: dict) -> None:
         cand['clip_state'] = str(row[1]) if row[1] is not None else None
 
 
+def fetch_adjusted_window(cur, candidate_id: int) -> tuple[float | None, float | None]:
+    cur.execute(
+        'SELECT adjusted_start_s, adjusted_end_s FROM clip_candidates WHERE id = %s',
+        (candidate_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f'candidate_id not found: {candidate_id}')
+    return (
+        float(row[0]) if row[0] is not None else None,
+        float(row[1]) if row[1] is not None else None,
+    )
+
+
+def render_adjusted_clip(candidate_id: int) -> int:
+    """cut_clip.render_clip's exact mechanics, cutting the D-055 EFFECTIVE
+    window instead of the original one.
+
+    Mirrors app/workers/cut_clip.py render_clip (lines 92-192) step for step:
+    OBS gate, clips-table guard, approved-state guard, pad+clamp, same out_dir
+    and <recording_id>_<candidate_id>.mp4 name (so refresh_clip_fields/sync see
+    it identically), the D-023 operator-proven filter_complex and encode flags
+    byte-for-byte (cut_clip.py lines 133-159), the same clips upsert, and
+    failure unlinks the partial output (charter gate 9). Only the cut window
+    differs: COALESCE(adjusted, original) +/- slice_geometry.PUBLISH_PAD_S
+    (== cut_clip.PAD_SECONDS, one truth in slice_geometry).
+    """
+    require_obs_idle_or_raise('deliver_approved')
+
+    run_id = f'deliver_adjusted_{dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
+
+    conn = db.connect()
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = 'clips'"
+        )
+        if cur.fetchone() is None:
+            raise RuntimeError('clips table missing; apply migrations_pg/001 before deliver_approved')
+
+        cur.execute(
+            '''
+            SELECT c.recording_id, c.start_s, c.end_s,
+                   c.adjusted_start_s, c.adjusted_end_s,
+                   c.state, r.path, r.duration_s
+            FROM clip_candidates c
+            JOIN recordings r ON r.id = c.recording_id
+            WHERE c.id = %s
+            ''',
+            (candidate_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f'candidate_id not found: {candidate_id}')
+        (recording_id, start_s, end_s, adjusted_start_s, adjusted_end_s,
+         state, recording_path, recording_duration_s) = row
+        if recording_duration_s is None:
+            raise RuntimeError(f'recording duration_s is NULL for candidate_id={candidate_id}')
+        recording_id = int(recording_id)
+        recording_duration_s = float(recording_duration_s)
+
+        if str(state) != 'approved':
+            raise RuntimeError(
+                f'candidate must be approved before cut: candidate_id={candidate_id} state={state}'
+            )
+
+        eff_start_s, eff_end_s = slice_geometry.effective_window(
+            float(start_s), float(end_s),
+            float(adjusted_start_s) if adjusted_start_s is not None else None,
+            float(adjusted_end_s) if adjusted_end_s is not None else None,
+        )
+        pad = slice_geometry.PUBLISH_PAD_S
+
+        cut_start_s = cut_clip.clamp(eff_start_s - pad, 0.0, recording_duration_s)
+        cut_end_s = cut_clip.clamp(eff_end_s + pad, 0.0, recording_duration_s)
+        if cut_end_s <= cut_start_s:
+            raise RuntimeError(
+                f'invalid cut window after padding/clamp: candidate_id={candidate_id} '
+                f'cut_start_s={cut_start_s} cut_end_s={cut_end_s}'
+            )
+        cut_duration_s = cut_end_s - cut_start_s
+
+        out_dir = Path(__file__).resolve().parent.parent / 'clips_out'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f'{recording_id}_{candidate_id}.mp4'
+
+        if out_path.exists():
+            out_path.unlink()
+
+        # Copied EXACTLY from cut_clip.py lines 133-159 (operator-proven live
+        # on Instagram, D-023); change nothing.
+        filter_complex = (
+            '[0:v]split=2[bg][fg];'
+            '[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=20[bg2];'
+            '[fg]scale=1080:-2:flags=lanczos[fg2];'
+            '[bg2][fg2]overlay=(W-w)/2:(H-h)/2,fps=30[v]'
+        )
+
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-y',
+            '-ss', f'{cut_start_s:.3f}',
+            '-i', str(recording_path),
+            '-t', f'{cut_duration_s:.3f}',
+            '-filter_complex', filter_complex,
+            '-map', '[v]',
+            '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-preset', 'slow',
+            '-crf', '18',
+            '-profile:v', 'high',
+            '-pix_fmt', 'yuv420p',
+            '-r', '30',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-movflags', '+faststart',
+            str(out_path),
+        ]
+
+        try:
+            ffmpeg_proc = cut_clip.run_capture(ffmpeg_cmd)
+            print(f'FFMPEG_EXIT_CODE {ffmpeg_proc.returncode}')
+
+            duration_s = cut_clip.measure_duration_s(out_path)
+
+            cur.execute(
+                '''
+                INSERT INTO clips(candidate_id, file_path, duration_s, state, created_by_run, created_at)
+                VALUES (%s, %s, %s, 'rendered', %s, %s)
+                ON CONFLICT (candidate_id) DO UPDATE SET
+                    file_path = EXCLUDED.file_path,
+                    duration_s = EXCLUDED.duration_s,
+                    state = 'rendered',
+                    created_by_run = EXCLUDED.created_by_run,
+                    created_at = EXCLUDED.created_at
+                ''',
+                (candidate_id, str(out_path), duration_s, run_id, utc_now_iso()),
+            )
+            conn.commit()
+
+            print(
+                f'RESULT deliver_adjusted candidate={candidate_id} ok=1 '
+                f'file="{out_path}" duration_s={duration_s:.3f}'
+            )
+            return 0
+        except Exception:
+            if out_path.exists():
+                out_path.unlink()
+            raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def render_candidate(cur, candidate_id: int) -> int:
+    """D-055 render dispatch: unedited candidates keep the operator-proven
+    cut_clip.render_clip path byte-identical; candidates with any adjusted
+    column set render the effective window via render_adjusted_clip."""
+    adjusted_start_s, adjusted_end_s = fetch_adjusted_window(cur, candidate_id)
+    if adjusted_start_s is None and adjusted_end_s is None:
+        return cut_clip.render_clip(candidate_id)
+    return render_adjusted_clip(candidate_id)
+
+
 def report_failure(candidate_id: int, stage: str, exc: Exception) -> None:
     msg = f'CANDIDATE_FAILED candidate={candidate_id} stage={stage} error="{exc}"'
     print(msg)
@@ -272,7 +450,7 @@ def main() -> int:
                 for cand in pending_render:
                     cid = cand['candidate_id']
                     try:
-                        cut_clip.render_clip(cid)
+                        render_candidate(cur, cid)
                     except Exception as exc:
                         if is_obs_gate_refusal(exc):
                             obs_blocked += 1

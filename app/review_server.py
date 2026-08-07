@@ -13,6 +13,7 @@ URL paths are an external contract consumed by review_ui.html and stay as-is
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -34,6 +35,31 @@ HOST = '127.0.0.1'
 PORT = int(os.environ.get('CLPR_REVIEW_PORT', '8737'))
 UI_PATH = Path(__file__).resolve().parent / 'review_ui.html'
 POST_ACTION_RE = re.compile(r'^/api/candidates/(\d+)/(approve|reject|maybe)$')
+POST_WINDOW_RE = re.compile(r'^/api/candidates/(\d+)/window$')
+
+# One truth for the candidate payload columns (list endpoints AND the window
+# endpoint's 200 body use exactly this shape — the UI re-renders from either).
+# D-055: adjusted_start_s/adjusted_end_s ride along in every candidate payload
+# (null when unset); originals start_s/end_s are immutable. `state` rides
+# along too (D-055 fixer) so the UI's editable backstop (c.state !==
+# 'approved') keys on a value that actually exists in the payload.
+CANDIDATE_PAYLOAD_COLUMNS = '''
+          c.id,
+          c.recording_id AS vod_id,
+          r.path AS vod_path,
+          r.session_label,
+          r.display_name,
+          c.start_s,
+          c.end_s,
+          c.adjusted_start_s,
+          c.adjusted_end_s,
+          c.state,
+          c.score,
+          c.signal_audio,
+          c.signal_transcript,
+          c.signal_chat,
+          c.signal_beat_boost,
+          c.created_at'''
 
 
 def dict_cursor(conn):
@@ -78,24 +104,12 @@ def fire_verdict_webhook(candidate_id: int, recording_id: int, old_state: str, n
         return 'failed'
 
 
-def fetch_candidate_row(cur, candidate_id: int) -> Optional[dict]:
+def fetch_candidate_payload(cur, candidate_id: int) -> Optional[dict]:
+    """The candidate row in EXACTLY the list-endpoint shape (state included —
+    CANDIDATE_PAYLOAD_COLUMNS carries it since the D-055 fixer)."""
     cur.execute(
-        '''
-        SELECT
-          c.id,
-          c.recording_id AS vod_id,
-          r.path AS vod_path,
-          r.session_label,
-          r.display_name,
-          c.start_s,
-          c.end_s,
-          c.score,
-          c.signal_audio,
-          c.signal_transcript,
-          c.signal_chat,
-          c.signal_beat_boost,
-          c.state,
-          c.created_at
+        f'''
+        SELECT{CANDIDATE_PAYLOAD_COLUMNS}
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
         WHERE c.id = %s
@@ -104,6 +118,12 @@ def fetch_candidate_row(cur, candidate_id: int) -> Optional[dict]:
     )
     row = cur.fetchone()
     return dict(row) if row else None
+
+
+def is_finite_number(v: object) -> bool:
+    """True for finite int/float; False for bool (a JSON true/false is not a
+    number here) and for NaN/Infinity (json.loads accepts those literals)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -143,21 +163,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         try:
             cur = dict_cursor(conn)
             cur.execute(
-                '''
-                SELECT
-                  c.id,
-                  c.recording_id AS vod_id,
-                  r.path AS vod_path,
-                  r.session_label,
-                  r.display_name,
-                  c.start_s,
-                  c.end_s,
-                  c.score,
-                  c.signal_audio,
-                  c.signal_transcript,
-                  c.signal_chat,
-                  c.signal_beat_boost,
-                  c.created_at
+                f'''
+                SELECT{CANDIDATE_PAYLOAD_COLUMNS}
                 FROM clip_candidates c
                 JOIN recordings r ON r.id = c.recording_id
                 WHERE c.state = %s
@@ -300,7 +307,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 conn.rollback()
                 raise
 
-            updated = fetch_candidate_row(cur, candidate_id)
+            updated = fetch_candidate_payload(cur, candidate_id)
         finally:
             conn.close()
 
@@ -314,6 +321,89 @@ class ReviewHandler(BaseHTTPRequestHandler):
         )
         if updated is not None:
             updated['webhook'] = webhook_status
+        self._send_json(HTTPStatus.OK, updated)
+
+    def _edit_window(self, candidate_id: int, body_raw: bytes) -> None:
+        # D-055: operator window edit. Originals start_s/end_s are IMMUTABLE;
+        # this endpoint only ever writes adjusted_start_s/adjusted_end_s.
+        # NO webhook fires here — the webhook is a verdict signal only.
+        try:
+            body = json.loads(body_raw.decode('utf-8')) if body_raw else None
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {'error': 'body must be valid JSON'})
+            return
+        if not isinstance(body, dict) or 'start_s' not in body or 'end_s' not in body:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {'error': 'body must be a JSON object with keys start_s and end_s'},
+            )
+            return
+
+        start_s = body['start_s']
+        end_s = body['end_s']
+        if start_s is None and end_s is None:
+            new_start: Optional[float] = None
+            new_end: Optional[float] = None
+        else:
+            if not (is_finite_number(start_s) and is_finite_number(end_s)):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {'error': 'start_s and end_s must both be finite numbers, or both null to reset'},
+                )
+                return
+            if not (0 <= start_s < end_s):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {'error': 'window must satisfy 0 <= start_s < end_s',
+                     'start_s': start_s, 'end_s': end_s},
+                )
+                return
+            new_start = float(start_s)
+            new_end = float(end_s)
+
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            # ATOMIC APPROVE LOCK (D-055 fixer): the guard lives IN the UPDATE,
+            # not in a preceding SELECT — a concurrent approve landing between
+            # a check and the write can no longer be edited past. approved is
+            # terminal (D-050, the publish gate), so a rowcount of 0 means the
+            # row is either absent (404) or approved (409); re-SELECT to answer
+            # honestly.
+            try:
+                cur.execute(
+                    'UPDATE clip_candidates SET adjusted_start_s = %s, adjusted_end_s = %s '
+                    "WHERE id = %s AND state <> 'approved'",
+                    (new_start, new_end, candidate_id),
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    cur.execute('SELECT state FROM clip_candidates WHERE id = %s', (candidate_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        self._send_json(
+                            HTTPStatus.NOT_FOUND,
+                            {'error': f'candidate not found: {candidate_id}'},
+                        )
+                        return
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            'error': 'candidate already decided',
+                            'id': candidate_id,
+                            'state': str(row['state']),
+                        },
+                    )
+                    return
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+            updated = fetch_candidate_payload(cur, candidate_id)
+        finally:
+            conn.close()
+
         self._send_json(HTTPStatus.OK, updated)
 
     def do_GET(self) -> None:
@@ -340,6 +430,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+
+        wm = POST_WINDOW_RE.match(parsed.path)
+        if wm:
+            content_len = int(self.headers.get('Content-Length', '0') or '0')
+            body_raw = self.rfile.read(content_len) if content_len > 0 else b''
+            self._edit_window(int(wm.group(1)), body_raw)
+            return
+
         m = POST_ACTION_RE.match(parsed.path)
         if not m:
             self._send_json(HTTPStatus.NOT_FOUND, {'error': 'Not found'})

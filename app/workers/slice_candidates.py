@@ -4,9 +4,29 @@
 For every clip_candidates row of one recording in state candidate/maybe/approved
 (never rejected/poisoned) that does not already have a slice file, cut a padded
 window from the archive video with `ffmpeg -c copy` (no re-encode) into
-$CLPR_SLICES_DIR/c<candidate_id>.mp4. Idempotent: an existing nonzero-size
-slice is skipped; slices are written via a .part temp file + atomic rename so a
-killed run can never leave a truncated file that a later run would skip as done.
+$CLPR_SLICES_DIR/c<candidate_id>.mp4.
+
+D-055 geometry: staging bounds come from slice_geometry (the one-truth module)
+with SLICE_PAD_S (10 s) headroom around the IMMUTABLE ORIGINAL window
+(start_s/end_s). Slices deliberately IGNORE the adjusted_start_s/adjusted_end_s
+columns: the original window is the fixed basis, so an operator edit before OR
+after staging never invalidates a staged slice.
+
+WITNESSED GEOMETRY (D-055 fixer): every staged slice gets a SIDECAR
+c<id>.json next to it recording the slice's REAL absolute coordinates —
+the renderer reads the sidecar, never re-derives from the formula, because
+the actual file can disobey the formula (a keyframe-snapped -c copy head,
+a staging-time video-end clamp, or a stale pre-D-055 slice under the same
+name). abs_end from a -to copy cut is near-exact while the head snaps to
+the keyframe BEFORE the requested start, so the sidecar anchors
+abs_start_s = abs_end_s - actual_duration_s, absorbing the snap.
+
+Idempotent: slice + valid sidecar => skip; a slice WITHOUT a valid sidecar
+is RESTAGED (both files regenerated) — this heals stale pre-D-055 slices
+staged under the same c<id>.mp4 name with different geometry. Both files
+are written via a .part temp + atomic os.replace, sidecar LAST (it is the
+commit marker: a crash between mp4 and sidecar leaves slice-without-sidecar,
+which the restage rule self-heals).
 
 Connects via the shared adapter app/workers/db.py (CLPR_DB_URL). CLPR_SLICES_DIR
 is REQUIRED (fail loudly when unset); the n8n node exports it, local tests set a
@@ -18,15 +38,24 @@ ERROR lines also go to stderr (D-047: n8n discards a failing child's stdout).
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import json
+import math
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import db
+import slice_geometry
 
-PAD_SECONDS = 1.5  # same padding as cut_clip.py so slices never feel abrupt.
 SLICE_STATES = ('candidate', 'maybe', 'approved')
+
+SIDECAR_SCHEMA = 1
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
 
 
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -62,10 +91,47 @@ def slices_dir_from_env() -> Path:
     return Path(raw)
 
 
+def sidecar_path_for(out_path: Path) -> Path:
+    """c<id>.mp4 -> c<id>.json (the slice's geometry witness, D-055 fixer)."""
+    return out_path.with_suffix('.json')
+
+
+def load_valid_sidecar(sidecar_path: Path, candidate_id: int) -> dict | None:
+    """Parse + validate an existing sidecar. None on ANY defect (missing,
+    unparseable, wrong schema, wrong candidate_id, non-finite coordinates) —
+    the caller treats None as 'restage both files'."""
+    try:
+        raw = sidecar_path.read_text(encoding='utf-8')
+        data = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get('schema') != SIDECAR_SCHEMA:
+        return None
+    if data.get('candidate_id') != candidate_id:
+        return None
+    for key in ('abs_start_s', 'abs_end_s', 'actual_duration_s'):
+        v = data.get(key)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+            return None
+    return data
+
+
+def write_sidecar_atomic(sidecar_path: Path, payload: dict) -> None:
+    part = sidecar_path.with_name(sidecar_path.name + '.part')
+    if part.exists():
+        part.unlink()
+    part.write_text(json.dumps(payload, ensure_ascii=False) + '\n', encoding='utf-8')
+    os.replace(part, sidecar_path)
+
+
 def slice_one(video: Path, video_duration_s: float, candidate_id: int,
               start_s: float, end_s: float, out_path: Path) -> None:
-    cut_start_s = clamp(start_s - PAD_SECONDS, 0.0, video_duration_s)
-    cut_end_s = clamp(end_s + PAD_SECONDS, 0.0, video_duration_s)
+    # D-055: staging bounds from the ORIGINAL window only, SLICE_PAD_S headroom,
+    # end clamped to the video duration here at staging time (slice_geometry).
+    cut_start_s = slice_geometry.slice_start(start_s)
+    cut_end_s = slice_geometry.slice_end(end_s, video_duration_s)
     if cut_end_s <= cut_start_s:
         raise RuntimeError(
             f'invalid cut window after padding/clamp: candidate_id={candidate_id} '
@@ -104,6 +170,35 @@ def slice_one(video: Path, video_duration_s: float, candidate_id: int,
         )
     os.replace(part_path, out_path)
 
+    # ---- Sidecar witness (D-055 fixer): the slice's REAL absolute coords. ----
+    # A -c copy input cut's END (-to) is near-exact, but its HEAD snaps to the
+    # keyframe AT/BEFORE the requested start, so the actual media starts
+    # EARLIER than nominal. Anchoring abs_start_s = abs_end_s - actual_duration
+    # absorbs the snap; the renderer trusts these two numbers, never the formula.
+    try:
+        actual_duration_s = measure_duration_s(out_path)
+    except Exception:
+        # Gate 9 (a failed run writes nothing): a slice we could not measure
+        # must not survive as an unwitnessed file a later run would skip.
+        if out_path.exists():
+            out_path.unlink()
+        raise
+
+    # requested_* are the PRE-CLAMP formula values (diagnostic only — a
+    # staging-time video-end clamp is visible as requested_end_s > abs_end_s;
+    # the renderer must never use them for math).
+    sidecar = {
+        'schema': SIDECAR_SCHEMA,
+        'candidate_id': candidate_id,
+        'abs_start_s': cut_end_s - actual_duration_s,
+        'abs_end_s': cut_end_s,
+        'requested_start_s': cut_start_s,
+        'requested_end_s': slice_geometry.slice_end(end_s),  # unclamped
+        'actual_duration_s': actual_duration_s,
+        'staged_at': utc_now_iso(),
+    }
+    write_sidecar_atomic(sidecar_path_for(out_path), sidecar)
+
 
 def run(vod_id: int, video: Path) -> int:
     slices_dir = slices_dir_from_env()
@@ -135,10 +230,19 @@ def run(vod_id: int, video: Path) -> int:
     failed = 0
     for candidate_id, start_s, end_s, state in rows:
         out_path = slices_dir / f'c{int(candidate_id)}.mp4'
+        sidecar_path = sidecar_path_for(out_path)
+        # Idempotency (D-055 fixer): only slice + VALID sidecar counts as done.
+        # A slice without one is restaged — that is the heal path for stale
+        # pre-D-055 slices staged under the same name with other geometry.
         if out_path.exists() and out_path.stat().st_size > 0:
-            skipped_existing += 1
-            print(f'SKIP_EXISTING candidate={int(candidate_id)} path={out_path}')
-            continue
+            if load_valid_sidecar(sidecar_path, int(candidate_id)) is not None:
+                skipped_existing += 1
+                print(f'SKIP_EXISTING candidate={int(candidate_id)} path={out_path}')
+                continue
+            print(
+                f'RESTAGE candidate={int(candidate_id)} path={out_path} '
+                'reason=missing_or_invalid_sidecar'
+            )
         try:
             slice_one(video, video_duration_s, int(candidate_id),
                       float(start_s), float(end_s), out_path)

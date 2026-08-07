@@ -3,7 +3,8 @@
 #
 # Creates a unix-socket-only cluster in a mktemp dir (no TCP ports, so parallel
 # agents never clash), creates role app_rw (LOGIN — 001 GRANTs to it, so it must
-# exist BEFORE the schema applies), applies app/migrations_pg/001_consolidated_schema.sql,
+# exist BEFORE the schema applies), applies EVERY app/migrations_pg/*.sql in
+# sorted order (D-055 fixer: a hardcoded 001 silently skipped later migrations),
 # loads a data file (default: ~/Downloads/consolidated_data.sql), exports
 # CLPR_DB_URL (connecting AS app_rw, the live app role, so the grants are part
 # of what every proof exercises), runs the caller's command, and ALWAYS tears
@@ -20,7 +21,7 @@ set -u
 
 PGBIN=/usr/local/bin
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCHEMA="$SCRIPT_DIR/../migrations_pg/001_consolidated_schema.sql"
+MIGRATIONS_DIR="$SCRIPT_DIR/../migrations_pg"
 DATA="$HOME/Downloads/consolidated_data.sql"
 
 if [ "${1:-}" = "--data" ]; then
@@ -32,8 +33,13 @@ if [ $# -lt 1 ]; then
     echo "ERROR: no command given. Usage: pg_test_harness.sh [--data FILE] command [args...]" >&2
     exit 2
 fi
-if [ ! -f "$SCHEMA" ]; then
-    echo "ERROR: schema not found: $SCHEMA" >&2
+# Fail loudly if the migrations glob matches nothing (charter 1.5 gate 2: an
+# empty match must never fall through to a "clean" run with no schema).
+shopt -s nullglob
+MIGRATIONS=("$MIGRATIONS_DIR"/*.sql)
+shopt -u nullglob
+if [ "${#MIGRATIONS[@]}" -eq 0 ]; then
+    echo "ERROR: no migrations found: $MIGRATIONS_DIR/*.sql" >&2
     exit 2
 fi
 if [ ! -f "$DATA" ]; then
@@ -81,7 +87,10 @@ step createdb "$PGBIN/createdb" -h "$TMP" clpr
 # 001 GRANTs to app_rw, so the role must exist first (LOGIN, as in the live DB).
 step create_role_app_rw "$PGBIN/psql" -h "$TMP" -d clpr -v ON_ERROR_STOP=1 \
     -c "CREATE ROLE app_rw LOGIN"
-step apply_schema "$PGBIN/psql" -h "$TMP" -d clpr -v ON_ERROR_STOP=1 -q -f "$SCHEMA"
+# Bash glob expansion is already lexicographically sorted => numbered order.
+for mig in "${MIGRATIONS[@]}"; do
+    step "apply_$(basename "$mig")" "$PGBIN/psql" -h "$TMP" -d clpr -v ON_ERROR_STOP=1 -q -f "$mig"
+done
 step load_data "$PGBIN/psql" -h "$TMP" -d clpr -v ON_ERROR_STOP=1 -q -f "$DATA"
 
 # Connect AS the app role over the socket (host = socket dir).
