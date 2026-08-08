@@ -34,6 +34,58 @@ import db  # noqa: E402  (app/workers/db.py — the shared adapter)
 
 HOST = '127.0.0.1'
 PORT = int(os.environ.get('CLPR_REVIEW_PORT', '8737'))
+
+# THE TWO-VOCABULARIES RULE (2026-08-08).
+#
+# `recordings.path` means different things depending on which lane registered
+# the recording, and the review UI is on a THIRD machine from either:
+#   local lane   -> /Volumes/GOLDMINE/vibecoder-recordings/<stem>.mov  (a video)
+#   portable lane-> /home/node/.n8n/clpr/media/<stem>.wav              (SERVER audio)
+# Serving `recordings.path` verbatim therefore 404s for every n8n-analyzed VOD,
+# and the player just silently does nothing. That was hand-patched once, for
+# recording 19, by rewriting the row. Rewriting a row fixes one VOD; this
+# resolves it for all of them.
+#
+# THE STEM IS THE ONLY STABLE KEY across lanes (same reason restore-inputs.py
+# joins on it, and the same stem D-068 derives session_label from). So: if the
+# stored path is not readable here, look for <stem>.<video-ext> in the local
+# video directories. Audio extensions are deliberately NOT candidates - a .wav
+# resolves to nothing rather than to an unplayable file.
+LOCAL_VOD_DIRS_DEFAULT = (
+    '/Users/fifgen/Library/CloudStorage/GoogleDrive-seun@gmgt.co/My Drive/projects/stream/to_clip',
+    '/Volumes/GOLDMINE/vibecoder-recordings',
+    str(Path(__file__).resolve().parent / 'clips_out'),
+)
+VIDEO_EXTS = ('.mov', '.mp4', '.m4v', '.mkv', '.webm', '.avi')
+
+
+def local_vod_dirs() -> list[Path]:
+    """Directories searched for a playable source video, in order.
+
+    Override with CLPR_LOCAL_VOD_DIRS (colon-separated) on a machine whose
+    Drive mount or GOLDMINE path differs.
+    """
+    raw = os.environ.get('CLPR_LOCAL_VOD_DIRS', '').strip()
+    dirs = raw.split(':') if raw else list(LOCAL_VOD_DIRS_DEFAULT)
+    return [Path(d) for d in dirs if d]
+
+
+def resolve_local_vod(stored_path: str) -> Path | None:
+    """A locally-readable VIDEO for this recording, or None.
+
+    Tries the stored path first (the local lane's rows are already correct and
+    must keep working unchanged), then falls back to a stem search.
+    """
+    p = Path(stored_path)
+    if p.suffix.lower() in VIDEO_EXTS and p.is_file():
+        return p
+    stem = p.stem
+    for d in local_vod_dirs():
+        for ext in VIDEO_EXTS:
+            cand = d / f'{stem}{ext}'
+            if cand.is_file():
+                return cand
+    return None
 UI_PATH = Path(__file__).resolve().parent / 'review_ui.html'
 POST_ACTION_RE = re.compile(r'^/api/candidates/(\d+)/(approve|reject|maybe)$')
 POST_WINDOW_RE = re.compile(r'^/api/candidates/(\d+)/window$')
@@ -372,9 +424,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_text(HTTPStatus.NOT_FOUND, f'vod_id not found: {recording_id}')
             return
 
-        file_path = Path(str(row['path']))
-        if not file_path.exists() or not file_path.is_file():
-            self._send_text(HTTPStatus.NOT_FOUND, f'VOD file not found: {file_path}')
+        file_path = resolve_local_vod(str(row['path']))
+        if file_path is None:
+            searched = ' ; '.join(str(d) for d in local_vod_dirs())
+            self._send_text(
+                HTTPStatus.NOT_FOUND,
+                f'VOD not playable on this machine.\n'
+                f'recordings.path = {row["path"]}\n'
+                f'Searched for a video named "{Path(str(row["path"])).stem}.*" in: {searched}\n'
+                f'Set CLPR_LOCAL_VOD_DIRS (colon-separated) to the folder holding the '
+                f'source videos.')
             return
 
         self._serve_file_range(file_path)
