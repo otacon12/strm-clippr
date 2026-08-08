@@ -741,6 +741,10 @@
           <div class="editrow">
             <button class="savewin" id="btnSaveKit">Save my edits (new version)</button>
             <button class="nudge" id="btnRegen">Regenerate</button>
+            <!-- Re-render is the VIDEO; Regenerate is the COPY. Labelled
+                 explicitly because the two were confusable enough that
+                 Regenerate got pressed to change a burned-in caption. -->
+            <button class="nudge" id="btnRerender" title="Re-cut the video file with the current caption setting">Re-render video</button>
             <span class="unsaved" id="kitUnsaved" style="display:${kitHasUnsaved(c) ? 'inline' : 'none'};">unsaved</span>
           </div>
           <div class="kitmeta">Saving never overwrites: it writes v${(c.kit_version || 0) + 1} and keeps
@@ -863,6 +867,8 @@
       if (saveBtn) saveBtn.onclick = () => saveKit(c);
       const regenBtn = document.getElementById('btnRegen');
       if (regenBtn) regenBtn.onclick = () => requestRegenerate(c);
+      const rrBtn = document.getElementById('btnRerender');
+      if (rrBtn) rrBtn.onclick = () => rerenderClip(c, rrBtn);
       const pfBtn = document.getElementById('btnSaveProfile');
       if (pfBtn) pfBtn.onclick = () => saveProfile();
       const subjBtn = document.getElementById('btnSaveSubj');
@@ -1084,6 +1090,42 @@
       if (j !== -1) { candidates[j] = row; idx = j; }
       renderList();
       renderDetail();
+    }
+
+    // RE-RENDER THE VIDEO (distinct from Regenerate, which rebuilds the COPY).
+    // Re-cuts the mp4 with whatever burn_captions currently says, which is the
+    // only way a caption decision taken AFTER delivery reaches Drive.
+    async function rerenderClip(c, btn) {
+      const on = c.burn_captions === 1;
+      const msg = 'Re-render this clip?\n\n'
+        + 'It re-cuts the video with captions ' + (on ? 'ON' : 'OFF')
+        + ' and re-uploads it.\n\n'
+        + 'The upload creates a NEW file rather than replacing one, so delete the '
+        + 'previous copy from Drive first if it is still there.';
+      if (!confirm(msg)) return;
+      const label = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Re-rendering...';
+      try {
+        const res = await fetch(`/api/candidates/${c.id}/rerender`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          alert('Re-render refused:\n\n' + (j.error || res.status));
+          return;
+        }
+        // The chain runs on the server; the row will not be updated by the time
+        // this returns. Say that rather than implying it is already done.
+        alert('Re-render queued (captions ' + (on ? 'ON' : 'OFF') + ').\n\n'
+              + 'webhook: ' + (j.webhook || '?')
+              + '\n\nIt takes a moment. Refresh to see the new file.');
+      } catch (e) {
+        alert('Re-render failed: ' + e);
+      } finally {
+        btn.disabled = false; btn.textContent = label;
+      }
     }
 
     async function requestRegenerate(c) {

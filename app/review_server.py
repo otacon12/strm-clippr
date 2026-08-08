@@ -211,6 +211,7 @@ POST_GENERATE_RE = re.compile(r'^/api/candidates/(\d+)/generate$')
 # D-063 captions toggle. Its own route, for the same reason as the others: a
 # typo must 404, never fall through into a verdict.
 POST_CAPTIONS_RE = re.compile(r'^/api/candidates/(\d+)/captions-toggle$')
+POST_RERENDER_RE = re.compile(r'^/api/candidates/(\d+)/rerender$')
 POST_KIT_RE = re.compile(r'^/api/candidates/(\d+)/kit$')
 POST_KIT_REGEN_RE = re.compile(r'^/api/candidates/(\d+)/kit/regenerate$')
 POST_SUBJECT_RE = re.compile(r'^/api/recordings/(\d+)/subject$')
@@ -1328,6 +1329,88 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
         self._send_json(HTTPStatus.OK, updated)
 
+    def _rerender_clip(self, candidate_id: int, body_raw: bytes) -> None:
+        """RE-RENDER an already-rendered clip, so a caption decision taken after
+        delivery can actually reach Drive.
+
+        WHY THIS EXISTS. `burn_captions` is a decision on the CANDIDATE and is
+        read at render time, so un-ticking it after delivery recorded the intent
+        and changed nothing: the delivered file keeps whatever was burned into
+        it, and neither verdict buttons nor `Regenerate` (which rebuilds the
+        post-kit COPY, never the video) re-render. The operator's decision was
+        being stored and ignored, which is worse than refusing it.
+
+        WHAT IT DOES, and what it deliberately does not. It clears the D-056
+        delivery witness and re-fires the verdict webhook, which re-runs the
+        SAME approved chain (render -> upload -> mark delivered) rather than
+        introducing a second rendering path that could drift from it. Clearing
+        the witness first is what re-opens the clip: the pending queue is
+        `state='approved' AND drive_synced_at IS NULL`.
+
+        It refuses on a candidate that is not approved -- there is nothing to
+        re-render -- and it refuses when the webhook is unconfigured rather than
+        clearing the witness and stranding the clip as undelivered with no
+        chain to deliver it.
+        """
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            cur.execute(
+                'SELECT c.state, c.recording_id, c.burn_captions, cl.id AS clip_id, '
+                '       cl.drive_sync_path '
+                'FROM clip_candidates c LEFT JOIN clips cl ON cl.candidate_id = c.id '
+                'WHERE c.id = %s',
+                (candidate_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                self._send_json(HTTPStatus.NOT_FOUND,
+                                {'error': f'no candidate {candidate_id}'})
+                return
+            if row['state'] != 'approved':
+                self._send_json(HTTPStatus.CONFLICT, {
+                    'error': f'candidate {candidate_id} is {row["state"]}, not approved. '
+                             'Only an approved clip can be re-rendered.'})
+                return
+            if row['clip_id'] is None:
+                self._send_json(HTTPStatus.CONFLICT, {
+                    'error': f'candidate {candidate_id} has no clip row yet — '
+                             'nothing has been rendered to re-render.'})
+                return
+            if not os.environ.get('CLPR_VERDICT_WEBHOOK_URL', '').strip():
+                self._send_json(HTTPStatus.CONFLICT, {
+                    'error': 'CLPR_VERDICT_WEBHOOK_URL is not set, so nothing would run the '
+                             're-render. Refusing rather than clearing the delivery witness '
+                             'and stranding the clip.'})
+                return
+
+            previous_drive_name = row['drive_sync_path']
+            cur.execute(
+                'UPDATE clips SET drive_synced_at = NULL, drive_sync_path = NULL '
+                'WHERE candidate_id = %s',
+                (candidate_id,),
+            )
+            conn.commit()
+            recording_id = row['recording_id']
+            burn = row['burn_captions']
+        finally:
+            conn.close()
+
+        hook = fire_verdict_webhook(candidate_id, recording_id, 'approved', 'approved')
+        self._send_json(HTTPStatus.OK, {
+            'candidate_id': candidate_id,
+            'rerender': 'queued',
+            'burn_captions': burn,
+            'webhook': hook,
+            # The Drive node uploads rather than replaces, so a copy left in the
+            # folder becomes a same-named duplicate. Say so plainly instead of
+            # letting the operator discover two files.
+            'previous_drive_file': previous_drive_name,
+            'note': ('The clip re-renders with the CURRENT caption setting and re-uploads. '
+                     'Delete the previous copy from Drive if it is still there — the upload '
+                     'creates a new file rather than replacing one.'),
+        })
+
     def _request_regenerate(self, candidate_id: int, body_raw: bytes) -> None:
         """Ask for a fresh machine kit. Records INTENT ONLY into
         post_kit_requests (004): it writes NOTHING to post_kits, deletes
@@ -1675,6 +1758,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             (POST_KIT_RE, self._save_kit),
             (POST_GENERATE_RE, self._set_generate),
             (POST_CAPTIONS_RE, self._set_captions),
+            (POST_RERENDER_RE, self._rerender_clip),
             (POST_SUBJECT_RE, self._set_subject),
         ):
             km = regex.match(parsed.path)
