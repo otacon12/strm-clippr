@@ -153,20 +153,33 @@ FILTER_COMPLEX_D023 = FILTER_COMPLEX_D023_BODY + '[v]'
 # therefore 1920/288 = 6.667 vertical and 1080/384 = 2.8125 horizontal. So
 # these are NOT pixels. Multiply before judging them:
 #
-#   FontSize=15   -> 15 * 6.667  = 100 px em on a 1920-tall frame (5.2% of the
-#                    frame height). Measured: a 59-character segment, the 88th
-#                    percentile of this project's 8,466 real transcript
-#                    segments, wraps to 4 short lines spanning 18%..83% of the
-#                    width.
-#   MarginV=68    -> 68 * 6.667  = 453 px of clearance under the text (23.6% of
-#                    the height). The review UI's own platform guide marks the
-#                    bottom 22% as the platform's UI, so this clears it with
-#                    room, measured at 452-472 px across real segments.
-#   MarginL/R=62  -> 62 * 2.8125 = 174 px each side (16.1%). The same UI marks
-#                    a right rail 16% wide for the platform's buttons, so the
-#                    text band stops exactly short of it and stays clear of the
-#                    left edge by the same amount. This is also what keeps the
-#                    lines SHORT: usable width is 68% of the frame.
+#   RETUNED 2026-08-08 to TV-SUBTITLE proportions. Operator, on seeing the
+#   first burn: "you thought caption taking up most of screen was good idea?
+#   make these like TV subtitles...bottom (where the bottom blur is)
+#   appropriately sized so it only take 1/2 lines max". The old values were
+#   internally consistent and still wrong: a 100 px em over a deliberately
+#   NARROWED text band forces more wrapping, and six lines of 100 px type grows
+#   UPWARD out of the blur band and over the speaker's face. Size and width
+#   were fighting each other.
+#
+#   FontSize=9    -> 9 * 6.667   = 60 px em on a 1920-tall frame (3.1% of the
+#                    height). Broadcast subtitles sit near 3%; the old 5.2% was
+#                    display-copy scale, not caption scale.
+#   MarginL/R=30  -> 30 * 2.8125 = 84 px each side (7.8%), so the usable band is
+#                    912 px = 84% of the width, UP from 68%. Widening the band
+#                    is what actually buys the line count: at ~31 px average
+#                    advance for 60 px bold sans, a line holds ~29 characters,
+#                    so the 40-char cap lands at TWO lines, never more.
+#                    The right rail is no longer avoided: captions sit BELOW the
+#                    video content in the blurred letterbox, where the
+#                    platform's action buttons do not overlap them.
+#   MarginV=68    -> 68 * 6.667  = 453 px of clearance under the text (23.6%).
+#                    UNCHANGED, and now doing its real job. For 16:9 content
+#                    fitted into 9:16 the picture ends 657 px above the bottom,
+#                    and the platform's own UI covers the bottom 422 px, so the
+#                    window for captions is 422..657 px. Two 72 px lines from a
+#                    453 px baseline occupy 453..597 px — inside that window,
+#                    in the blur, clear of both.
 #   Outline=2.5 + Shadow=1 on a black outline with white fill — a stroke, not a
 #                    box, so the frame never reads as "majority text" (which
 #                    Instagram demotes) while staying legible on any
@@ -177,10 +190,10 @@ FILTER_COMPLEX_D023 = FILTER_COMPLEX_D023_BODY + '[v]'
 #                    Never a font nobody has seen on the box.
 #   Alignment=2   -> bottom centre, stated explicitly rather than inherited.
 CAPTION_FORCE_STYLE = (
-    'FontName=Liberation Sans,Bold=1,FontSize=15,'
+    'FontName=Liberation Sans,Bold=1,FontSize=9,'
     'PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,'
-    'BorderStyle=1,Outline=2.5,Shadow=1,'
-    'Alignment=2,MarginL=62,MarginR=62,MarginV=68'
+    'BorderStyle=1,Outline=1.6,Shadow=0.8,'
+    'Alignment=2,MarginL=30,MarginR=30,MarginV=68'
 )
 
 # FILTERGRAPH ESCAPING, DETERMINED EMPIRICALLY, NOT FROM THE DOCS.
@@ -228,7 +241,7 @@ FILTER_ESCAPE_PASS1 = "\\',;[]"
 # THE CAP IS 42 CHARACTERS ~= 3 lines ~= 19% of the frame height. 2,643 of the
 # 7,252 segments (36%) are longer and get split into consecutive sub-cues at
 # word boundaries. No text is ever dropped, reordered or hyphenated.
-MAX_CAPTION_CHARS = 42
+MAX_CAPTION_CHARS = 40
 
 # ...BUT A SPLIT THAT FLASHES IS WORSE THAN A LONG LINE, so the number of
 # sub-cues is clamped by TIME as well as by length: no sub-cue is ever given
