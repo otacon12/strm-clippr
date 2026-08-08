@@ -6,10 +6,11 @@ Order of operations is sync-first: clips that are already rendered are delivered
 BEFORE any render is attempted, so an OBS gate refusal (expected while OBS is
 live, same as run_pipeline's GATE C) never blocks delivery of existing files.
 
-The delivered copy gets a DESCRIPTIVE name (operator-approved naming ruling,
-2026-08-06): <session_label>_c<candidate_id>_<category>.mp4, where category is
-looked up from llm_signal_candidates matching (recording_id, start_s), or
-'unknown' when absent. The local file in clips_out keeps its existing name.
+The delivered copy gets a DESCRIPTIVE name (D-068 naming convention,
+2026-08-07): <session_label>_<offset>_<category>_c<candidate_id>.mp4, e.g.
+2026-08-04_1910_00h14m32s_funny_c109.mp4, where category is looked up from
+llm_signal_candidates matching (recording_id, start_s), or 'unknown' when
+absent. The local file in clips_out keeps its existing name.
 
 Idempotent: a candidate whose delivered copy already exists at the destination
 with matching byte size is skipped.
