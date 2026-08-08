@@ -66,6 +66,24 @@ validation failure still fails loudly on the first try. Measured 2026-08-07:
 candidate 45 failed FOUR attempts on INVENTED_QUOTE, inventing a different
 plausible sentence each time, and ended the batch with no kit at all.
 
+THE PAYLOAD CEILING, CHECKED BEFORE SENDING (D-064). OpenRouter sits behind
+Cloudflare, whose standard maximum request body is 100 MB, and base64 inflates a
+file by 4/3. Measured 2026-08-07 against the live API: a 4.7 MB clip made a
+6.2 MB payload and worked, a 35.4 MB clip made a 47.2 MB payload and worked, and
+an 89.4 MB clip made a 119.2 MB payload that returned 502 five times out of five.
+That 502 called ITSELF retryable, so the retry policy below would have re-uploaded
+the whole video until the attempt cap, every run, forever. So the exact body size
+is computed from the file's size BEFORE the request is built, and when it would
+breach the ceiling (CLPR_POST_KIT_MAX_PAYLOAD_BYTES, default 80,000,000) a
+THROWAWAY downscaled copy is transcoded for the model alone and deleted the
+moment it is encoded. Operator ruling 2026-08-07, verbatim: "for now downscale".
+THE DELIVERED CLIP IS NEVER MODIFIED, a clip under the ceiling produces a
+byte-identical request to the one it produced before this existed, and a kit
+written from a degraded input records that fact with the real numbers
+(post_kits.analysis_downscaled and friends, migration 008). When even a
+downscaled copy cannot fit, the run fails loudly with the numbers and names the
+real fix, which is the Gemini Files API.
+
 TRANSIENT TRANSPORT FAULTS RETRY THEMSELVES. Of 27 clips in that same batch, 6
 failed and 5 of those succeeded on an IDENTICAL later retry with no code
 change: five OPENROUTER_EMPTY_CONTENTs and a 502 whose own body said
@@ -138,7 +156,10 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -203,6 +224,85 @@ WRITER_MAX_TOKENS = 1400
 DEFAULT_MAX_ATTEMPTS = 4          # 1 first try + 3 retries
 DEFAULT_RETRY_BASE_DELAY_S = 2.0  # doubled per attempt
 DEFAULT_RETRY_MAX_DELAY_S = 60.0  # also the ceiling on a provider's retry_after
+
+# ---------------------------------------------------------------------------
+# THE PAYLOAD CEILING (D-064). MEASURED, not assumed.
+#
+# OpenRouter sits behind Cloudflare, whose standard maximum request body is
+# 100 MB, and base64 inflates a file by 4/3. Measured against the live API on
+# 2026-08-07:
+#
+#     clip   raw       base64 payload   vision call
+#     c43    4.7 MB    6.2 MB           OK
+#     c45    35.4 MB   47.2 MB          OK
+#     c111   89.4 MB   119.2 MB         502, five times out of five
+#
+# THE BOUNDARY IS THEREFORE KNOWN TO SIT SOMEWHERE IN (47.2 MB, 119.2 MB]. It
+# is not known more precisely than that, and this worker does not pretend it is.
+#
+# THE ARITHMETIC FOR THE DEFAULT. Cloudflare's documented limit is 100 MB, which
+# is ambiguous between 100 * 1000 * 1000 and 100 * 1024 * 1024. The conservative
+# reading is the decimal one, 100,000,000 bytes, so that is what is assumed.
+# 80,000,000 leaves 20,000,000 bytes of headroom, i.e. 20% under the decimal
+# reading and 23.7% under the binary one. That headroom absorbs the JSON
+# envelope, the prompt, the transcript and any per-connection overhead, and it
+# still sits well ABOVE the largest payload measured working (47.2 MB), so no
+# clip that succeeds today is pushed into a downscale by this number.
+#
+# WHY IT IS ENV TUNABLE, AND THIS IS NOT DECORATION. If the true limit turns out
+# to be BELOW 80 MB, the 502 guard in openrouter_call converts what would
+# otherwise be an endless retry into one line telling the operator to lower this
+# number. A one-variable fix, with no code change and no rebuild.
+#
+# AND IT TUNES IN ONE DIRECTION ONLY: DOWN. CLPR_POST_KIT_MAX_PAYLOAD_BYTES can
+# lower the ceiling and can never raise it past
+# CLOUDFLARE_ASSUMED_MAX_BODY_BYTES, because raising it past the documented
+# limit does not move the limit, it only blinds the worker to it. That knob is
+# the first one an operator reaches for when a clip gets downscaled and he would
+# rather it did not, and without the clamp the consequences were exact and bad:
+# at 150,000,000 the c111 payload of 119,200,000 bytes reads as fitting, no
+# downscale happens, the request is sent, Cloudflare 502s it, and the 502 guard
+# STAYS SILENT because its threshold is a FRACTION OF THE CEILING and had been
+# raised along with it. That is the original D-064 failure, restored in full by
+# one environment variable. So payload_ceiling_bytes() clamps, and it says so.
+# ---------------------------------------------------------------------------
+CLOUDFLARE_ASSUMED_MAX_BODY_BYTES = 100_000_000
+DEFAULT_PAYLOAD_CEILING_BYTES = 80_000_000
+
+# A 502 on a request whose payload sits this close to the ceiling is treated as
+# a SIZE rejection and is never retried. See openrouter_call.
+SIZE_GUARD_FRACTION = 0.8
+
+# THE ANALYSIS COPY. Only ever built when a clip would otherwise breach the
+# ceiling, and deleted the moment it has been encoded.
+#
+#   - 1280 on the LONG side. Gemini tokenises video frames at a fixed low
+#     resolution regardless of what is uploaded, so 1280 is already more pixels
+#     than the model consumes, and the scale expression is written so it can
+#     never UPSCALE a clip that is already smaller.
+#   - 15 fps cap. This worker asks the provider to sample at DEFAULT_FPS = 1.0,
+#     so a 15 fps transport copy still carries fifteen times the frames the
+#     analysis will look at. If the fps passthrough is dropped, Gemini's own
+#     default sampling is 1 fps, so the cap is safe in both worlds.
+#   - Audio KEPT, mono at 64 kbit/s. Gemini listens as well as watches, and one
+#     minute of it costs about 0.5 MB, which is nothing against the budget.
+#   - The bitrate target is a PREDICTION, never a guarantee, so the real output
+#     size is measured and the encode is repeated at a corrected bitrate rather
+#     than sending something over the limit and hoping.
+ANALYSIS_TARGET_FRACTION = 0.9    # aim at 90% of the ceiling, not at its edge
+ANALYSIS_MAX_DIMENSION = 1280
+ANALYSIS_MAX_FPS = 15
+ANALYSIS_AUDIO_BITRATE_BPS = 64_000
+ANALYSIS_CONTAINER_OVERHEAD_FACTOR = 0.97  # mp4 muxing overhead, measured small
+ANALYSIS_MAX_TRANSCODE_ATTEMPTS = 3
+
+# Below this the picture stops carrying information a vision model can read, so
+# a "successful" downscale to it would be a lie dressed as a saving. Under it,
+# the run fails loudly and names the real fix instead.
+ANALYSIS_MIN_VIDEO_BITRATE_BPS = 150_000
+
+FFPROBE_TIMEOUT_S = 120
+FFMPEG_TIMEOUT_S = 1800
 
 # Research limits, enforced here AND in the 003 CHECK constraints. TikTok's own
 # creative guidance is 5-10 words per second of reading, so a hook read in the
@@ -312,6 +412,19 @@ class OpenRouterUnreachable(OpenRouterError):
 
 class OpenRouterEmptyContent(OpenRouterError):
     """A 200 whose completion carried no text. MEASURED transient on this project."""
+
+
+class PayloadTooLargeError(OpenRouterError):
+    """The request body is too big for the endpoint. NEVER retryable.
+
+    Its own type because the failure it names arrives WEARING A DISGUISE.
+    Measured 2026-08-07: a 119.2 MB payload came back as `502
+    origin_bad_gateway` whose own body said `"retryable": true,
+    "retry_after": 60`, five times out of five. Cloudflare is describing its
+    ORIGIN there, not the request, and the request is a permanent deterministic
+    size rejection. Believing the body would re-upload 89 MB of video until the
+    attempt cap, every run, forever.
+    """
 
 
 class InventedQuoteError(RuntimeError):
@@ -528,7 +641,8 @@ def retry_delay_s(attempt: int, policy: dict, retry_after: float | None) -> floa
 
 
 def openrouter_call(which: str, method: str, url: str, api_key: str, payload: dict | None,
-                    timeout: int, expect_message: bool) -> tuple[dict, str | None]:
+                    timeout: int, expect_message: bool,
+                    size_guard: dict | None = None) -> tuple[dict, str | None]:
     """One OpenRouter call, retried on transient faults only.
 
     EVERY retry is logged with its attempt number and its reason, so a run that
@@ -541,6 +655,20 @@ def openrouter_call(which: str, method: str, url: str, api_key: str, payload: di
     A retry re-sends the payload it was given and nothing else. The vision
     payload is the only one that carries video, and the writer payload is text
     only, so a writer retry can never re-upload a clip.
+
+    `size_guard`, when supplied, is {'predicted_bytes': int, 'ceiling_bytes':
+    int} for THIS request. It exists because A 5xx FROM THIS ENDPOINT CANNOT BE
+    TRUSTED TO MEAN "TRANSIENT". Cloudflare fronts openrouter.ai and rejects an
+    oversized body at its edge with `502 origin_bad_gateway`, whose payload
+    self-describes as `"retryable": true, "retry_after": 60`. That flag is about
+    Cloudflare's origin, not about the request, and the request is a permanent
+    deterministic size failure: it was measured failing five times out of five,
+    unchanged. Retrying it re-uploads the whole video for nothing. So a 502 on a
+    request already near the ceiling is reported AS a size rejection and is not
+    retried. The pre-send gate in _generate should make this unreachable, which
+    is exactly why it is here: it is the check that fires if the real limit
+    turns out to sit lower than the ceiling this worker assumed. A 413 needs no
+    guard, because classify_failure already refuses to retry any non-429 4xx.
     """
     policy = retry_policy()
     attempts = policy['max_attempts']
@@ -550,6 +678,32 @@ def openrouter_call(which: str, method: str, url: str, api_key: str, payload: di
             text = message_text(response, which) if expect_message else None
         except Exception as exc:  # noqa: BLE001 - classified immediately below
             retryable, reason = classify_failure(exc)
+            if (retryable and size_guard and isinstance(exc, OpenRouterHTTPError)
+                    and exc.status == 502
+                    and size_guard['predicted_bytes']
+                    >= SIZE_GUARD_FRACTION * size_guard['ceiling_bytes']):
+                raise PayloadTooLargeError(
+                    f'OPENROUTER_PAYLOAD_TOO_LARGE: call={which} got status 502 on a request '
+                    f'whose body is {size_guard["predicted_bytes"]} bytes, which is at least '
+                    f'{SIZE_GUARD_FRACTION:.0%} of the configured ceiling of '
+                    f'{size_guard["ceiling_bytes"]} bytes. At this size a 502 is treated as a '
+                    'SIZE rejection at the Cloudflare edge and is NOT retried, because retrying '
+                    'a size rejection re-uploads the entire video and fails identically '
+                    '(measured five times out of five on 2026-08-07) even though its own body '
+                    'says "retryable": true. '
+                    'SAY THE HONEST PART: THIS CALL CANNOT TELL THE TWO APART FROM ONE 502. A '
+                    'genuine transient outage returns the same status, and one was measured in '
+                    'the 27-clip batch that recovered on an unchanged retry, so this run may '
+                    'have been refused a retry it would have survived. THE TEST THAT SEPARATES '
+                    'THEM IS A RE-RUN, and it is cheap: a size rejection is deterministic and '
+                    'fails the same way every time, while an outage clears. RE-RUN THIS CLIP '
+                    'FIRST. If it succeeds, this was an outage and nothing needs changing. If it '
+                    'fails at the same size again, it is the limit, and THEN the fix is to lower '
+                    'CLPR_POST_KIT_MAX_PAYLOAD_BYTES so the analysis copy is downscaled further, '
+                    'or to move this call to the Gemini Files API, which has no such body limit. '
+                    'Do not lower the ceiling on a single 502: that degrades every later clip to '
+                    'fix something that may not be broken. Zero rows written.'
+                ) from exc
             if not retryable:
                 if attempt > 1:
                     print(f'OPENROUTER_RETRY_ABANDONED call={which} attempt={attempt}/{attempts} '
@@ -1108,7 +1262,8 @@ def fetch_active_kit_full(cur, candidate_id: int) -> dict | None:
     cur.execute(
         'SELECT id, version, origin, hook_withheld, hook_domain, hook_payoff, '
         'video_caption, hashtags, quoted_line, srt_text, srt_segment_count, '
-        'srt_basis, created_at, quote_fallback, quote_fallback_reason '
+        'srt_basis, created_at, quote_fallback, quote_fallback_reason, '
+        'analysis_downscaled, analysis_source_bytes, analysis_sent_bytes '
         'FROM post_kits WHERE candidate_id = %s AND is_active = 1',
         (candidate_id,),
     )
@@ -1133,6 +1288,12 @@ def fetch_active_kit_full(cur, candidate_id: int) -> dict | None:
         # quote as the one written on the day the kit was generated.
         'quote_fallback': int(row[13] or 0),
         'quote_fallback_reason': row[14],
+        # 008. Carried for the same reason: a RE-DELIVERED .txt must say the
+        # same thing about its analysis input as the one written on the day the
+        # kit was generated.
+        'analysis_downscaled': int(row[15] or 0),
+        'analysis_source_bytes': row[16],
+        'analysis_sent_bytes': row[17],
     }
 
 
@@ -1447,6 +1608,29 @@ def render_kit_text(kit: dict, candidate_id: int, version: int, origin: str,
                 'transcript of this clip. That draft was rejected in full and the copy was '
                 'rewritten with no quoted line. Nothing invented reached this file.'
             )
+    if int(kit.get('analysis_downscaled') or 0) == 1:
+        # SAY WHAT WAS DEGRADED AND WHAT WAS NOT, IN THAT ORDER. This file sorts
+        # beside the delivered mp4 on his phone, so a bare word like
+        # "downscaled" reads as "your video is worse now", which is false and is
+        # the opposite of what happened. The clip he posts is untouched.
+        src = kit.get('analysis_source_bytes')
+        sent = kit.get('analysis_sent_bytes')
+        lines.append('')
+        lines.append('NOTE ON THE ANALYSIS COPY')
+        lines.append(
+            '  YOUR CLIP IS UNTOUCHED. The file beside this one is the full quality render, '
+            'exactly as it was delivered, and nothing has been re-encoded for posting.'
+        )
+        sizes = ''
+        if src and sent:
+            sizes = f' ({_mb(float(src))} down to {_mb(float(sent))} for the model only)'
+        lines.append(
+            '  What changed is only the throwaway copy that was sent to the vision model'
+            f'{sizes}: the full size clip is larger than the upload limit on the analysis '
+            'endpoint, so a smaller copy was made for it and deleted straight afterwards. The '
+            'model therefore saw fewer pixels than you will, which is worth knowing if a hook '
+            'above misreads something small on screen.'
+        )
     lines.append('')
     return '\n'.join(lines) + '\n'
 
@@ -1502,6 +1686,18 @@ def result_file_fields(files: dict) -> str:
 # The run
 # ---------------------------------------------------------------------------
 
+def clip_data_url_prefix(path: Path) -> str:
+    """The `data:<mime>;base64,` head of the data URL, WITHOUT the payload.
+
+    ONE TRUTH with encode_clip, which calls this to build the real URL. The
+    pre-send size prediction needs this string's LENGTH before a single byte of
+    the file has been read, and a second copy of the mime rule would drift.
+    """
+    suffix = path.suffix.lower().lstrip('.') or 'mp4'
+    mime = 'video/mp4' if suffix in ('mp4', 'm4v') else f'video/{suffix}'
+    return f'data:{mime};base64,'
+
+
 def encode_clip(path: Path) -> tuple[str, int, int]:
     """base64 data URL for the clip. The bytes are NEVER logged, only sized.
 
@@ -1514,9 +1710,275 @@ def encode_clip(path: Path) -> tuple[str, int, int]:
     """
     raw = path.read_bytes()
     b64 = base64.b64encode(raw).decode('ascii')
-    suffix = path.suffix.lower().lstrip('.') or 'mp4'
-    mime = 'video/mp4' if suffix in ('mp4', 'm4v') else f'video/{suffix}'
-    return f'data:{mime};base64,{b64}', len(raw), len(b64)
+    return f'{clip_data_url_prefix(path)}{b64}', len(raw), len(b64)
+
+
+# ---------------------------------------------------------------------------
+# THE PAYLOAD CEILING: check BEFORE sending, never discover by 502 (D-064)
+# ---------------------------------------------------------------------------
+
+def payload_ceiling_bytes() -> int:
+    """The maximum serialised request body this worker will send, in bytes.
+
+    CLAMPED TO CLOUDFLARE_ASSUMED_MAX_BODY_BYTES, and the clamp is the point.
+    The env var exists to LOWER this number when the true edge limit turns out
+    to sit under the default. Raising it above the documented limit cannot make
+    a bigger body acceptable to Cloudflare, it can only stop this worker seeing
+    that the body is too big, and it disarms the 502 guard at the same time
+    because that guard's threshold is a fraction of THIS number. So the
+    documented limit is a hard stop that no environment can lift, and an attempt
+    to lift it is reported rather than silently honoured.
+    """
+    requested = max(1, int(_env_number('CLPR_POST_KIT_MAX_PAYLOAD_BYTES',
+                                       DEFAULT_PAYLOAD_CEILING_BYTES)))
+    ceiling = min(requested, CLOUDFLARE_ASSUMED_MAX_BODY_BYTES)
+    if ceiling != requested:
+        print(
+            f'PAYLOAD_CEILING_CLAMPED requested_bytes={requested} using_bytes={ceiling} '
+            f'({_mb(ceiling)}) CLPR_POST_KIT_MAX_PAYLOAD_BYTES asked for a ceiling above the '
+            f'documented Cloudflare request body limit of {CLOUDFLARE_ASSUMED_MAX_BODY_BYTES} '
+            'bytes. That variable can only LOWER the ceiling. Raising it would not make a '
+            'larger body acceptable at the edge, it would only hide the overflow from this '
+            'worker and disarm the 502 size guard, which is exactly the D-064 failure.'
+        )
+    return ceiling
+
+
+def b64_length(raw_bytes: int) -> int:
+    """The EXACT base64 length of `raw_bytes` bytes: four characters per group
+    of three, the last group padded. Not an estimate and not a ratio."""
+    return 4 * ((raw_bytes + 2) // 3)
+
+
+def body_bytes(body: dict) -> int:
+    """The exact serialised size of a request body, in bytes.
+
+    len() of the string IS the byte count here, and that is a property of
+    json.dumps rather than an assumption: its default ensure_ascii=True escapes
+    every non-ASCII character, so the output is pure ASCII and one character is
+    one byte. Called with the SAME default settings _http_json uses (a bare
+    json.dumps), because a prediction measured with different separators or
+    sort_keys would silently stop describing the body that actually goes out.
+    """
+    return len(json.dumps(body))
+
+
+def predicted_payload_bytes(envelope: int, prefix_len: int, raw_bytes: int) -> int:
+    """The exact size of the request body that `raw_bytes` of video will make.
+
+    EXACT, not approximate, and the verification proves it to the byte: the
+    base64 alphabet (A-Za-z0-9+/=) and the data URL prefix contain no character
+    json.dumps escapes, and json.dumps does not escape the forward slash, so the
+    URL contributes exactly its own length to the body.
+    """
+    return envelope + prefix_len + b64_length(raw_bytes)
+
+
+def _mb(n: float) -> str:
+    return f'{n / 1_000_000:.1f} MB'
+
+
+def ffprobe_video(path: Path) -> dict:
+    """duration, fps, width and height of a real file, from ffprobe.
+
+    The file's OWN measurements, never the geometry witness or a stored figure:
+    the bitrate arithmetic below turns on the duration of the exact bytes being
+    transcoded. A probe failure raises rather than falling back to a guess.
+    """
+    args = [
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height,r_frame_rate',
+        '-show_entries', 'format=duration',
+        '-of', 'json', str(path),
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f'ANALYSIS_PROBE_FAILED: could not run ffprobe on {path}: {exc!r}') from exc
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f'ANALYSIS_PROBE_FAILED: ffprobe exited {proc.returncode} on {path}. '
+            f'stderr verbatim: {proc.stderr.strip()[:600]!r}'
+        )
+    try:
+        parsed = json.loads(proc.stdout)
+        stream = (parsed.get('streams') or [{}])[0]
+        duration = float(parsed['format']['duration'])
+        width = int(stream['width'])
+        height = int(stream['height'])
+        num, _, den = str(stream.get('r_frame_rate') or '0/1').partition('/')
+        fps = (float(num) / float(den)) if float(den or 0) else 0.0
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        raise RuntimeError(
+            f'ANALYSIS_PROBE_FAILED: ffprobe output on {path} was not usable ({exc!r}). '
+            f'stdout verbatim: {proc.stdout.strip()[:600]!r}'
+        ) from exc
+    if duration <= 0:
+        raise RuntimeError(
+            f'ANALYSIS_PROBE_FAILED: ffprobe reported duration {duration} for {path}, '
+            'so no bitrate can be computed from it.'
+        )
+    return {'duration_s': duration, 'fps': fps, 'width': width, 'height': height}
+
+
+def transcode_for_analysis(src: Path, dest: Path, envelope: int, ceiling: int) -> dict:
+    """Build a THROWAWAY analysis copy of `src` that fits the ceiling.
+
+    THE SOURCE IS NEVER TOUCHED. ffmpeg reads it and writes somewhere else, and
+    the delivered clip, the Drive copy and everything the operator sees are the
+    same bytes they were before this function ran.
+
+    A BITRATE TARGET IS A PREDICTION, NOT A GUARANTEE. x264's average bitrate
+    mode lands near the target, not on it, so the ACTUAL output size is measured
+    against the budget after every attempt and the bitrate is corrected from the
+    real overshoot rather than from hope. If it still will not fit after
+    ANALYSIS_MAX_TRANSCODE_ATTEMPTS, or if the arithmetic demands a bitrate below
+    ANALYSIS_MIN_VIDEO_BITRATE_BPS, this raises: sending an over-limit body, or
+    sending a smear the model cannot read, are both worse than a loud failure
+    that names the real fix.
+
+    Returns the detail dict recorded on the kit row.
+    """
+    prefix_len = len(clip_data_url_prefix(dest))
+    target_payload = int(ceiling * ANALYSIS_TARGET_FRACTION)
+    # The largest FILE that can ride inside the target payload, inverting
+    # predicted_payload_bytes: (payload - envelope - prefix) * 3/4.
+    budget_bytes = ((target_payload - envelope - prefix_len) * 3) // 4
+    source_bytes = src.stat().st_size
+
+    if budget_bytes <= 0:
+        raise RuntimeError(
+            f'ANALYSIS_UNSAVEABLE: the request envelope alone (prompt plus transcript, '
+            f'{envelope} bytes) leaves no room for any video under the ceiling of '
+            f'{ceiling} bytes. No downscale can fix this. THE REAL FIX: send the clip through '
+            'the Gemini Files API, which uploads the file separately and has no request body '
+            'limit, instead of inlining it as a base64 data URL. Zero rows written.'
+        )
+
+    probe = ffprobe_video(src)
+    duration_s = probe['duration_s']
+    audio_bps = ANALYSIS_AUDIO_BITRATE_BPS
+    total_bps = (budget_bytes * 8.0 / duration_s) * ANALYSIS_CONTAINER_OVERHEAD_FACTOR
+    video_bps = int(total_bps - audio_bps)
+
+    if video_bps < ANALYSIS_MIN_VIDEO_BITRATE_BPS:
+        raise RuntimeError(
+            f'ANALYSIS_UNSAVEABLE: fitting this clip under the ceiling would need a video '
+            f'bitrate of {video_bps} bit/s, below the {ANALYSIS_MIN_VIDEO_BITRATE_BPS} bit/s '
+            'floor, so the downscaled copy would be a smear the vision model cannot read and '
+            'any description of it would be invented. The numbers: source '
+            f'{source_bytes} bytes ({_mb(source_bytes)}), duration {duration_s:.1f}s, ceiling '
+            f'{ceiling} bytes ({_mb(ceiling)}), video budget {budget_bytes} bytes '
+            f'({_mb(budget_bytes)}) after a {envelope} byte envelope. THE REAL FIX: send this '
+            'clip through the Gemini Files API, which uploads the file separately and has no '
+            'request body limit, instead of inlining it as a base64 data URL. A shorter clip '
+            'would also fit. Zero rows written. NOTHING about the delivered clip has changed.'
+        )
+
+    attempts: list[dict] = []
+    for attempt in range(1, ANALYSIS_MAX_TRANSCODE_ATTEMPTS + 1):
+        vf = (
+            f"scale='min({ANALYSIS_MAX_DIMENSION},iw)':'min({ANALYSIS_MAX_DIMENSION},ih)'"
+            ':force_original_aspect_ratio=decrease:force_divisible_by=2'
+        )
+        args = [
+            'ffmpeg', '-hide_banner', '-nostdin', '-y',
+            '-i', str(src),
+            '-vf', vf,
+        ]
+        # Only cap the frame rate when the source is actually faster. Naming -r
+        # unconditionally would RESAMPLE a slower clip upwards, inventing frames
+        # for no benefit and spending budget on them.
+        if probe['fps'] > ANALYSIS_MAX_FPS:
+            args += ['-r', str(ANALYSIS_MAX_FPS)]
+        args += [
+            '-c:v', 'libx264', '-preset', 'veryfast',
+            '-b:v', str(video_bps),
+            '-maxrate', str(int(video_bps * 1.5)),
+            '-bufsize', str(int(video_bps * 3)),
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-ac', '1', '-b:a', str(audio_bps),
+            '-movflags', '+faststart',
+            str(dest),
+        ]
+        print(
+            f'ANALYSIS_TRANSCODE attempt={attempt}/{ANALYSIS_MAX_TRANSCODE_ATTEMPTS} '
+            f'video_bps={video_bps} audio_bps={audio_bps} budget_bytes={budget_bytes} '
+            f'scale_max={ANALYSIS_MAX_DIMENSION} fps_cap='
+            f'{ANALYSIS_MAX_FPS if probe["fps"] > ANALYSIS_MAX_FPS else "source"}'
+        )
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                f'ANALYSIS_TRANSCODE_FAILED: could not run ffmpeg on {src}: {exc!r}') from exc
+        if proc.returncode != 0:
+            tail = '\n'.join((proc.stderr or '').strip().splitlines()[-12:])
+            raise RuntimeError(
+                f'ANALYSIS_TRANSCODE_FAILED: ffmpeg exited {proc.returncode}. Last lines of '
+                f'stderr, verbatim: {tail!r}'
+            )
+        if not dest.is_file():
+            raise RuntimeError(
+                f'ANALYSIS_TRANSCODE_FAILED: ffmpeg exited 0 but wrote no file at {dest}.')
+
+        actual = dest.stat().st_size
+        predicted = predicted_payload_bytes(envelope, prefix_len, actual)
+        attempts.append({'attempt': attempt, 'video_bps': video_bps,
+                         'output_bytes': actual, 'predicted_payload_bytes': predicted})
+        print(
+            f'ANALYSIS_TRANSCODE_RESULT attempt={attempt} output_bytes={actual} '
+            f'budget_bytes={budget_bytes} predicted_payload_bytes={predicted} '
+            f'ceiling_bytes={ceiling} fits={1 if actual <= budget_bytes else 0}'
+        )
+        if actual <= budget_bytes:
+            out_probe = ffprobe_video(dest)
+            return {
+                'source_bytes': source_bytes,
+                'sent_bytes': actual,
+                'ceiling_bytes': ceiling,
+                'target_payload_bytes': target_payload,
+                'video_budget_bytes': budget_bytes,
+                'envelope_bytes': envelope,
+                'predicted_payload_bytes': predicted,
+                'duration_s': round(duration_s, 3),
+                'source_resolution': f'{probe["width"]}x{probe["height"]}',
+                'analysis_resolution': f'{out_probe["width"]}x{out_probe["height"]}',
+                'source_fps': round(probe['fps'], 3),
+                'analysis_fps': round(out_probe['fps'], 3),
+                'video_bitrate_bps': video_bps,
+                'audio_bitrate_bps': audio_bps,
+                'audio_kept': True,
+                'attempts': attempts,
+                'codec': 'libx264 + aac, mp4',
+            }
+
+        # Correct from the MEASURED overshoot, with 10% taken off so the next
+        # attempt aims inside the budget rather than at its edge.
+        corrected = int(video_bps * (budget_bytes / actual) * 0.9)
+        if corrected < ANALYSIS_MIN_VIDEO_BITRATE_BPS:
+            raise RuntimeError(
+                f'ANALYSIS_UNSAVEABLE: attempt {attempt} produced {actual} bytes '
+                f'({_mb(actual)}) against a budget of {budget_bytes} bytes '
+                f'({_mb(budget_bytes)}), and the corrected bitrate {corrected} bit/s is below '
+                f'the {ANALYSIS_MIN_VIDEO_BITRATE_BPS} bit/s floor. Source {source_bytes} bytes '
+                f'({_mb(source_bytes)}), duration {duration_s:.1f}s, ceiling {ceiling} bytes. '
+                'THE REAL FIX: send this clip through the Gemini Files API, which uploads the '
+                'file separately and has no request body limit. Zero rows written. NOTHING '
+                'about the delivered clip has changed.'
+            )
+        video_bps = corrected
+
+    last = attempts[-1] if attempts else {}
+    raise RuntimeError(
+        f'ANALYSIS_UNSAVEABLE: {ANALYSIS_MAX_TRANSCODE_ATTEMPTS} transcode attempts all '
+        f'overshot the budget of {budget_bytes} bytes ({_mb(budget_bytes)}). Attempts, '
+        f'verbatim: {attempts!r}. The last output was {last.get("output_bytes")} bytes. '
+        'Refusing to send an over-limit request. THE REAL FIX: send this clip through the '
+        'Gemini Files API, which uploads the file separately and has no request body limit. '
+        'Zero rows written. NOTHING about the delivered clip has changed.'
+    )
 
 
 def generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str | None,
@@ -1750,22 +2212,132 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     )
     profile_text = profile_block(profile)
 
-    data_url, raw_bytes, b64_chars = encode_clip(clip_path)
-    print(f'CLIP_ENCODED candidate={candidate_id} bytes={raw_bytes} base64_chars={b64_chars}')
+    def make_vision_body(data_url: str) -> dict:
+        """The vision request, from a data URL. The body a clip UNDER the
+        ceiling produces here is byte-identical to the one this worker sent
+        before the ceiling existed: same keys, same order, same values.
 
-    vision_body: dict = {
-        'model': vision_model,
-        'messages': [{
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': build_vision_prompt(
-                    subject, profile_text, product['transcript_lines'], duration_s)},
-                {'type': 'video_url', 'video_url': {'url': data_url}},
-            ],
-        }],
-    }
-    if passthrough['options']:
-        vision_body['provider'] = {'options': passthrough['options']}
+        It is a function so the size gate can serialise it with an EMPTY url and
+        measure the envelope exactly, without a second copy of the construction
+        that would drift from the one that actually goes out.
+        """
+        body: dict = {
+            'model': vision_model,
+            'messages': [{
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': build_vision_prompt(
+                        subject, profile_text, product['transcript_lines'], duration_s)},
+                    {'type': 'video_url', 'video_url': {'url': data_url}},
+                ],
+            }],
+        }
+        if passthrough['options']:
+            body['provider'] = {'options': passthrough['options']}
+        return body
+
+    # ---- THE PAYLOAD CEILING (D-064). CHECKED BEFORE SENDING, NEVER
+    # ---- DISCOVERED BY A 502.
+    #
+    # The clip is only STAT'd here, never read: a 90 MB file that cannot be sent
+    # must not first be loaded into memory and base64 encoded to find that out.
+    # The prediction is exact (see predicted_payload_bytes), so this decides on
+    # the same number the request would actually weigh.
+    ceiling = payload_ceiling_bytes()
+    envelope = body_bytes(make_vision_body(''))
+    source_bytes = clip_path.stat().st_size
+    source_payload = predicted_payload_bytes(
+        envelope, len(clip_data_url_prefix(clip_path)), source_bytes)
+    fits = source_payload <= ceiling
+    print(
+        f'CLIP_PAYLOAD_PLAN candidate={candidate_id} clip_bytes={source_bytes} '
+        f'envelope_bytes={envelope} predicted_payload_bytes={source_payload} '
+        f'ceiling_bytes={ceiling} fits={1 if fits else 0}'
+    )
+
+    downscale: dict | None = None
+    analysis_dir: str | None = None
+    try:
+        if fits:
+            # NOTHING CHANGES. No transcode, no temp file, no degradation, and a
+            # request body identical to the one this clip took yesterday.
+            analysis_path = clip_path
+        else:
+            print(
+                f'ANALYSIS_DOWNSCALE_REQUIRED candidate={candidate_id} the delivered clip is '
+                f'{_mb(source_bytes)} which would make a {_mb(source_payload)} request body, '
+                f'over the {_mb(ceiling)} ceiling. OpenRouter sits behind Cloudflare, whose '
+                'maximum request body is 100 MB, and an over-limit request comes back as a 502 '
+                'that falsely calls itself retryable. A THROWAWAY downscaled copy is being '
+                'transcoded for the vision model only. THE DELIVERED CLIP IS NOT TOUCHED and '
+                'does not change in any way.'
+            )
+            analysis_dir = tempfile.mkdtemp(prefix=f'clpr_post_kit_analysis_{candidate_id}_')
+            analysis_path = Path(analysis_dir) / 'analysis.mp4'
+            downscale = transcode_for_analysis(clip_path, analysis_path, envelope, ceiling)
+
+        data_url, raw_bytes, b64_chars = encode_clip(analysis_path)
+    finally:
+        # THE TEMP COPY DIES HERE, on success and on failure alike, and it dies
+        # as soon as it has been encoded rather than after the vision call: the
+        # retry loop re-sends the payload from MEMORY, so the file is dead
+        # weight the moment data_url exists.
+        if analysis_dir:
+            shutil.rmtree(analysis_dir, ignore_errors=True)
+            # ignore_errors=True keeps a temp-hygiene problem from aborting a
+            # run that has already paid for its transcode, but a swallowed error
+            # that leaves a video copy on disk must not read as a clean removal.
+            # So the removal is CHECKED rather than assumed, and a survivor gets
+            # its own distinct, greppable line instead of a quiet exists=True.
+            if Path(analysis_dir).exists():
+                print(
+                    f'ANALYSIS_TEMP_LEAKED path={analysis_dir} the throwaway analysis copy could '
+                    'NOT be deleted and is still on disk. The run continues, because the copy is '
+                    'already encoded and deleting it is not what this run is for, but this '
+                    'directory holds a video file and needs removing by hand. Nothing about the '
+                    'delivered clip is affected.'
+                )
+            else:
+                print(f'ANALYSIS_TEMP_REMOVED {analysis_dir} exists=False')
+
+    print(f'CLIP_ENCODED candidate={candidate_id} bytes={raw_bytes} base64_chars={b64_chars}')
+    if downscale is not None:
+        print(
+            f'ANALYSIS_DOWNSCALED candidate={candidate_id} '
+            f'source_bytes={downscale["source_bytes"]} sent_bytes={downscale["sent_bytes"]} '
+            f'source_payload_bytes={source_payload} '
+            f'sent_payload_bytes={downscale["predicted_payload_bytes"]} '
+            f'ceiling_bytes={ceiling} '
+            f'resolution={downscale["source_resolution"]}->{downscale["analysis_resolution"]} '
+            f'fps={downscale["source_fps"]}->{downscale["analysis_fps"]} '
+            f'attempts={len(downscale["attempts"])} '
+            'THE DELIVERED CLIP IS UNCHANGED, only the analysis copy was degraded.'
+        )
+
+    vision_body: dict = make_vision_body(data_url)
+
+    # THE ACTUAL BODY, MEASURED, NOT THE PREDICTED ONE. A bitrate target is a
+    # prediction and so is an arithmetic model, so the thing that is finally
+    # about to be sent is weighed and refused if it is over. This is also what
+    # proves the prediction: sent_payload_bytes and predicted_payload_bytes are
+    # printed side by side on every run and must be equal.
+    actual_payload = body_bytes(vision_body)
+    if actual_payload > ceiling:
+        raise RuntimeError(
+            f'PAYLOAD_OVER_CEILING: the assembled vision request is {actual_payload} bytes '
+            f'({_mb(actual_payload)}), over the ceiling of {ceiling} bytes ({_mb(ceiling)}). '
+            'Refusing to send it: on this endpoint an over-limit body returns a 502 that '
+            'falsely declares itself retryable, so sending it would burn a full video upload '
+            'per attempt and fail identically every time. THE REAL FIX: send the clip through '
+            'the Gemini Files API, which uploads separately and has no request body limit. '
+            'Zero rows written.'
+        )
+    print(
+        f'PAYLOAD_OK candidate={candidate_id} predicted_payload_bytes='
+        f'{predicted_payload_bytes(envelope, len(clip_data_url_prefix(analysis_path)), raw_bytes)} '
+        f'actual_payload_bytes={actual_payload} ceiling_bytes={ceiling} '
+        f'headroom_bytes={ceiling - actual_payload}'
+    )
 
     chat_url = f'{OPENROUTER_BASE}/chat/completions'
 
@@ -1787,7 +2359,11 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     # writer payload is text only, so the no-quote fallback below cannot
     # re-upload the clip no matter how many times it retries.
     vision_response, scene = openrouter_call(
-        'vision', 'POST', chat_url, api_key, vision_body, VISION_TIMEOUT_S, expect_message=True)
+        'vision', 'POST', chat_url, api_key, vision_body, VISION_TIMEOUT_S, expect_message=True,
+        # The ONLY call that carries video, so the ONLY one that can be rejected
+        # for size. The writer and the endpoints probe pass no guard and behave
+        # exactly as they did before this existed.
+        size_guard={'predicted_bytes': actual_payload, 'ceiling_bytes': ceiling})
     if len(scene) < MIN_SCENE_DESCRIPTION_CHARS:
         raise RuntimeError(
             f'VISION_RESPONSE_TOO_SHORT: the vision model returned {len(scene)} characters, '
@@ -1947,6 +2523,8 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 vision_generation_id, writer_generation_id,
                 vision_params, writer_params, passthrough_degraded,
                 quote_fallback, quote_fallback_reason,
+                analysis_downscaled, analysis_source_bytes, analysis_sent_bytes,
+                analysis_downscale_detail,
                 created_by_run, created_at
             ) VALUES (
                 %s, %s, 'generated', 1,
@@ -1960,6 +2538,8 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 %s, %s,
                 %s, %s, %s,
                 %s, %s,
+                %s, %s, %s,
+                %s,
                 %s, %s
             ) RETURNING id
             ''',
@@ -1977,6 +2557,14 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 vision_generation_id, writer_generation_id,
                 vision_params, writer_params, 1 if passthrough['degraded'] else 0,
                 quote_fallback, quote_fallback_reason,
+                # 008. A kit written from a degraded analysis input must never
+                # be indistinguishable from one written at full quality, so the
+                # real numbers travel with the row rather than only through a
+                # log line the operator may never scroll back to.
+                1 if downscale is not None else 0,
+                source_bytes,
+                raw_bytes,
+                json.dumps(downscale, sort_keys=True) if downscale is not None else None,
                 run_id, utc_now_iso(),
             ),
         )
@@ -2012,6 +2600,9 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
             'srt_text': product['srt_text'],
             'srt_segment_count': product['cue_count'],
             'quote_fallback': quote_fallback,
+            'analysis_downscaled': 1 if downscale is not None else 0,
+            'analysis_source_bytes': source_bytes,
+            'analysis_sent_bytes': raw_bytes,
         },
         candidate_id, version, 'generated',
         {'file_path': info['clip_file_path'], 'drive_sync_path': info['drive_sync_path']},
@@ -2023,7 +2614,8 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         f'srt_cues={product["cue_count"]} srt_basis={geom["basis"]} '
         f'hashtags={len(kit["hashtags"])} subject={subject_kind} '
         f'passthrough_degraded={1 if passthrough["degraded"] else 0} '
-        f'quote_fallback={quote_fallback}'
+        f'quote_fallback={quote_fallback} '
+        f'analysis_downscaled={1 if downscale is not None else 0}'
         f'{result_file_fields(files)}'
     )
     return 0
