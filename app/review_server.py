@@ -70,6 +70,63 @@ def local_vod_dirs() -> list[Path]:
     return [Path(d) for d in dirs if d]
 
 
+LOCAL_CLIP_DIRS_DEFAULT = (
+    '/Users/fifgen/Library/CloudStorage/GoogleDrive-seun@gmgt.co/My Drive/projects/stream/appr_clips',
+    '/Users/fifgen/Library/CloudStorage/GoogleDrive-seun@gmgt.co/My Drive/projects/stream/used_clips',
+    str(Path(__file__).resolve().parent / 'clips_out'),
+)
+
+
+def local_clip_dirs() -> list[Path]:
+    """Directories searched for a RENDERED clip. Override with
+    CLPR_LOCAL_CLIP_DIRS (colon-separated)."""
+    raw = os.environ.get('CLPR_LOCAL_CLIP_DIRS', '').strip()
+    dirs = raw.split(':') if raw else list(LOCAL_CLIP_DIRS_DEFAULT)
+    return [Path(d) for d in dirs if d]
+
+
+def find_by_name(name: str, dirs: list[Path]) -> Path | None:
+    """Exact-filename lookup across dirs. Used for rendered clips, whose names
+    are already unique and fully-formed (D-068) -- unlike source VODs, where the
+    extension differs per lane and only the stem is stable."""
+    for d in dirs:
+        cand = d / name
+        if cand.is_file():
+            return cand
+    return None
+
+
+def resolve_local_clip(file_path: str | None, drive_sync_path: str | None) -> Path | None:
+    """A locally-readable RENDERED clip, or None.
+
+    THE SAME TWO-VOCABULARIES PROBLEM AS resolve_local_vod, one layer down.
+    `clips.file_path` is written by whichever machine rendered, so an
+    n8n-rendered clip points at the SERVER filesystem and is unreachable here.
+    `drive_sync_path` is a full local Drive path from the Mac deliverer but a
+    BARE FILENAME from the n8n lane -- and a bare name was previously skipped
+    outright, which is why a delivered, Drive-synced clip still reported "not
+    reachable from this machine" with the file sitting in the operator's own
+    Drive mount.
+
+    Order: any absolute path that exists, then the basename of either candidate
+    looked up in the local clip directories.
+    """
+    for raw in (file_path, drive_sync_path):
+        if not raw:
+            continue
+        p = Path(str(raw))
+        if p.is_absolute() and p.is_file():
+            return p
+    dirs = local_clip_dirs()
+    for raw in (drive_sync_path, file_path):
+        if not raw:
+            continue
+        hit = find_by_name(Path(str(raw)).name, dirs)
+        if hit is not None:
+            return hit
+    return None
+
+
 def resolve_local_vod(stored_path: str) -> Path | None:
     """A locally-readable VIDEO for this recording, or None.
 
@@ -471,18 +528,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_text(HTTPStatus.NOT_FOUND, f'no clip row for candidate {candidate_id}')
             return
 
-        for key in ('file_path', 'drive_sync_path'):
-            raw = row[key]
-            if not raw:
-                continue
-            p = Path(str(raw))
-            # A bare filename (the n8n lane's drive_sync_path) is not a local
-            # path and must never be resolved against this process's cwd.
-            if not p.is_absolute():
-                continue
-            if p.exists() and p.is_file():
-                self._serve_file_range(p)
-                return
+        resolved = resolve_local_clip(row['file_path'], row['drive_sync_path'])
+        if resolved is not None:
+            self._serve_file_range(resolved)
+            return
 
         self._send_text(
             HTTPStatus.NOT_FOUND,
