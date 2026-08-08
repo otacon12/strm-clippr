@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import shlex
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -125,6 +127,63 @@ def resolve_local_clip(file_path: str | None, drive_sync_path: str | None) -> Pa
         if hit is not None:
             return hit
     return None
+
+
+CLIP_CACHE_DIR = Path(
+    os.environ.get('CLPR_CLIP_CACHE',
+                   str(Path.home() / '.cache' / 'clpr' / 'clips')))
+SSH_HOST = os.environ.get('CLPR_SSH_HOST', 'n8nserver')
+
+
+def fetch_clip_from_server(server_path: str | None, candidate_id: int) -> Path | None:
+    """Pull a clip off the origin server and cache it locally, or None.
+
+    WHY THIS EXISTS RATHER THAN JUST SEARCHING HARDER LOCALLY. Local resolution
+    is machine-specific by construction: it depends on this Mac's Drive mount
+    path, and on the clip having been delivered at all. Both assumptions fail --
+    the first on the laptop, the second for a clip that is rendered but not yet
+    synced. Fetching from the server depends only on ssh, which is the same
+    thing every other server operation in this project already needs.
+
+    Cached under CLPR_CLIP_CACHE so the transfer happens once per clip and every
+    byte-range request after that is served from disk, which is also what makes
+    seeking in the player work.
+
+    Returns None rather than raising: the caller already has a 404 path that the
+    UI renders as "not reachable from this machine", and a review surface must
+    not 500 because a side channel is unavailable.
+    """
+    if not server_path:
+        return None
+    name = Path(str(server_path)).name
+    if not name:
+        return None
+    cached = CLIP_CACHE_DIR / f'c{candidate_id}_{name}'
+    if cached.is_file() and cached.stat().st_size > 0:
+        return cached
+    CLIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = cached.with_suffix(cached.suffix + '.part')
+    try:
+        container = subprocess.run(
+            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', SSH_HOST,
+             "docker ps --format '{{.Names}}' | grep '^n8n-'"],
+            capture_output=True, text=True, timeout=30)
+        names = [n for n in container.stdout.split() if n.startswith('n8n-')]
+        if container.returncode != 0 or len(names) != 1:
+            return None
+        with open(tmp, 'wb') as fh:
+            proc = subprocess.run(
+                ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', SSH_HOST,
+                 f'docker exec {names[0]} cat {shlex.quote(str(server_path))}'],
+                stdout=fh, stderr=subprocess.DEVNULL, timeout=600)
+        if proc.returncode != 0 or tmp.stat().st_size == 0:
+            tmp.unlink(missing_ok=True)
+            return None
+        tmp.replace(cached)
+        return cached
+    except Exception:  # noqa: BLE001 - a side channel must never 500 the review UI
+        tmp.unlink(missing_ok=True)
+        return None
 
 
 def resolve_local_vod(stored_path: str) -> Path | None:
@@ -529,6 +588,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
 
         resolved = resolve_local_clip(row['file_path'], row['drive_sync_path'])
+        if resolved is None:
+            # THE DURABLE FALLBACK: fetch it from the origin server.
+            #
+            # Everything above depends on a local copy existing, which makes it
+            # machine-specific: it breaks on a laptop whose Drive mount differs,
+            # and on a clip that is rendered but not yet delivered. Pulling from
+            # the server removes both dependencies -- the clip is reachable
+            # wherever ssh is, delivered or not.
+            resolved = fetch_clip_from_server(row['file_path'], candidate_id)
         if resolved is not None:
             self._serve_file_range(resolved)
             return
