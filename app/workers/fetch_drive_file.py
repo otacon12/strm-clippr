@@ -710,6 +710,26 @@ def run(args: argparse.Namespace) -> int:
                  meta.get('mimeType', ''), elapsed))
         return 0
 
+    if args.max_bytes:
+        # metadata_size() does NOT return a falsy value when Drive omits "size" —
+        # it raises FetchError directly (see its own docstring/body). So the
+        # missing-size case is checked HERE, before calling it, using the exact
+        # same condition it uses internally: that is the only way to emit the
+        # distinct INGEST_SIZE_UNKNOWN marker this gate requires instead of
+        # metadata_size's own unmarked "no size" refusal.
+        raw_size = meta.get('size')
+        if raw_size is None or raw_size == '':
+            raise FetchError(
+                'INGEST_SIZE_UNKNOWN file_id={0} name="{1}" — Drive reported no '
+                'size; refusing rather than pass an unmeasured file through the '
+                '--max-bytes ceiling'.format(file_id, meta.get('name', '')))
+        size = metadata_size(meta)
+        if size > args.max_bytes:
+            raise FetchError(
+                'INGEST_CEILING_REFUSED file_id={0} name="{1}" bytes={2} '
+                'max_bytes={3}'.format(
+                    file_id, meta.get('name', ''), size, args.max_bytes))
+
     out_dir = args.out_dir or DEFAULT_OUT_DIR
     path, size = download(token, meta, out_dir)
     elapsed = time.monotonic() - started
@@ -734,6 +754,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                              'or {0})'.format(DEFAULT_SA_PATH))
     parser.add_argument('--metadata-only', action='store_true',
                         help='resolve and report id/name/size only; download nothing')
+    parser.add_argument('--max-bytes', type=int, default=0,
+                        help='refuse BEFORE downloading if Drive-reported size exceeds '
+                             'this many bytes; 0 = no ceiling (default)')
     return parser.parse_args(argv)
 
 
