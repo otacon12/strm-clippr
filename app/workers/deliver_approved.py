@@ -23,6 +23,26 @@ byte-identical behavior; adjusted candidates render via render_adjusted_clip
 below, which mirrors cut_clip exactly but cuts the effective window with
 slice_geometry.PUBLISH_PAD_S breathing room (one truth for the pad).
 
+D-063: THIS MACHINE CANNOT BURN CAPTIONS, SO IT REFUSES THE CANDIDATES THAT
+WANT THEM — AT BOTH STAGES. The render stage refuses through
+cut_clip.require_no_caption_request (one truth for the message and the
+capability probe). The SYNC stage refuses too, and that is the half that is
+easy to miss: a clip rendered BEFORE the operator ticked captions is already on
+disk and byte-matches nothing about the request, so without a sync-stage guard
+it would be delivered uncaptioned against an explicit ask and then recorded as
+delivered. The mirror case is guarded as well — a clip whose file WAS burned
+while the toggle has since been switched off is not delivered either, because
+shipping captions he switched off is the same failure pointing the other way.
+Both refusals are per-candidate: the rest of the batch is unaffected, and both
+are counted into RESULT's refused_captions as well as into failed.
+
+WHAT IS EXPLICITLY NOT A REFUSAL: a clip the server rendered with captions
+asked for whose window holds NO SPEECH (captions_requested=1, captions_burned=0,
+captions_cue_count=0). That file is exactly what was requested — there was
+nothing to burn — so it delivers normally. Reading only captions_burned cannot
+tell it apart from "this machine cannot burn", which is why all three columns
+are fetched.
+
 Per-candidate failure isolation: one failure never aborts the batch.
 Connects via the shared adapter app/workers/db.py (CLPR_DB_URL). Prints
 machine-parseable RESULT line last; failure details also go to stderr (D-047
@@ -91,7 +111,9 @@ def fetch_approved(cur) -> list[dict]:
         f'''
         SELECT c.id, c.recording_id, c.start_s, r.session_label,
                cl.file_path, cl.state, cl.drive_synced_at,
-               {category_select} AS category
+               {category_select} AS category,
+               c.burn_captions, cl.captions_burned,
+               cl.captions_requested, cl.captions_cue_count
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
         LEFT JOIN clips cl ON cl.candidate_id = c.id
@@ -112,8 +134,86 @@ def fetch_approved(cur) -> list[dict]:
             'clip_state': str(r[5]) if r[5] is not None else None,
             'drive_synced_at': str(r[6]) if r[6] is not None else None,
             'category': str(r[7]) if r[7] is not None else 'unknown',
+            # D-063: the INTENT (candidate) and the FACT (clip row) are read as
+            # two separate things on purpose — they are allowed to disagree,
+            # and the disagreement is precisely what must stop a delivery.
+            'burn_captions': int(r[8]),
+            'captions_burned': int(r[9]) if r[9] is not None else None,
+            # D-063 fixer: requested + cue_count are read too, because
+            # captions_burned ALONE cannot tell the two zero-cases apart —
+            # "this machine could not burn it" and "the server burned nothing
+            # because nobody speaks in this window" are both burned=0, and only
+            # one of them is a reason to refuse a delivery.
+            'captions_requested': int(r[10]) if r[10] is not None else None,
+            'captions_cue_count': int(r[11]) if r[11] is not None else None,
         })
     return out
+
+
+def captions_honest_no_speech(cand: dict) -> bool:
+    """Was this file rendered WITH captions asked for, and nothing said in it?
+
+    render_from_slice writes exactly this triple when the shipped window holds
+    no speech: requested=1, burned=0, cue_count=0. That is a SUCCESSFUL render
+    of precisely what was asked for, not a shortfall — there was nothing to
+    burn. Only render_from_slice can ever write requested=1 (both Mac paths
+    hardcode 0/0/NULL), so this triple is unforgeable by the machine that
+    cannot burn.
+    """
+    return (
+        cand['captions_requested'] == 1
+        and cand['captions_burned'] == 0
+        and cand['captions_cue_count'] == 0
+    )
+
+
+def require_captions_consistent(cand: dict) -> None:
+    """D-063: refuse any candidate whose captions INTENT and clip FACT disagree.
+
+    Two directions, both of which would otherwise ship a file that contradicts
+    what the operator asked for:
+
+      wants captions, file has none  -> cut_clip's shared refusal (this machine
+          cannot burn), raised even when a perfectly good uncaptioned file is
+          already sitting there ready to copy.
+      wants none, file was burned    -> the operator switched captions off after
+          a server-side burn. The bytes on disk still carry them, so delivering
+          would publish captions he removed.
+
+    TWO CASES THAT MUST NOT BE REFUSED, and the guard got the second of them
+    wrong until the adversarial sweep caught it:
+
+      wants captions, file HAS them  -> the n8n server lane burned it. Nothing
+          is being asked of this machine's ffmpeg — it is a file copy of
+          exactly what was requested — so gating on the request alone would
+          strand every server-burned clip in the queue forever.
+      wants captions, file was rendered WITH captions asked for and the window
+          holds NO SPEECH -> requested=1, burned=0, cue_count=0. The server
+          already did exactly what was asked and there was nothing to burn.
+          Refusing here refused a correct file forever, told the operator via
+          the review card to "re-render on the server lane" (which reproduces
+          the identical row), and — because every refusal counts into `failed`
+          and main() returns 1 when failed>0 — turned the WHOLE batch to ok=0
+          on every future run. One honest render, one permanently red batch.
+
+    So the guard keys on a real DISAGREEMENT between the intent and the file,
+    never on the intent by itself and never on burned=0 by itself.
+    """
+    if (cand['burn_captions'] == 1
+            and cand['captions_burned'] != 1
+            and not captions_honest_no_speech(cand)):
+        cut_clip.require_no_caption_request(
+            cand['candidate_id'], cand['burn_captions'], 'deliver_approved.sync'
+        )
+    if cand['burn_captions'] == 0 and cand['captions_burned'] == 1:
+        raise cut_clip.CaptionRefused(
+            f'CAPTIONS_STALE_BURN: candidate_id={cand["candidate_id"]} has captions '
+            'switched OFF (clip_candidates.burn_captions=0) but its rendered clip was '
+            'burned WITH captions (clips.captions_burned=1), so delivering it would '
+            'publish captions that were switched off. Refusing this candidate: the '
+            'rest of the batch is unaffected. Fixes: re-tick captions for this clip in '
+            'the review UI, or re-render it without captions on the n8n server lane.'
+        )
 
 
 def is_sync_eligible(cand: dict) -> bool:
@@ -300,7 +400,7 @@ def render_adjusted_clip(candidate_id: int) -> int:
             '''
             SELECT c.recording_id, c.start_s, c.end_s,
                    c.adjusted_start_s, c.adjusted_end_s,
-                   c.state, r.path, r.duration_s
+                   c.state, r.path, r.duration_s, c.burn_captions
             FROM clip_candidates c
             JOIN recordings r ON r.id = c.recording_id
             WHERE c.id = %s
@@ -311,7 +411,7 @@ def render_adjusted_clip(candidate_id: int) -> int:
         if not row:
             raise RuntimeError(f'candidate_id not found: {candidate_id}')
         (recording_id, start_s, end_s, adjusted_start_s, adjusted_end_s,
-         state, recording_path, recording_duration_s) = row
+         state, recording_path, recording_duration_s, burn_captions) = row
         if recording_duration_s is None:
             raise RuntimeError(f'recording duration_s is NULL for candidate_id={candidate_id}')
         recording_id = int(recording_id)
@@ -321,6 +421,11 @@ def render_adjusted_clip(candidate_id: int) -> int:
             raise RuntimeError(
                 f'candidate must be approved before cut: candidate_id={candidate_id} state={state}'
             )
+
+        # D-063: same refusal as cut_clip.render_clip, same message, one truth.
+        cut_clip.require_no_caption_request(
+            candidate_id, burn_captions, 'deliver_approved.render_adjusted_clip'
+        )
 
         eff_start_s, eff_end_s = slice_geometry.effective_window(
             float(start_s), float(end_s),
@@ -381,16 +486,24 @@ def render_adjusted_clip(candidate_id: int) -> int:
 
             duration_s = cut_clip.measure_duration_s(out_path)
 
+            # D-063: identical to cut_clip's — this path cannot burn either, so
+            # it writes the honest 0/0/NULL and resets those columns on
+            # re-render (a server-burned clip re-rendered here must stop
+            # claiming captions the new file does not have).
             cur.execute(
                 '''
-                INSERT INTO clips(candidate_id, file_path, duration_s, state, created_by_run, created_at)
-                VALUES (%s, %s, %s, 'rendered', %s, %s)
+                INSERT INTO clips(candidate_id, file_path, duration_s, state, created_by_run, created_at,
+                                  captions_requested, captions_burned, captions_cue_count)
+                VALUES (%s, %s, %s, 'rendered', %s, %s, 0, 0, NULL)
                 ON CONFLICT (candidate_id) DO UPDATE SET
                     file_path = EXCLUDED.file_path,
                     duration_s = EXCLUDED.duration_s,
                     state = 'rendered',
                     created_by_run = EXCLUDED.created_by_run,
-                    created_at = EXCLUDED.created_at
+                    created_at = EXCLUDED.created_at,
+                    captions_requested = 0,
+                    captions_burned = 0,
+                    captions_cue_count = NULL
                 ''',
                 (candidate_id, str(out_path), duration_s, run_id, utc_now_iso()),
             )
@@ -398,7 +511,8 @@ def render_adjusted_clip(candidate_id: int) -> int:
 
             print(
                 f'RESULT deliver_adjusted candidate={candidate_id} ok=1 '
-                f'file="{out_path}" duration_s={duration_s:.3f}'
+                f'file="{out_path}" duration_s={duration_s:.3f} '
+                f'captions_requested=0 captions_burned=0'
             )
             return 0
         except Exception:
@@ -446,6 +560,12 @@ def main() -> int:
     already = 0
     obs_blocked = 0
     failed = 0
+    # D-063 fixer: caption refusals are counted in their OWN field as well as
+    # in `failed`, never instead of it. Folded only into `failed` they were
+    # indistinguishable from a real delivery error in the one line the operator
+    # reads, while the dry run had reported them explicitly — the two RESULT
+    # lines described the same batch in different vocabularies.
+    refused_captions = 0
 
     conn = db.connect()
     try:
@@ -456,8 +576,25 @@ def main() -> int:
         if args.dry_run:
             planned_sync = 0
             planned_render = 0
+            planned_refused = 0
             for cand in candidates:
                 dest = dest_path_for(drive_sync_dir, cand)
+                # D-063: the dry run must SHOW the refusal, not discover it at
+                # execution time. It reports, it never raises: a dry run
+                # executes nothing, including nothing that fails.
+                caption_block = None
+                if cand['drive_synced_at'] is None:
+                    try:
+                        require_captions_consistent(cand)
+                    except Exception as exc:
+                        caption_block = str(exc)
+                if caption_block is not None:
+                    planned_refused += 1
+                    print(
+                        f'PLAN candidate={cand["candidate_id"]} action=refuse_captions '
+                        f'category={cand["category"]} reason="{caption_block}"'
+                    )
+                    continue
                 if cand['drive_synced_at'] is not None:
                     # D-056: the delivery witness is set — this candidate is
                     # delivered, full stop. Never re-rendered, never re-synced.
@@ -479,12 +616,16 @@ def main() -> int:
             print(
                 'DRY_RUN executes nothing: '
                 f'planned_sync={planned_sync} planned_render_then_sync={planned_render} '
-                f'already_delivered={already}'
+                f'already_delivered={already} refused_captions={planned_refused}'
             )
+            # failed=0 is the truth: a dry run executes nothing, so nothing
+            # failed. The refusals are a PLAN and are reported as their own
+            # field rather than dressed up as failures that did not happen.
             print(
                 'RESULT deliver_approved '
                 f'ok=1 approved={approved} rendered_now=0 synced_now=0 '
-                f'already_delivered={already} obs_blocked=0 failed=0'
+                f'already_delivered={already} obs_blocked=0 failed=0 '
+                f'refused_captions={planned_refused}'
             )
             return 0
 
@@ -508,6 +649,12 @@ def main() -> int:
                         f'drive_synced_at={cand["drive_synced_at"]}'
                     )
                     continue
+
+                # D-063: the captions guard sits AFTER the delivered skip and
+                # BEFORE every file check, so it can never re-open an already
+                # delivered clip and can never be reached around by a
+                # byte-matching file that predates the operator's request.
+                require_captions_consistent(cand)
 
                 matched, reason = delivery_file_check(cand, dest)
                 if matched:
@@ -546,6 +693,8 @@ def main() -> int:
             except Exception as exc:
                 conn.rollback()  # clear any aborted transaction before continuing the batch
                 failed += 1
+                if isinstance(exc, cut_clip.CaptionRefused):
+                    refused_captions += 1
                 report_failure(cid, 'sync', exc)
 
         # ---- Phase 2: render the rest (OBS-gated), then sync each fresh render.
@@ -576,6 +725,13 @@ def main() -> int:
                             )
                         else:
                             failed += 1
+                            # Unreachable while the sync-stage guard above runs
+                            # first (it refuses the same disagreement before a
+                            # candidate can reach this queue), but counted here
+                            # too so the field stays true if that ordering ever
+                            # changes rather than silently under-reporting.
+                            if isinstance(exc, cut_clip.CaptionRefused):
+                                refused_captions += 1
                             report_failure(cid, 'render', exc)
                         continue
 
@@ -599,7 +755,8 @@ def main() -> int:
     print(
         'RESULT deliver_approved '
         f'ok={ok} approved={approved} rendered_now={rendered_now} synced_now={synced_now} '
-        f'already_delivered={already} obs_blocked={obs_blocked} failed={failed}'
+        f'already_delivered={already} obs_blocked={obs_blocked} failed={failed} '
+        f'refused_captions={refused_captions}'
     )
     return 0 if failed == 0 else 1
 

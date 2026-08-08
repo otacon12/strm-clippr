@@ -338,9 +338,35 @@
             ? `<div class="meta">${kitStampHtml(c)}${kitHasUnsaved(c) ? ' <span class="unsaved">unsaved</span>' : ''}</div>`
             : (deliveryBadgeHtml(c) ? `<div class="meta">${deliveryBadgeHtml(c)}</div>` : '')}
           ${view !== 'delivered' && c.post_kit_enabled === 0 ? '<div class="meta">post kit: OFF</div>' : ''}
+          ${captionsChipHtml(c)}
         `;
         listEl.appendChild(el);
       });
+    }
+
+    // D-063 card chip. The post kit's chip shows when it is OFF because it
+    // defaults ON. Captions default OFF, so the chip shows when it is ON — the
+    // chip always marks the NON-default state, which is the one worth a glance.
+    // On a delivered card the chip reports the FILE, never the toggle: that is
+    // the only fact a delivered clip has.
+    function captionsChipHtml(c) {
+      const rendered = !(c.clip_state === null || c.clip_state === undefined);
+      if (rendered && c.captions_burned === 1) return '<div class="meta">captions: BURNED IN</div>';
+      // Asked for, and the window holds no speech. An honest outcome, not a
+      // shortfall, and NOT something a later render would change.
+      if (rendered && c.captions_requested === 1 && c.captions_cue_count === 0) {
+        return '<div class="meta">captions: none (no speech in this window)</div>';
+      }
+      // D-063 fixer: a DELIVERED clip is delivered, full stop (D-056) — there
+      // is no next render for it, so promising one on its card was a claim
+      // about work that will never happen.
+      if (c.drive_synced_at) {
+        return c.burn_captions === 1
+          ? '<div class="meta">captions: ON, but this delivered file has none</div>'
+          : '';
+      }
+      if (c.burn_captions === 1) return '<div class="meta">captions: ON (next render)</div>';
+      return '';
     }
 
     // ------------------------------------------------------------- D-061/D-062
@@ -682,6 +708,11 @@
         <div class="winline">${kitStampHtml(c)}</div>
         <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
           generate a post kit for this clip (intent only, the generator reads this)</label>
+        <label class="genrow"><input type="checkbox" id="burnCaps" ${c.burn_captions === 1 ? 'checked' : ''} />
+          burn speech captions into this clip (intent only — it applies to the NEXT render,
+          it cannot change the file already delivered)</label>
+        <div class="winline">${captionsFactHtml(c)}</div>
+        ${captionsIntentNote(c)}
         <div class="kitgrid">
           <div>
             <div class="phone" id="phoneFrame">
@@ -706,8 +737,10 @@
               <div class="tags" id="postTags">${esc(v.hashtags)}</div>
             </div>
             <div class="kitmeta">Dashed regions are covered by the platform's own UI. The hook is a CSS
-              overlay on top of the video: the delivered file in Drive has no text burned into it and
-              never will.</div>
+              overlay on top of the video: it is never burned into the delivered file and never will be
+              (D-061) — you type it into the platform's own text tool. Speech captions are the one
+              exception, and only when you tick the box above: they are burned during the render, sit
+              along the bottom clear of these guides, and this mockup does not show them.</div>
           </div>
           <div>
             ${copyBlocks}
@@ -737,6 +770,8 @@
       }
       const genEl = document.getElementById('genKit');
       if (genEl) genEl.onchange = () => setGenerate(c, genEl.checked);
+      const capEl = document.getElementById('burnCaps');
+      if (capEl) capEl.onchange = () => setCaptions(c, capEl.checked);
 
       detailEl.querySelectorAll('.variant .pick').forEach((b) => {
         b.onclick = () => { hookPick[c.id] = b.dataset.hook; repaintOverlay(); };
@@ -808,6 +843,119 @@
         ).join('');
         out.innerHTML = (rows + reqs) || '<div class="histrow">no versions</div>';
       } catch (_) { /* history is informational, never surface a transient error */ }
+    }
+
+    // ------------------------------------------------------------------ D-063
+    // BURNED-IN SPEECH CAPTIONS. Two facts, never merged into one badge:
+    //
+    //   the TOGGLE (c.burn_captions)   — what you want for the NEXT render.
+    //   the FILE   (c.captions_burned) — what the delivered clip actually has.
+    //
+    // They are allowed to disagree, and when they do the honest thing is to
+    // say so rather than to pick whichever one flatters the surface. A clip
+    // shown as captioned that has no captions is the exact failure this
+    // project keeps paying for, so `captions_burned` is the ONLY field that
+    // may ever produce the words "has captions".
+
+    function captionsFactHtml(c) {
+      if (c.clip_state === null || c.clip_state === undefined) {
+        return 'captions: <b>no clip rendered yet</b>';
+      }
+      if (c.captions_burned === 1) {
+        return `captions: <b>BURNED IN</b> (${c.captions_cue_count} cue${c.captions_cue_count === 1 ? '' : 's'})`;
+      }
+      if (c.captions_requested === 1 && c.captions_cue_count === 0) {
+        return 'captions: <b>none burned</b> — they were requested, but nobody speaks inside this window';
+      }
+      return 'captions: <b>none burned</b> — this file has no text in it';
+    }
+
+    // The gap between intent and file, stated plainly wherever it exists. This
+    // is not a warning about a bug, it is the surface telling you the file on
+    // disk does not match what the toggle now says, which is exactly the state
+    // the Mac-side deliverer refuses on.
+    function captionsIntentNote(c) {
+      const rendered = !(c.clip_state === null || c.clip_state === undefined);
+      if (!rendered) return '';
+      // D-063 fixer: "requested, but nobody speaks in this window" is NOT a
+      // gap between intent and file — the render did exactly what was asked
+      // and there was nothing to burn. captionsFactHtml already says so on
+      // this same card, and this function used to contradict it by telling the
+      // operator to re-render, which reproduces the identical row forever.
+      const noSpeech = (c.captions_requested === 1 && c.captions_cue_count === 0);
+      if (c.burn_captions === 1 && c.captions_burned !== 1 && !noSpeech) {
+        // A delivered clip has no next render (D-056), so do not promise one.
+        if (c.drive_synced_at) {
+          return `<div class="genrow" style="color:var(--maybe);">captions are ON but the file that was
+            already delivered does not carry them. The toggle cannot change a delivered clip: it only
+            applies if this candidate is ever rendered again.</div>`;
+        }
+        return `<div class="genrow" style="color:var(--maybe);">captions are ON but the rendered file
+          does not carry them. It has to be re-rendered on the server lane to gain them, and the Mac
+          batch deliverer will refuse this clip until then rather than ship it uncaptioned.</div>`;
+      }
+      if (c.burn_captions === 0 && c.captions_burned === 1) {
+        if (c.drive_synced_at) {
+          return `<div class="genrow" style="color:var(--maybe);">captions are OFF but the file that was
+            already delivered has them burned in. Unticking the box cannot take them out of a clip that
+            has shipped.</div>`;
+        }
+        return `<div class="genrow" style="color:var(--maybe);">captions are OFF but the rendered file
+          already has them burned in. Re-tick captions, or re-render, before delivering.</div>`;
+      }
+      return '';
+    }
+
+    // D-063 fixer: THE TOGGLE MUST LAND BEFORE THE VERDICT.
+    //
+    // setCaptions is async and the checkbox fires it on change, but decide()
+    // did not wait for it. Tick captions and hit Approve (or the `a` key)
+    // straight after, and the verdict POST could win the race: the server
+    // commits the approval and fires the delivery webhook, and the server lane
+    // then reads burn_captions from the database as it was BEFORE the tick.
+    // The clip renders uncaptioned and every row about it is honest, so
+    // nothing anywhere reports a problem — the operator's intent is simply
+    // gone, on the single action this whole feature exists for.
+    //
+    // decide() awaits this promise, so the verdict is always sent against the
+    // flag the operator actually set. Deliberately NOT wired to setGenerate:
+    // post_kit_enabled is read long after delivery, not by the webhook the
+    // verdict fires, so there is no comparable window there.
+    let pendingIntentSave = null;
+
+    async function setCaptions(c, value) {
+      const save = (async () => {
+      gen += 1;
+      try {
+        const res = await fetch(`/api/candidates/${c.id}/captions-toggle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ burn_captions: value }),
+        });
+        if (!res.ok) {
+          let body = '';
+          try { body = JSON.stringify(await res.json()); } catch (_) {}
+          alert(`Failed: ${res.status} ${body}`);
+          await loadCandidates();
+          return;
+        }
+        const row = await res.json();
+        const j = indexOfRow(row.id);
+        if (j !== -1) { candidates[j] = mergeLocalFlags(candidates[j], row); idx = j; }
+        renderList();
+        renderDetail();
+      } catch (err) {
+        alert(`Failed: ${String(err)}`);
+      }
+      })();
+      // Cleared in a finally so a rejected save can never wedge every future
+      // verdict behind a promise that will not settle again.
+      pendingIntentSave = save;
+      try {
+        await save;
+      } finally {
+        if (pendingIntentSave === save) pendingIntentSave = null;
+      }
     }
 
     async function setGenerate(c, value) {
@@ -1083,6 +1231,10 @@
         <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
           generate a post kit for this clip (default on, flip it any time — it records intent only,
           the copy is generated after the clip is delivered)</label>
+        <label class="genrow"><input type="checkbox" id="burnCaps" ${c.burn_captions === 1 ? 'checked' : ''} />
+          burn speech captions into this clip (default off, tick it any time before or at approval —
+          the captions go in during the render itself, not afterwards)</label>
+        ${captionsIntentNote(c)}
         <div class="actions">
           <button class="approve" id="btnApprove">Approve (a)</button>
           ${view !== 'rejected' ? '<button class="reject" id="btnReject">Reject (r)</button>' : ''}
@@ -1108,6 +1260,10 @@
       // approved cards).
       const genEl = document.getElementById('genKit');
       if (genEl) genEl.onchange = () => setGenerate(c, genEl.checked);
+      // D-063: the captions toggle. Same shape as the generate toggle and for
+      // the same reasons — intent only, fires no render, live in every state.
+      const capEl = document.getElementById('burnCaps');
+      if (capEl) capEl.onchange = () => setCaptions(c, capEl.checked);
       if (editable) {
         detailEl.querySelectorAll('.nudge').forEach((btn) => {
           btn.onclick = () => nudgeWindow(btn.dataset.field, Number(btn.dataset.delta));
@@ -1244,7 +1400,18 @@
 
     async function decide(action) {
       if (!candidates.length) return;
+      // D-063 fixer: let any in-flight captions toggle land first, so the
+      // verdict (and the delivery webhook it fires) always sees the flag the
+      // operator just set. The rejection is swallowed on purpose: setCaptions
+      // has already alerted, and a failed toggle must not also swallow the
+      // verdict keystroke.
+      if (pendingIntentSave) {
+        try { await pendingIntentSave; } catch (_) { /* already surfaced */ }
+      }
+      // Re-read after the await: setCaptions replaces the row object in place.
+      if (!candidates.length) return;
       const c = candidates[idx];
+      if (!c) return;
       // D-056: approved (awaiting-delivery) cards are verdict-locked — covers
       // the a/r/m keys; the buttons are already disabled (server 409s anyway).
       if (c.state === 'approved') return;

@@ -5,12 +5,26 @@ non-zero on any failure. Prints machine-parseable RESULT line last.
 
 PostgreSQL port (D-052 P3): tables and columns per app/docs/naming-map.md.
 The --candidate-id CLI flag is an external contract and stays.
+
+D-063: THIS RENDERER CANNOT BURN CAPTIONS, AND SAYS SO INSTEAD OF PRETENDING.
+It is the Mac-side path, and the operator's ffmpeg is built without libass, so
+it has no `subtitles` filter at all — the burn is not merely unimplemented
+here, it is impossible on this machine. A candidate with
+clip_candidates.burn_captions = 1 is therefore REFUSED loudly
+(CAPTIONS_UNSUPPORTED_HERE) rather than rendered without the captions it asked
+for. Delivering an uncaptioned file against an explicit request, and then
+recording it as delivered, is exactly the class of lie this project keeps
+paying for. Everything about the render itself is unchanged: with the flag off
+(the default, and every clip that exists today) not one byte of the D-023
+command differs, and the clips row records captions_requested = 0,
+captions_burned = 0 — which is TRUE of every file this renderer can produce.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +36,61 @@ try:
 except ModuleNotFoundError:
     from .obs_guard import require_obs_idle_or_raise
 
+try:
+    import render_from_slice
+except ModuleNotFoundError:  # pragma: no cover - package-relative import
+    from . import render_from_slice
+
 PAD_SECONDS = 1.5  # small default padding so cuts do not feel abrupt; tunable later.
+
+
+class CaptionRefused(RuntimeError):
+    """A candidate refused because its captions INTENT and the file disagree.
+
+    A TYPE, not a message prefix, because deliver_approved counts these into
+    its own RESULT field and matching on the text of an error message is the
+    proxy version of asking what actually happened: reword the message and the
+    counter silently goes to zero while still reporting ok=1. Subclasses
+    RuntimeError so every existing per-candidate handler keeps treating it as
+    the failure it is — the refusal is COUNTED separately, never RECLASSIFIED
+    out of `failed`, or a batch would report success while clips the operator
+    asked for sat undelivered.
+    """
+
+
+def require_no_caption_request(candidate_id: int, burn_captions: int, stage: str) -> None:
+    """ONE TRUTH for the Mac-side caption refusal (D-063).
+
+    Every Mac-side entry point routes through here: cut_clip.render_clip (also
+    reached from cut_all_approved.py), deliver_approved.render_adjusted_clip,
+    and deliver_approved's SYNC stage — because a clip rendered BEFORE the flag
+    was ticked is already on disk and would otherwise be delivered uncaptioned
+    against an explicit request, which is the same lie with fewer steps.
+
+    The capability is PROBED and quoted in the message rather than asserted, so
+    the error stays true on a machine that later gains libass: this renderer
+    still does not implement burning, and the message says which of the two
+    reasons applies here.
+    """
+    if int(burn_captions) != 1:
+        return
+    has_filter = render_from_slice.ffmpeg_has_subtitles_filter()
+    capability = (
+        'this ffmpeg HAS the subtitles filter, but this Mac-side renderer does not '
+        'implement burning at all'
+        if has_filter else
+        'this ffmpeg has no `subtitles` filter, so it was built without libass and '
+        'cannot burn anything'
+    )
+    raise CaptionRefused(
+        f'CAPTIONS_UNSUPPORTED_HERE: candidate_id={candidate_id} asks for burned-in '
+        f'captions (clip_candidates.burn_captions=1) at stage={stage}, but on host '
+        f'"{socket.gethostname()}" {capability}. Refusing this candidate: nothing is '
+        'rendered, nothing is delivered, and no clip row will claim captions it does '
+        'not have. The rest of the batch is unaffected. Fixes: approve it so the n8n '
+        'server lane renders it (that ffmpeg has libass), or untick captions for this '
+        'clip in the review UI, or install an ffmpeg build that includes libass here.'
+    )
 
 
 def utc_now_iso() -> str:
@@ -57,10 +125,11 @@ def measure_duration_s(path: Path) -> float:
     return float(raw)
 
 
-def fetch_candidate(cur, candidate_id: int) -> tuple[int, float, float, str, str, float]:
+def fetch_candidate(cur, candidate_id: int) -> tuple[int, float, float, str, str, float, int]:
     cur.execute(
         '''
-        SELECT c.recording_id, c.start_s, c.end_s, c.state, r.path, r.duration_s
+        SELECT c.recording_id, c.start_s, c.end_s, c.state, r.path, r.duration_s,
+               c.burn_captions
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
         WHERE c.id = %s
@@ -71,7 +140,8 @@ def fetch_candidate(cur, candidate_id: int) -> tuple[int, float, float, str, str
     if not row:
         raise RuntimeError(f'candidate_id not found: {candidate_id}')
 
-    recording_id, start_s, end_s, state, recording_path, recording_duration_s = row
+    (recording_id, start_s, end_s, state, recording_path, recording_duration_s,
+     burn_captions) = row
     if recording_duration_s is None:
         raise RuntimeError(f'recording duration_s is NULL for candidate_id={candidate_id}')
 
@@ -82,6 +152,7 @@ def fetch_candidate(cur, candidate_id: int) -> tuple[int, float, float, str, str
         str(state),
         str(recording_path),
         float(recording_duration_s),
+        int(burn_captions),
     )
 
 
@@ -105,14 +176,17 @@ def render_clip(candidate_id: int) -> int:
         if cur.fetchone() is None:
             raise RuntimeError('clips table missing; apply migrations_pg/001 before cut_clip')
 
-        recording_id, start_s, end_s, state, recording_path, recording_duration_s = fetch_candidate(
-            cur, candidate_id
-        )
+        (recording_id, start_s, end_s, state, recording_path, recording_duration_s,
+         burn_captions) = fetch_candidate(cur, candidate_id)
 
         if state != 'approved':
             raise RuntimeError(
                 f'candidate must be approved before cut: candidate_id={candidate_id} state={state}'
             )
+
+        # D-063: refuse BEFORE any work, so a candidate that wants captions
+        # never produces a file this machine would have to lie about.
+        require_no_caption_request(candidate_id, burn_captions, 'cut_clip.render_clip')
 
         cut_start_s = clamp(start_s - PAD_SECONDS, 0.0, recording_duration_s)
         cut_end_s = clamp(end_s + PAD_SECONDS, 0.0, recording_duration_s)
@@ -164,22 +238,34 @@ def render_clip(candidate_id: int) -> int:
 
             duration_s = measure_duration_s(out_path)
 
+            # D-063: this renderer can only ever produce an uncaptioned file
+            # (it refuses the request above), so it writes the honest 0/0/NULL
+            # and RESETS those columns on re-render. Without the reset, a clip
+            # previously burned by the server lane and re-rendered here would
+            # keep claiming captions the new file does not have.
             cur.execute(
                 '''
-                INSERT INTO clips(candidate_id, file_path, duration_s, state, created_by_run, created_at)
-                VALUES (%s, %s, %s, 'rendered', %s, %s)
+                INSERT INTO clips(candidate_id, file_path, duration_s, state, created_by_run, created_at,
+                                  captions_requested, captions_burned, captions_cue_count)
+                VALUES (%s, %s, %s, 'rendered', %s, %s, 0, 0, NULL)
                 ON CONFLICT (candidate_id) DO UPDATE SET
                     file_path = EXCLUDED.file_path,
                     duration_s = EXCLUDED.duration_s,
                     state = 'rendered',
                     created_by_run = EXCLUDED.created_by_run,
-                    created_at = EXCLUDED.created_at
+                    created_at = EXCLUDED.created_at,
+                    captions_requested = 0,
+                    captions_burned = 0,
+                    captions_cue_count = NULL
                 ''',
                 (candidate_id, str(out_path), duration_s, run_id, utc_now_iso()),
             )
             conn.commit()
 
-            print(f'RESULT cut_clip candidate={candidate_id} ok=1 file="{out_path}" duration_s={duration_s:.3f}')
+            print(
+                f'RESULT cut_clip candidate={candidate_id} ok=1 file="{out_path}" '
+                f'duration_s={duration_s:.3f} captions_requested=0 captions_burned=0'
+            )
             return 0
         except Exception:
             if out_path.exists():

@@ -40,6 +40,9 @@ POST_WINDOW_RE = re.compile(r'^/api/candidates/(\d+)/window$')
 # D-061 post kit (2026-08-07 follow-ups). Each of these is its own route so a
 # typo can never fall through into the verdict routes above.
 POST_GENERATE_RE = re.compile(r'^/api/candidates/(\d+)/generate$')
+# D-063 captions toggle. Its own route, for the same reason as the others: a
+# typo must 404, never fall through into a verdict.
+POST_CAPTIONS_RE = re.compile(r'^/api/candidates/(\d+)/captions-toggle$')
 POST_KIT_RE = re.compile(r'^/api/candidates/(\d+)/kit$')
 POST_KIT_REGEN_RE = re.compile(r'^/api/candidates/(\d+)/kit/regenerate$')
 POST_SUBJECT_RE = re.compile(r'^/api/recordings/(\d+)/subject$')
@@ -58,6 +61,18 @@ GET_CLIP_MEDIA_RE = re.compile(r'^/clipmedia/(\d+)$')
 # drive_synced_at (null when unset/no row) ride along additively — the
 # delivery witness the UI badges on. clips has UNIQUE(candidate_id), so the
 # LEFT JOIN in CANDIDATE_PAYLOAD_FROM can never fan a candidate into two rows.
+# D-063: FOUR caption fields ride along, and they are four because they answer
+# four different questions that are allowed to disagree (006's own reasoning):
+#   burn_captions      — what the operator wants NOW, on the candidate. The
+#                        toggle's state, and the ONLY one the toggle reflects.
+#   captions_requested — what the render that made the existing file was asked.
+#   captions_burned    — whether that file really carries captions. The ONLY
+#                        field any surface may render as "this clip has
+#                        captions", and it is null when no clip exists yet.
+#   captions_cue_count — 0 with requested=1 is the honest "asked, but nobody
+#                        spoke in this window" case, which is not a failure.
+# A surface that showed the candidate flag on a delivered clip would be
+# claiming a property of a FILE from a field about an INTENTION.
 CANDIDATE_PAYLOAD_COLUMNS = '''
           c.id,
           c.recording_id AS vod_id,
@@ -77,7 +92,11 @@ CANDIDATE_PAYLOAD_COLUMNS = '''
           c.created_at,
           cl.state AS clip_state,
           cl.drive_synced_at,
-          c.post_kit_enabled'''
+          c.post_kit_enabled,
+          c.burn_captions,
+          cl.captions_requested,
+          cl.captions_burned,
+          cl.captions_cue_count'''
 
 # One truth for the payload FROM clause (every query that SELECTs
 # CANDIDATE_PAYLOAD_COLUMNS uses exactly these joins).
@@ -866,6 +885,64 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
         self._send_json(HTTPStatus.OK, updated)
 
+    def _set_captions(self, candidate_id: int, body_raw: bytes) -> None:
+        """The per-clip BURN-CAPTIONS TOGGLE (clip_candidates.burn_captions).
+
+        D-063, the operator's own shape: "C" (on demand, not always) plus "UI
+        option while approving". So it is OFF by default, ticking it is the
+        opt-in, and it is settable any time before or at approval.
+
+        Records INTENT ONLY. No render fires from here and no existing file is
+        touched: the burn happens inside whichever render runs next, in the
+        same pass as the clip. It is deliberately NOT locked after approval,
+        for the identical reason _set_generate is not (see there): the ruling
+        grants a permission, it does not impose a prohibition, and locking it
+        would leave an approved clip's toggle permanently unfixable.
+
+        THE ONE THING THIS ENDPOINT MUST NOT DO is change any clips column.
+        Flipping the toggle cannot make an already-rendered file gain or lose
+        captions, so the fields that describe that file (captions_requested /
+        captions_burned) are left exactly as the render wrote them. That gap is
+        not an inconsistency to be tidied away, it is the operator asking for
+        something the current file does not have — and the Mac-side deliverer
+        refuses on exactly that signal.
+        """
+        ok, body = self._parse_json_body(body_raw)
+        if not ok:
+            return
+        value = body.get('burn_captions')
+        if value is None:
+            value = body.get('captions')  # the UI's plainer name
+        if not isinstance(value, bool):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {'error': 'body must be a JSON object with boolean key burn_captions'},
+            )
+            return
+
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            try:
+                cur.execute(
+                    'UPDATE clip_candidates SET burn_captions = %s WHERE id = %s',
+                    (1 if value else 0, candidate_id),
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND, {'error': f'candidate not found: {candidate_id}'}
+                    )
+                    return
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            updated = fetch_delivered_payload(cur, candidate_id)
+        finally:
+            conn.close()
+        self._send_json(HTTPStatus.OK, updated)
+
     def _save_kit(self, candidate_id: int, body_raw: bytes) -> None:
         """Save an operator edit as a NEW VERSION with origin='operator_edit'.
 
@@ -1421,6 +1498,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             (POST_KIT_REGEN_RE, self._request_regenerate),
             (POST_KIT_RE, self._save_kit),
             (POST_GENERATE_RE, self._set_generate),
+            (POST_CAPTIONS_RE, self._set_captions),
             (POST_SUBJECT_RE, self._set_subject),
         ):
             km = regex.match(parsed.path)
