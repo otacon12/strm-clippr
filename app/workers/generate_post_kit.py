@@ -167,9 +167,10 @@ from pathlib import Path
 
 import build_srt
 import db
+import gemini_files
 import transcript_signal as ts
 
-PROMPT_VERSION = 'post_kit_v1'
+PROMPT_VERSION = 'post_kit_v2'
 
 OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 
@@ -2197,32 +2198,18 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     api_key = read_api_key(key_path)
     print(f'OPENROUTER_KEY_SOURCE {key_path} (value never printed)')
 
-    vision_model = os.environ.get('CLPR_POST_KIT_VISION_MODEL', '').strip() or DEFAULT_VISION_MODEL
-    writer_model = os.environ.get('CLPR_POST_KIT_WRITER_MODEL', '').strip() or DEFAULT_WRITER_MODEL
-    fps = float(os.environ.get('CLPR_POST_KIT_FPS', '').strip() or DEFAULT_FPS)
-    media_resolution = (
-        os.environ.get('CLPR_POST_KIT_MEDIA_RESOLUTION', '').strip() or DEFAULT_MEDIA_RESOLUTION
+    # D-066: the run now loads TWO credentials, and a log naming only one is a
+    # half-truth. gemini_files.read_gemini_key resolves its own path (the
+    # CLPR_GEMINI_ENV override, else its own DEFAULT_GEMINI_KEY_ENV_PATH), the
+    # same shape read_api_key/DEFAULT_KEY_ENV_PATH use for OpenRouter above.
+    gemini_key_path = (
+        os.environ.get('CLPR_GEMINI_ENV', '').strip() or gemini_files.DEFAULT_GEMINI_KEY_ENV_PATH
     )
-    writer_temperature = float(os.environ.get('CLPR_POST_KIT_TEMPERATURE', '').strip() or 0.7)
+    gemini_key = gemini_files.read_gemini_key(gemini_key_path)
+    print(f'GEMINI_KEY_SOURCE {gemini_key_path} (value never printed)')
 
-    # Keyed by the LOGICAL parameter, with both snake_case and camelCase
-    # offered underneath it. Only what an endpoint publishes as allowed is ever
-    # sent, and a logical parameter counts as delivered when EITHER spelling
-    # lands (see build_provider_options).
-    desired = {
-        'media_resolution': {
-            'media_resolution': media_resolution,
-            'mediaResolution': media_resolution,
-        },
-        'fps': {
-            'video_metadata': {'fps': fps},
-            'videoMetadata': {'fps': fps},
-        },
-    }
-    endpoints = fetch_endpoints(vision_model, api_key)
-    print(f'VISION_ENDPOINTS model={vision_model} count={len(endpoints)}')
-    passthrough = build_provider_options(endpoints, desired)
-    log_passthrough(passthrough)
+    writer_model = os.environ.get('CLPR_POST_KIT_WRITER_MODEL', '').strip() or DEFAULT_WRITER_MODEL
+    writer_temperature = float(os.environ.get('CLPR_POST_KIT_TEMPERATURE', '').strip() or 0.7)
 
     subject = subject_block(
         subject_kind,
@@ -2231,158 +2218,129 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     )
     profile_text = profile_block(profile)
 
-    def make_vision_body(data_url: str) -> dict:
-        """The vision request, from a data URL. The body a clip UNDER the
-        ceiling produces here is byte-identical to the one this worker sent
-        before the ceiling existed: same keys, same order, same values.
+    # ---- D-066: THE VISION CALL MOVES TO THE GEMINI FILES API.
+    #
+    # THE OLD CEILING/DOWNSCALE MACHINERY STAYS DEFINED, JUST UNCALLED.
+    # payload_ceiling_bytes, transcode_for_analysis, encode_clip,
+    # clip_data_url_prefix, predicted_payload_bytes, the size_guard in
+    # openrouter_call, and their constants are untouched below -- Brief 4
+    # removes them. This path uploads the DELIVERED clip at full quality
+    # through gemini_files, which has no comparable request-body ceiling, so
+    # no downscale copy is ever built for analysis: THE DELIVERED CLIP IS
+    # NEVER MODIFIED, and there is no transcode on this path at all. That
+    # removes the exact failure mode that motivated this brief: on the same
+    # 15 seconds, full quality reported "the feed is intact for the whole
+    # clip" while a downscaled copy of identical footage reported black-frame
+    # cuts that do not exist in the file.
+    #
+    # THE OPENROUTER PROVIDER-PASSTHROUGH NEGOTIATION IS ALSO GONE FROM THIS
+    # PATH. fetch_endpoints/build_provider_options/log_passthrough (still
+    # defined below, untouched) existed only to get fps and media_resolution
+    # onto an OpenRouter vision request via provider.options, because
+    # n8n's native Gemini node exposes neither. Gemini's own API takes both
+    # natively -- MEASURED 2026-08-07: fps genuinely works on a Files API
+    # file_uri, a combination that appears in none of Google's own examples --
+    # so there is nothing left to negotiate here. post_kits.passthrough_degraded
+    # is written NULL below: the negotiation does not exist for this row, which
+    # is a different fact from "nothing was refused".
+    vision_prompt = build_vision_prompt(
+        subject, profile_text, product['transcript_lines'], duration_s)
 
-        It is a function so the size gate can serialise it with an EMPTY url and
-        measure the envelope exactly, without a second copy of the construction
-        that would drift from the one that actually goes out.
+    yavg = gemini_files.measure_motion(clip_path)
+    fps, fps_reason = gemini_files.choose_fps(yavg)
+    print(
+        f'VISION_CALL model={gemini_files.DEFAULT_GEMINI_MODEL} transport=gemini_files '
+        f'motion_yavg={yavg:.3f} fps={fps} fps_reason={fps_reason} '
+        '(request body never logged)'
+    )
+
+    def gemini_generate_call(file_uri: str) -> dict:
+        """generate_content, retried on transient faults only -- SAME SHAPE as
+        openrouter_call's retry loop (see below, unchanged): the same
+        retry_policy() (DEFAULT_MAX_ATTEMPTS and friends), no second policy
+        invented. Leaving openrouter_call behind on the vision path also
+        leaves behind its whole retry apparatus, and one part of that is
+        load-bearing: five of the six failures in the 27-clip batch were
+        empty completions that recovered on an unchanged retry. A Gemini path
+        without an equivalent retry would be weaker than what it replaces.
+
+        Retries GeminiEmptyCompletionError (the direct analogue of that
+        empty-completion case) and transient transport faults --
+        GeminiUnreachable unconditionally, and a GeminiHTTPError only on 429
+        or a 5xx, mirroring classify_failure's OpenRouter classification
+        above. Any other 4xx is not retried: a bad request does not fix
+        itself.
+
+        DELIBERATELY RETRIES ONLY THIS CALL, NOT THE UPLOAD. `file_uri` is the
+        ALREADY-UPLOADED file's URI, passed in once from the caller; nothing
+        in this closure re-uploads, so a retry here costs one more
+        generateContent call, never another upload of the whole clip.
         """
-        body: dict = {
-            'model': vision_model,
-            'messages': [{
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': build_vision_prompt(
-                        subject, profile_text, product['transcript_lines'], duration_s)},
-                    {'type': 'video_url', 'video_url': {'url': data_url}},
-                ],
-            }],
-        }
-        if passthrough['options']:
-            body['provider'] = {'options': passthrough['options']}
-        return body
-
-    # ---- THE PAYLOAD CEILING (D-064). CHECKED BEFORE SENDING, NEVER
-    # ---- DISCOVERED BY A 502.
-    #
-    # The clip is only STAT'd here, never read: a 90 MB file that cannot be sent
-    # must not first be loaded into memory and base64 encoded to find that out.
-    # The prediction is exact (see predicted_payload_bytes), so this decides on
-    # the same number the request would actually weigh.
-    ceiling = payload_ceiling_bytes()
-    envelope = body_bytes(make_vision_body(''))
-    source_bytes = clip_path.stat().st_size
-    source_payload = predicted_payload_bytes(
-        envelope, len(clip_data_url_prefix(clip_path)), source_bytes)
-    fits = source_payload <= ceiling
-    print(
-        f'CLIP_PAYLOAD_PLAN candidate={candidate_id} clip_bytes={source_bytes} '
-        f'envelope_bytes={envelope} predicted_payload_bytes={source_payload} '
-        f'ceiling_bytes={ceiling} fits={1 if fits else 0}'
-    )
-
-    downscale: dict | None = None
-    analysis_dir: str | None = None
-    try:
-        if fits:
-            # NOTHING CHANGES. No transcode, no temp file, no degradation, and a
-            # request body identical to the one this clip took yesterday.
-            analysis_path = clip_path
-        else:
-            print(
-                f'ANALYSIS_DOWNSCALE_REQUIRED candidate={candidate_id} the delivered clip is '
-                f'{_mb(source_bytes)} which would make a {_mb(source_payload)} request body, '
-                f'over the {_mb(ceiling)} ceiling. OpenRouter sits behind Cloudflare, whose '
-                'maximum request body is 100 MB, and an over-limit request comes back as a 502 '
-                'that falsely calls itself retryable. A THROWAWAY downscaled copy is being '
-                'transcoded for the vision model only. THE DELIVERED CLIP IS NOT TOUCHED and '
-                'does not change in any way.'
-            )
-            analysis_dir = tempfile.mkdtemp(prefix=f'clpr_post_kit_analysis_{candidate_id}_')
-            analysis_path = Path(analysis_dir) / 'analysis.mp4'
-            downscale = transcode_for_analysis(clip_path, analysis_path, envelope, ceiling)
-
-        data_url, raw_bytes, b64_chars = encode_clip(analysis_path)
-    finally:
-        # THE TEMP COPY DIES HERE, on success and on failure alike, and it dies
-        # as soon as it has been encoded rather than after the vision call: the
-        # retry loop re-sends the payload from MEMORY, so the file is dead
-        # weight the moment data_url exists.
-        if analysis_dir:
-            shutil.rmtree(analysis_dir, ignore_errors=True)
-            # ignore_errors=True keeps a temp-hygiene problem from aborting a
-            # run that has already paid for its transcode, but a swallowed error
-            # that leaves a video copy on disk must not read as a clean removal.
-            # So the removal is CHECKED rather than assumed, and a survivor gets
-            # its own distinct, greppable line instead of a quiet exists=True.
-            if Path(analysis_dir).exists():
+        policy = retry_policy()
+        attempts = policy['max_attempts']
+        for attempt in range(1, attempts + 1):
+            try:
+                return gemini_files.generate_content(
+                    file_uri, 'video/mp4', vision_prompt, gemini_key,
+                    fps=fps, media_resolution=DEFAULT_MEDIA_RESOLUTION)
+            except Exception as exc:  # noqa: BLE001 - classified immediately below
+                if isinstance(exc, gemini_files.GeminiEmptyCompletionError):
+                    retryable, reason = True, 'empty_completion'
+                elif isinstance(exc, gemini_files.GeminiUnreachable):
+                    retryable, reason = True, 'transport_or_timeout'
+                elif isinstance(exc, gemini_files.GeminiHTTPError):
+                    if exc.status == 429:
+                        retryable, reason = True, 'http_429_rate_limited'
+                    elif exc.status >= 500:
+                        retryable, reason = True, f'http_{exc.status}_server'
+                    else:
+                        retryable, reason = False, f'http_{exc.status}_client'
+                else:
+                    retryable, reason = False, type(exc).__name__
+                if not retryable:
+                    if attempt > 1:
+                        print(f'GEMINI_RETRY_ABANDONED attempt={attempt}/{attempts} '
+                              f'reason={reason} (not retryable, failing loudly)')
+                    raise
+                if attempt >= attempts:
+                    print(f'GEMINI_RETRIES_EXHAUSTED attempts={attempt}/{attempts} '
+                          f'reason={reason} (still failing, failing loudly)')
+                    raise
+                delay = retry_delay_s(attempt, policy, None)
                 print(
-                    f'ANALYSIS_TEMP_LEAKED path={analysis_dir} the throwaway analysis copy could '
-                    'NOT be deleted and is still on disk. The run continues, because the copy is '
-                    'already encoded and deleting it is not what this run is for, but this '
-                    'directory holds a video file and needs removing by hand. Nothing about the '
-                    'delivered clip is affected.'
+                    f'GEMINI_RETRY attempt={attempt}/{attempts} reason={reason} '
+                    f'delay_s={delay:.1f} error={exc}'
                 )
-            else:
-                print(f'ANALYSIS_TEMP_REMOVED {analysis_dir} exists=False')
+                time.sleep(delay)
+                continue
+        # Unreachable: the loop either returns or raises. Present so a future
+        # edit to the loop bounds cannot fall through to an implicit None.
+        raise gemini_files.GeminiError('GEMINI_RETRY_LOOP_FELL_THROUGH')
 
-    print(f'CLIP_ENCODED candidate={candidate_id} bytes={raw_bytes} base64_chars={b64_chars}')
-    if downscale is not None:
-        print(
-            f'ANALYSIS_DOWNSCALED candidate={candidate_id} '
-            f'source_bytes={downscale["source_bytes"]} sent_bytes={downscale["sent_bytes"]} '
-            f'source_payload_bytes={source_payload} '
-            f'sent_payload_bytes={downscale["predicted_payload_bytes"]} '
-            f'ceiling_bytes={ceiling} '
-            f'resolution={downscale["source_resolution"]}->{downscale["analysis_resolution"]} '
-            f'fps={downscale["source_fps"]}->{downscale["analysis_fps"]} '
-            f'attempts={len(downscale["attempts"])} '
-            'THE DELIVERED CLIP IS UNCHANGED, only the analysis copy was degraded.'
-        )
+    # 008's own docstring: "the delivered clip's size in bytes... recorded on
+    # every generated kit, downscaled or not... costs nothing to keep." No
+    # downscale ever happens on this path (that is the whole point of
+    # D-066), so analysis_source_bytes and analysis_sent_bytes stay equal --
+    # both the DELIVERED clip's real size, matching what migration 008's own
+    # undownscaled ("fits") case always wrote -- and analysis_downscale_detail
+    # stays NULL, the same as that case.
+    source_bytes = clip_path.stat().st_size
 
-    vision_body: dict = make_vision_body(data_url)
+    file_obj = gemini_files.upload_video(clip_path, gemini_key)
+    try:
+        active = gemini_files.wait_active(file_obj['name'], gemini_key)
+        # THE POSITIVE CONTROL: the witness that the real bytes reached
+        # Google. post_kits.gemini_sha256_match is the receipt that this ran.
+        witnesses = gemini_files.verify_upload(clip_path, active)
+        out = gemini_generate_call(active['uri'])
+    finally:
+        # In a finally so the remote file is removed on failure too. A leak
+        # must be loud but must NOT abort a run that already has its answer --
+        # delete_file itself never raises on a leak (see its own docstring),
+        # so this cannot mask a real result or a real failure raised above it.
+        gemini_files.delete_file(file_obj['name'], gemini_key)
 
-    # THE ACTUAL BODY, MEASURED, NOT THE PREDICTED ONE. A bitrate target is a
-    # prediction and so is an arithmetic model, so the thing that is finally
-    # about to be sent is weighed and refused if it is over. This is also what
-    # proves the prediction: sent_payload_bytes and predicted_payload_bytes are
-    # printed side by side on every run and must be equal.
-    actual_payload = body_bytes(vision_body)
-    if actual_payload > ceiling:
-        raise RuntimeError(
-            f'PAYLOAD_OVER_CEILING: the assembled vision request is {actual_payload} bytes '
-            f'({_mb(actual_payload)}), over the ceiling of {ceiling} bytes ({_mb(ceiling)}). '
-            'Refusing to send it: on this endpoint an over-limit body returns a 502 that '
-            'falsely declares itself retryable, so sending it would burn a full video upload '
-            'per attempt and fail identically every time. THE REAL FIX: send the clip through '
-            'the Gemini Files API, which uploads separately and has no request body limit. '
-            'Zero rows written.'
-        )
-    print(
-        f'PAYLOAD_OK candidate={candidate_id} predicted_payload_bytes='
-        f'{predicted_payload_bytes(envelope, len(clip_data_url_prefix(analysis_path)), raw_bytes)} '
-        f'actual_payload_bytes={actual_payload} ceiling_bytes={ceiling} '
-        f'headroom_bytes={ceiling - actual_payload}'
-    )
-
-    chat_url = f'{OPENROUTER_BASE}/chat/completions'
-
-    print(f'VISION_CALL model={vision_model} (request body never logged)')
-    # THE EXPENSIVE CALL, AND THE ONLY ONE CARRYING THE VIDEO.
-    #
-    # SAY THE COST HONESTLY. This is INVOKED once per run, but openrouter_call
-    # retries transient faults internally by re-sending the payload it was
-    # given, and that payload is this one, base64 clip included. So a run that
-    # hits four empty completions uploads the clip four times, and a provider
-    # that hangs costs VISION_TIMEOUT_S per attempt: at the shipped defaults
-    # (900s timeout, 4 attempts, 2+4+8s of backoff) the worst case for ONE clip
-    # is about 3614 seconds. That is the deliberate trade the retry policy was
-    # ruled on (five of six failures in the 27-clip batch recovered unchanged),
-    # and every attempt prints an OPENROUTER_RETRY line, so it is slow and
-    # LOUD, never silent. Tune it with CLPR_POST_KIT_MAX_ATTEMPTS.
-    #
-    # What IS true unconditionally: no WRITER path ever carries video. The
-    # writer payload is text only, so the no-quote fallback below cannot
-    # re-upload the clip no matter how many times it retries.
-    vision_response, scene = openrouter_call(
-        'vision', 'POST', chat_url, api_key, vision_body, VISION_TIMEOUT_S, expect_message=True,
-        # The ONLY call that carries video, so the ONLY one that can be rejected
-        # for size. The writer and the endpoints probe pass no guard and behave
-        # exactly as they did before this existed.
-        size_guard={'predicted_bytes': actual_payload, 'ceiling_bytes': ceiling})
+    scene = out['text']
     if len(scene) < MIN_SCENE_DESCRIPTION_CHARS:
         raise RuntimeError(
             f'VISION_RESPONSE_TOO_SHORT: the vision model returned {len(scene)} characters, '
@@ -2395,8 +2353,13 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     # expensive video call over a stylistic tic these models produce constantly,
     # and the retry could fail identically. The ban is scoped to its real blast
     # radius: the four platform-bound copy fields, which validate_kit gates.
-    vision_generation_id = str(vision_response.get('id') or '')
-    print(f'VISION_OK chars={len(scene)} generation_id={vision_generation_id}')
+    vision_generation_id = str(out['response_id'] or '')
+    print(
+        f'VISION_OK chars={len(scene)} generation_id={vision_generation_id} '
+        f'sha256_match={witnesses["sha256_match"]}'
+    )
+
+    chat_url = f'{OPENROUTER_BASE}/chat/completions'
 
     transcript_plain = product['transcript_plain']
 
@@ -2483,13 +2446,17 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         f'quoted={"1" if kit["quoted_line"] else "0"} quote_fallback={quote_fallback}'
     )
 
+    # D-066: fps and media_resolution are recorded as genuinely SENT (Gemini's
+    # API takes both natively, no passthrough negotiation involved), plus
+    # yavg and fps_reason so the fps choice is reconstructable after the fact.
+    # No passthrough_requested/accepted/dropped: that negotiation does not
+    # exist on this path (see passthrough_degraded below).
     vision_params = json.dumps({
-        'model': vision_model,
+        'model': gemini_files.DEFAULT_GEMINI_MODEL,
         'fps': fps,
-        'media_resolution': media_resolution,
-        'passthrough_requested': passthrough['requested'],
-        'passthrough_accepted': passthrough['accepted'],
-        'passthrough_dropped': passthrough['dropped'],
+        'fps_reason': fps_reason,
+        'media_resolution': DEFAULT_MEDIA_RESOLUTION,
+        'motion_yavg': yavg,
     }, sort_keys=True)
     writer_params = json.dumps({
         'model': writer_model,
@@ -2544,6 +2511,8 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 quote_fallback, quote_fallback_reason,
                 analysis_downscaled, analysis_source_bytes, analysis_sent_bytes,
                 analysis_downscale_detail,
+                analysis_transport, motion_yavg, fps_used, fps_reason,
+                gemini_file_name, gemini_sha256_match,
                 created_by_run, created_at
             ) VALUES (
                 %s, %s, 'generated', 1,
@@ -2559,6 +2528,8 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 %s, %s,
                 %s, %s, %s,
                 %s,
+                %s, %s, %s, %s,
+                %s, %s,
                 %s, %s
             ) RETURNING id
             ''',
@@ -2572,18 +2543,28 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 subject_kind,
                 context['version'] if context else None,
                 profile['version'] if profile else None,
-                vision_model, writer_model, PROMPT_VERSION,
+                gemini_files.DEFAULT_GEMINI_MODEL, writer_model, PROMPT_VERSION,
                 vision_generation_id, writer_generation_id,
-                vision_params, writer_params, 1 if passthrough['degraded'] else 0,
+                # D-066: the OpenRouter passthrough negotiation does not exist
+                # on this path, so NULL (the question does not apply) rather
+                # than 0 (nothing was refused) is the honest value here.
+                vision_params, writer_params, None,
                 quote_fallback, quote_fallback_reason,
-                # 008. A kit written from a degraded analysis input must never
-                # be indistinguishable from one written at full quality, so the
-                # real numbers travel with the row rather than only through a
-                # log line the operator may never scroll back to.
-                1 if downscale is not None else 0,
+                # 008. No downscale ever happens on the gemini_files path --
+                # that is the whole point of D-066 -- so analysis_downscaled
+                # is always 0, source and sent bytes are equal (both the
+                # DELIVERED clip's real size), and detail is NULL, exactly
+                # matching what migration 008's own undownscaled case wrote.
+                0,
                 source_bytes,
-                raw_bytes,
-                json.dumps(downscale, sort_keys=True) if downscale is not None else None,
+                source_bytes,
+                None,
+                # D-066: the new Gemini-transport provenance columns
+                # (migration 009). gemini_sha256_match is the receipt that
+                # verify_upload's positive control actually ran; it is never
+                # hardcoded, only the real witnesses result.
+                'gemini_files', yavg, fps, fps_reason,
+                file_obj['name'], witnesses['sha256_match'],
                 run_id, utc_now_iso(),
             ),
         )
@@ -2619,9 +2600,9 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
             'srt_text': product['srt_text'],
             'srt_segment_count': product['cue_count'],
             'quote_fallback': quote_fallback,
-            'analysis_downscaled': 1 if downscale is not None else 0,
+            'analysis_downscaled': 0,
             'analysis_source_bytes': source_bytes,
-            'analysis_sent_bytes': raw_bytes,
+            'analysis_sent_bytes': source_bytes,
         },
         candidate_id, version, 'generated',
         {'file_path': info['clip_file_path'], 'drive_sync_path': info['drive_sync_path']},
@@ -2632,9 +2613,9 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         f'version={version} deactivated={deactivated} wrote_rows=1 '
         f'srt_cues={product["cue_count"]} srt_basis={geom["basis"]} '
         f'hashtags={len(kit["hashtags"])} subject={subject_kind} '
-        f'passthrough_degraded={1 if passthrough["degraded"] else 0} '
+        f'analysis_transport=gemini_files gemini_sha256_match={witnesses["sha256_match"]} '
         f'quote_fallback={quote_fallback} '
-        f'analysis_downscaled={1 if downscale is not None else 0}'
+        f'analysis_downscaled=0'
         f'{result_file_fields(files)}'
     )
     return 0
