@@ -62,9 +62,21 @@ with no quoted line at all, and the already-paid vision result is reused. The
 kit row records that fallback (post_kits.quote_fallback + quote_fallback_reason,
 migration 007) because a kit that silently lost its quote to a fabrication
 otherwise looks identical to a clip that never had a quotable line. Every OTHER
-validation failure still fails loudly on the first try. Measured 2026-08-07:
-candidate 45 failed FOUR attempts on INVENTED_QUOTE, inventing a different
-plausible sentence each time, and ended the batch with no kit at all.
+validation failure that describes copy the model DID produce -- a banned dash,
+an over-length hook, a hashtag over the cap -- still fails loudly on the first
+try. Measured 2026-08-07: candidate 45 failed FOUR attempts on INVENTED_QUOTE,
+inventing a different plausible sentence each time, and ended the batch with no
+kit at all.
+
+A STRUCTURALLY INCOMPLETE RESPONSE IS A BAD ROLL, NOT A DEFECT, AND IT RETRIES.
+Added 2026-08-08: unparseable JSON, or a required field missing or empty,
+re-asks the IDENTICAL payload up to WRITER_STRUCTURAL_MAX_ATTEMPTS times
+(env CLPR_WRITER_STRUCTURAL_MAX_ATTEMPTS), reusing the already-paid vision
+result, and only then fails loudly. Candidate 1 failed on `on_video_text.payoff
+is missing or empty` and an IDENTICAL re-run succeeded with no code change,
+producing kit 32. The writer samples at temperature 0.7, so whether it emits
+every required key is a draw from a distribution, not a property of the clip.
+See MalformedWriterResponseError.
 
 THE PAYLOAD CEILING, CHECKED BEFORE SENDING (D-064). OpenRouter sits behind
 Cloudflare, whose standard maximum request body is 100 MB, and base64 inflates a
@@ -459,12 +471,17 @@ class PayloadTooLargeError(OpenRouterError):
 class InventedQuoteError(RuntimeError):
     """The copy contains a quotation that is NOT in the transcript.
 
-    Its own type because it is the ONE validation failure with a cheap, honest
-    remedy: the quote is optional, so the writer can be asked again for copy
-    with no quoted line at all. Every other validation failure still fails
-    loudly on the first try, and keeping them apart is a TYPE decision rather
-    than a string match so a reworded message can never silently widen the
-    retry (charter gate 10: specify the invariant, never a proxy).
+    Its own type because the quote is OPTIONAL, giving it a cheap, honest
+    remedy no other copy failure has: the writer can be asked again for copy
+    with no quoted line at all. It is one of exactly TWO validation failures
+    that do not fail on the first try. The other is
+    MalformedWriterResponseError, added 2026-08-08, which re-asks the IDENTICAL
+    payload because structural incompleteness was measured to be a sampling
+    wobble rather than a defect. Every remaining validation failure -- a banned
+    dash, an over-length hook, a hashtag over the cap -- still fails loudly on
+    the first try. Keeping them apart is a TYPE decision rather than a string
+    match so a reworded message can never silently widen the retry (charter
+    gate 10: specify the invariant, never a proxy).
     """
 
 
