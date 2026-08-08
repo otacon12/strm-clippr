@@ -74,7 +74,7 @@ an 89.4 MB clip made a 119.2 MB payload that returned 502 five times out of five
 That 502 called ITSELF retryable, so the retry policy below would have re-uploaded
 the whole video until the attempt cap, every run, forever. So the exact body size
 is computed from the file's size BEFORE the request is built, and when it would
-breach the ceiling (CLPR_POST_KIT_MAX_PAYLOAD_BYTES, default 80,000,000) a
+breach the ceiling (CLPR_POST_KIT_MAX_PAYLOAD_BYTES, default 50,000,000) a
 THROWAWAY downscaled copy is transcoded for the model alone and deleted the
 moment it is encoded. Operator ruling 2026-08-07, verbatim: "for now downscale".
 THE DELIVERED CLIP IS NEVER MODIFIED, a clip under the ceiling produces a
@@ -267,7 +267,21 @@ DEFAULT_RETRY_MAX_DELAY_S = 60.0  # also the ceiling on a provider's retry_after
 # one environment variable. So payload_ceiling_bytes() clamps, and it says so.
 # ---------------------------------------------------------------------------
 CLOUDFLARE_ASSUMED_MAX_BODY_BYTES = 100_000_000
-DEFAULT_PAYLOAD_CEILING_BYTES = 80_000_000
+# 80,000,000 was an ESTIMATE derived from Cloudflare's documented 100 MB with
+# headroom. Two live runs of c111 on 2026-08-07 refuted it, and the second one
+# is the informative one because the SYMPTOM CHANGED while the cause did not:
+#   attempt 1  -> 502 origin_bad_gateway   (claims "retryable": true)
+#   attempt 2  -> 400 "Invalid JSON payload received. Closing quote expected in
+#                 string."  <- Google's parser choking on a TRUNCATED body
+# A truncation is what an over-large request looks like once something upstream
+# cuts it instead of refusing it, so this size limit has now worn three masks in
+# one day: a container OOM, a "retryable" 502, and a JSON parse error. NONE of
+# them says "too big". The only honest handle on the real boundary is measured
+# evidence, and it brackets it: 47,200,000 bytes SUCCEEDED (c45, live), and
+# c111 failed twice below 80,000,000. So the default drops to just above the
+# largest payload actually proven to work, rather than being guessed high a
+# second time. Operator-approved 2026-08-07: "yes lower it to 50MB".
+DEFAULT_PAYLOAD_CEILING_BYTES = 50_000_000
 
 # A 502 on a request whose payload sits this close to the ceiling is treated as
 # a SIZE rejection and is never retried. See openrouter_call.
