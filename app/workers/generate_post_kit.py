@@ -226,6 +226,15 @@ DEFAULT_MAX_ATTEMPTS = 4          # 1 first try + 3 retries
 DEFAULT_RETRY_BASE_DELAY_S = 2.0  # doubled per attempt
 DEFAULT_RETRY_MAX_DELAY_S = 60.0  # also the ceiling on a provider's retry_after
 
+# A STRUCTURALLY INCOMPLETE WRITER RESPONSE IS A SAMPLING WOBBLE, NOT A DEFECT
+# (measured 2026-08-08, see MalformedWriterResponseError's own docstring):
+# candidate 1 failed with `on_video_text.payoff is missing or empty` and an
+# IDENTICAL re-run succeeded, same clip, same prompt, same model, no code
+# change. So unlike the other validation failures, the SAME writer ask is
+# worth repeating. 1 first try + 2 structural re-asks by default, env-tunable
+# for the same reason DEFAULT_MAX_ATTEMPTS above is.
+WRITER_STRUCTURAL_MAX_ATTEMPTS = 3
+
 # ---------------------------------------------------------------------------
 # THE PAYLOAD CEILING (D-064). MEASURED, not assumed.
 #
@@ -456,6 +465,32 @@ class InventedQuoteError(RuntimeError):
     loudly on the first try, and keeping them apart is a TYPE decision rather
     than a string match so a reworded message can never silently widen the
     retry (charter gate 10: specify the invariant, never a proxy).
+    """
+
+
+class MalformedWriterResponseError(RuntimeError):
+    """The writer returned a STRUCTURALLY incomplete response: unparseable JSON,
+    or a required field missing or empty.
+
+    Its own type, added 2026-08-08, because this class of failure was MEASURED
+    to be a sampling wobble rather than a defect. Candidate 1 failed with
+    `on_video_text.payoff is missing or empty` and then SUCCEEDED on an
+    identical re-run -- same clip, same prompt, same model, no code change --
+    producing kit 32. The writer runs at temperature 0.7, so "did the model
+    emit every required key this time" is a draw from a distribution, not a
+    property of the input.
+
+    That falsifies the reasoning this file carried until today, which grouped a
+    missing field with a banned dash and an over-length hook on the grounds
+    that "none of those is fixed by ... retrying them would only pay twice for
+    the same defect." True for a defect. A missing key is not a defect, it is a
+    bad roll, and the cost of treating it as permanent is the entire kit.
+
+    DELIBERATELY NARROW. Only structural incompleteness lives here. A banned
+    dash, an over-length hook, a hashtag over the cap and an invented quote all
+    keep their existing behaviour: those describe copy the model DID produce,
+    where a retry really would pay twice to be told the same thing. Split by
+    TYPE, never by message text, for the same reason as InventedQuoteError.
     """
 
 
@@ -1080,22 +1115,22 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
     try:
         data = json.loads(ts.extract_json_payload(raw_text))
     except (ValueError, TypeError) as exc:
-        raise RuntimeError(
+        raise MalformedWriterResponseError(
             f'MALFORMED_WRITER_RESPONSE: the writer model did not return parseable JSON '
             f'({exc}). First 400 chars, verbatim: {raw_text[:400]!r}. Zero rows written.'
         ) from exc
     if not isinstance(data, dict):
-        raise RuntimeError('MALFORMED_WRITER_RESPONSE: response is not a JSON object. Zero rows written.')
+        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: response is not a JSON object. Zero rows written.')
 
     hooks_raw = data.get('on_video_text')
     if not isinstance(hooks_raw, dict):
-        raise RuntimeError('MALFORMED_WRITER_RESPONSE: missing on_video_text object. Zero rows written.')
+        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: missing on_video_text object. Zero rows written.')
 
     hooks: dict = {}
     for key in ('withheld', 'domain', 'payoff'):
         value = hooks_raw.get(key)
         if not isinstance(value, str) or not value.strip():
-            raise RuntimeError(
+            raise MalformedWriterResponseError(
                 f'MALFORMED_WRITER_RESPONSE: on_video_text.{key} is missing or empty. '
                 'All three concreteness variants are required. Zero rows written.'
             )
@@ -1125,7 +1160,7 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
 
     caption = data.get('video_caption')
     if not isinstance(caption, str) or not caption.strip():
-        raise RuntimeError('MALFORMED_WRITER_RESPONSE: video_caption is missing or empty. Zero rows written.')
+        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: video_caption is missing or empty. Zero rows written.')
     caption = caption.strip()
     if len(caption) > MAX_CAPTION_CHARS:
         raise RuntimeError(
@@ -1142,7 +1177,7 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
         hashtags = []
         for item in hashtags_raw:
             if not isinstance(item, str) or not item.strip():
-                raise RuntimeError('MALFORMED_WRITER_RESPONSE: a hashtag is not a non-empty string. Zero rows written.')
+                raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: a hashtag is not a non-empty string. Zero rows written.')
             tag = item.strip()
             if not tag.startswith('#') or len(tag.split()) != 1 or len(tag) < 2:
                 raise RuntimeError(
@@ -1151,7 +1186,7 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
             _reject_banned_dash('hashtags', tag)
             hashtags.append(tag)
     else:
-        raise RuntimeError('MALFORMED_WRITER_RESPONSE: hashtags is not a list. Zero rows written.')
+        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: hashtags is not a list. Zero rows written.')
 
     if len(hashtags) > MAX_HASHTAGS:
         raise RuntimeError(
@@ -1163,7 +1198,7 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
     quoted = data.get('quoted_line')
     if quoted is not None:
         if not isinstance(quoted, str):
-            raise RuntimeError('MALFORMED_WRITER_RESPONSE: quoted_line is not a string or null. Zero rows written.')
+            raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: quoted_line is not a string or null. Zero rows written.')
         quoted = quoted.strip()
         if not quoted:
             quoted = None
@@ -2379,67 +2414,102 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
             }],
         }
 
-    print(f'WRITER_CALL model={writer_model} temperature={writer_temperature}')
-    writer_response, writer_text = openrouter_call(
-        'writer', 'POST', chat_url, api_key, writer_payload(False), WRITER_TIMEOUT_S,
-        expect_message=True)
-    writer_generation_id = str(writer_response.get('id') or '')
+    # THE STRUCTURAL RETRY. MalformedWriterResponseError was MEASURED
+    # (2026-08-08, see its own docstring) to be a sampling wobble, not a
+    # defect: candidate 1 failed with `on_video_text.payoff is missing or
+    # empty` and an IDENTICAL re-run succeeded, same clip, same prompt, same
+    # model, no code change. So unlike every other validation failure, the
+    # SAME ask is worth repeating. Bounded by WRITER_STRUCTURAL_MAX_ATTEMPTS
+    # (env CLPR_WRITER_STRUCTURAL_MAX_ATTEMPTS) so a persistently malformed
+    # writer still fails loudly rather than looping forever. Caught BY TYPE,
+    # never by matching message text (charter gate 10), so a reworded
+    # MALFORMED_WRITER_RESPONSE message can never silently widen the retry to
+    # cover a real defect. The InventedQuoteError fallback nested below is
+    # UNCHANGED: it still fires on its own type, independently of this loop.
+    structural_max_attempts = max(1, int(_env_number(
+        'CLPR_WRITER_STRUCTURAL_MAX_ATTEMPTS', WRITER_STRUCTURAL_MAX_ATTEMPTS)))
 
-    # THE NO-QUOTE FALLBACK. A fabricated quote costs ONE cheap writer call, not
-    # the whole kit. Measured 2026-08-07: candidate 45 failed FOUR separate
-    # attempts on INVENTED_QUOTE, fabricating a DIFFERENT plausible sentence
-    # every time, so that clip ended the batch with no kit at all. The quote is
-    # OPTIONAL and several kits that day shipped without one and read fine, so
-    # the honest remedy is to ask for copy with no quoted line rather than to
-    # throw the paid vision call away.
-    #
-    # SCOPED TO THE QUOTE, BY TYPE AND NOT BY MESSAGE. Only InventedQuoteError
-    # is caught. A banned dash, an over-length hook, a missing field or a
-    # hashtag over the cap still fails loudly on the FIRST try exactly as
-    # today, because none of those is fixed by dropping a quote and retrying
-    # them would only pay twice for the same defect.
     quote_fallback = 0
     quote_fallback_reason: str | None = None
-    try:
-        kit = validate_kit(writer_text, transcript_plain)
-    except InventedQuoteError as first_exc:
-        quote_fallback_reason = str(first_exc)
+    for structural_attempt in range(1, structural_max_attempts + 1):
+        label = 'writer' if structural_attempt == 1 else 'writer_structural_retry'
         print(
-            f'QUOTE_FALLBACK candidate={candidate_id} the writer fabricated a quotation, so it '
-            'is being re-asked ONCE for copy with no quoted line. The vision call is NOT '
-            f'repeated. First failure (verbatim): {first_exc}'
+            f'WRITER_CALL model={writer_model} temperature={writer_temperature} '
+            f'attempt={structural_attempt}/{structural_max_attempts}'
         )
-        # THE RETRY CALL IS INSIDE THIS try, NOT ABOVE IT, AND THAT PLACEMENT IS
-        # THE WHOLE POINT. The failure record written by generate() is built
-        # from whatever escapes here, so a retry that dies in TRANSPORT (a
-        # timeout, a 429 whose retries ran out) escaping bare would put a plain
-        # network error in post_kit_requests.error and the operator would never
-        # learn that a quotation had been fabricated at all. The fabrication is
-        # the fact worth keeping. Both failures travel together or the record is
-        # a half-truth.
+        writer_response, writer_text = openrouter_call(
+            label, 'POST', chat_url, api_key, writer_payload(False), WRITER_TIMEOUT_S,
+            expect_message=True)
+        writer_generation_id = str(writer_response.get('id') or '')
+
+        # THE NO-QUOTE FALLBACK. A fabricated quote costs ONE cheap writer call, not
+        # the whole kit. Measured 2026-08-07: candidate 45 failed FOUR separate
+        # attempts on INVENTED_QUOTE, fabricating a DIFFERENT plausible sentence
+        # every time, so that clip ended the batch with no kit at all. The quote is
+        # OPTIONAL and several kits that day shipped without one and read fine, so
+        # the honest remedy is to ask for copy with no quoted line rather than to
+        # throw the paid vision call away.
+        #
+        # SCOPED TO THE QUOTE, BY TYPE AND NOT BY MESSAGE. Only InventedQuoteError
+        # is caught. A banned dash, an over-length hook, a missing field or a
+        # hashtag over the cap still fails loudly on the FIRST try exactly as
+        # today, because none of those is fixed by dropping a quote and retrying
+        # them would only pay twice for the same defect.
         try:
-            writer_response, writer_text = openrouter_call(
-                'writer_no_quote', 'POST', chat_url, api_key, writer_payload(True),
-                WRITER_TIMEOUT_S, expect_message=True)
-            writer_generation_id = str(writer_response.get('id') or '')
             kit = validate_kit(writer_text, transcript_plain)
-        except Exception as second_exc:
-            # Deliberately NOT "also failed validation": the second failure may
-            # now be a transport fault, and naming it as a validation failure
-            # would be a paraphrase of a machine outcome. The verbatim SECOND
-            # says which kind it actually was.
-            raise RuntimeError(
-                'QUOTE_FALLBACK_FAILED: the writer fabricated a quotation, and the no-quote '
-                'retry ALSO failed. Both failures, verbatim. FIRST: '
-                f'{first_exc} SECOND: {type(second_exc).__name__}: {second_exc} '
-                'Zero rows written.'
-            ) from second_exc
-        quote_fallback = 1
-        print(
-            f'QUOTE_FALLBACK_OK candidate={candidate_id} the rewritten copy validated. This '
-            'kit LOST ITS QUOTE to a fabrication, and post_kits.quote_fallback records that so '
-            'it cannot be mistaken for a clip that simply had no quotable line.'
-        )
+            break
+        except InventedQuoteError as first_exc:
+            quote_fallback_reason = str(first_exc)
+            print(
+                f'QUOTE_FALLBACK candidate={candidate_id} the writer fabricated a quotation, so it '
+                'is being re-asked ONCE for copy with no quoted line. The vision call is NOT '
+                f'repeated. First failure (verbatim): {first_exc}'
+            )
+            # THE RETRY CALL IS INSIDE THIS try, NOT ABOVE IT, AND THAT PLACEMENT IS
+            # THE WHOLE POINT. The failure record written by generate() is built
+            # from whatever escapes here, so a retry that dies in TRANSPORT (a
+            # timeout, a 429 whose retries ran out) escaping bare would put a plain
+            # network error in post_kit_requests.error and the operator would never
+            # learn that a quotation had been fabricated at all. The fabrication is
+            # the fact worth keeping. Both failures travel together or the record is
+            # a half-truth.
+            try:
+                writer_response, writer_text = openrouter_call(
+                    'writer_no_quote', 'POST', chat_url, api_key, writer_payload(True),
+                    WRITER_TIMEOUT_S, expect_message=True)
+                writer_generation_id = str(writer_response.get('id') or '')
+                kit = validate_kit(writer_text, transcript_plain)
+            except Exception as second_exc:
+                # Deliberately NOT "also failed validation": the second failure may
+                # now be a transport fault, and naming it as a validation failure
+                # would be a paraphrase of a machine outcome. The verbatim SECOND
+                # says which kind it actually was.
+                raise RuntimeError(
+                    'QUOTE_FALLBACK_FAILED: the writer fabricated a quotation, and the no-quote '
+                    'retry ALSO failed. Both failures, verbatim. FIRST: '
+                    f'{first_exc} SECOND: {type(second_exc).__name__}: {second_exc} '
+                    'Zero rows written.'
+                ) from second_exc
+            quote_fallback = 1
+            print(
+                f'QUOTE_FALLBACK_OK candidate={candidate_id} the rewritten copy validated. This '
+                'kit LOST ITS QUOTE to a fabrication, and post_kits.quote_fallback records that so '
+                'it cannot be mistaken for a clip that simply had no quotable line.'
+            )
+            break
+        except MalformedWriterResponseError as structural_exc:
+            if structural_attempt >= structural_max_attempts:
+                raise
+            # This file's own rule: "a run that only worked on the third try
+            # must never read as a clean first try." Every retry is printed,
+            # never swallowed.
+            print(
+                f'WRITER_STRUCTURAL_RETRY candidate={candidate_id} '
+                f'attempt={structural_attempt}/{structural_max_attempts} re-asking the SAME '
+                'payload -- candidate 1 (2026-08-08) failed this way and an identical re-run '
+                f'succeeded. Verbatim reason: {structural_exc}'
+            )
+            continue
 
     print(
         f'WRITER_OK generation_id={writer_generation_id} hashtags={len(kit["hashtags"])} '
