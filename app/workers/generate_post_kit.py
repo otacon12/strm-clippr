@@ -243,16 +243,21 @@ DEFAULT_RETRY_MAX_DELAY_S = 60.0  # also the ceiling on a provider's retry_after
 # THE ARITHMETIC FOR THE DEFAULT. Cloudflare's documented limit is 100 MB, which
 # is ambiguous between 100 * 1000 * 1000 and 100 * 1024 * 1024. The conservative
 # reading is the decimal one, 100,000,000 bytes, so that is what is assumed.
-# 80,000,000 leaves 20,000,000 bytes of headroom, i.e. 20% under the decimal
-# reading and 23.7% under the binary one. That headroom absorbs the JSON
-# envelope, the prompt, the transcript and any per-connection overhead, and it
-# still sits well ABOVE the largest payload measured working (47.2 MB), so no
-# clip that succeeds today is pushed into a downscale by this number.
+# The first default, 80,000,000, was chosen from that arithmetic alone: 20%
+# under the decimal reading, enough to absorb the JSON envelope, the prompt and
+# the transcript. **IT WAS REFUTED BY MEASUREMENT** (see the constant below):
+# c111 failed twice beneath it. Arithmetic headroom against a documented limit
+# is not evidence that a request will be accepted, because the limit that
+# actually bites may not be the one that is documented. The default is now set
+# from the measured boundary instead, and the paragraph above is kept because
+# the 100 MB reading it establishes is still what the hard clamp uses.
 #
 # WHY IT IS ENV TUNABLE, AND THIS IS NOT DECORATION. If the true limit turns out
-# to be BELOW 80 MB, the 502 guard in openrouter_call converts what would
-# otherwise be an endless retry into one line telling the operator to lower this
-# number. A one-variable fix, with no code change and no rebuild.
+# to be BELOW the current default, the 502 guard in openrouter_call converts
+# what would otherwise be an endless retry into one line telling the operator to
+# lower this number. A one-variable fix, with no code change and no rebuild.
+# That is exactly the path that produced the 50 MB default: the guard fired, the
+# operator re-ran as it instructed, and the second failure settled it.
 #
 # AND IT TUNES IN ONE DIRECTION ONLY: DOWN. CLPR_POST_KIT_MAX_PAYLOAD_BYTES can
 # lower the ceiling and can never raise it past
