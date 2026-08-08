@@ -2450,11 +2450,16 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         # the honest remedy is to ask for copy with no quoted line rather than to
         # throw the paid vision call away.
         #
-        # SCOPED TO THE QUOTE, BY TYPE AND NOT BY MESSAGE. Only InventedQuoteError
-        # is caught. A banned dash, an over-length hook, a missing field or a
-        # hashtag over the cap still fails loudly on the FIRST try exactly as
-        # today, because none of those is fixed by dropping a quote and retrying
-        # them would only pay twice for the same defect.
+        # SCOPED BY TYPE, NEVER BY MESSAGE. This except clause catches only
+        # InventedQuoteError; the structural retry below catches only
+        # MalformedWriterResponseError. A banned dash, an over-length hook and
+        # a hashtag over the cap are caught by NEITHER and still fail loudly on
+        # the first try, because none of those is fixed by dropping a quote or
+        # by re-asking, and retrying them would only pay twice for the same
+        # defect. A missing or empty required field USED to sit in that list
+        # and no longer does -- it was measured on 2026-08-08 to be a sampling
+        # wobble that clears on an identical re-ask, so it moved to the
+        # structural retry. See MalformedWriterResponseError's docstring.
         try:
             kit = validate_kit(writer_text, transcript_plain)
             break
