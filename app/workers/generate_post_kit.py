@@ -55,6 +55,34 @@ same shape as transcript_signal_ingest.py's response gating):
     volunteered is a self-report, and a model that simply omits the
     declaration walks straight past it
 
+A FABRICATED QUOTE COSTS A RETRY, NOT THE KIT. The quote is OPTIONAL: kits
+ship without one and read fine. So when validation fails SPECIFICALLY because a
+quotation is not in the transcript, the WRITER alone is re-asked once, for copy
+with no quoted line at all, and the already-paid vision result is reused. The
+kit row records that fallback (post_kits.quote_fallback + quote_fallback_reason,
+migration 007) because a kit that silently lost its quote to a fabrication
+otherwise looks identical to a clip that never had a quotable line. Every OTHER
+validation failure still fails loudly on the first try. Measured 2026-08-07:
+candidate 45 failed FOUR attempts on INVENTED_QUOTE, inventing a different
+plausible sentence each time, and ended the batch with no kit at all.
+
+TRANSIENT TRANSPORT FAULTS RETRY THEMSELVES. Of 27 clips in that same batch, 6
+failed and 5 of those succeeded on an IDENTICAL later retry with no code
+change: five OPENROUTER_EMPTY_CONTENTs and a 502 whose own body said
+"retryable":true,"retry_after":60. So 429, 5xx, timeouts and empty completions
+are retried (honouring retry_after when supplied, else exponential backoff, cap
+and delays env-tunable), while any other 4xx is not, because a bad request does
+not fix itself. Every retry is logged with its attempt number and reason: a run
+that only worked on the third try must never read as a clean first try.
+
+THE WORKER OWNS ITS OWN FAILURE RECORD. All 6 of those failures left
+post_kit_requests completely EMPTY, because a request row was only ever created
+by the review server's endpoint and the batch invoked this CLI. In the review
+UI the failed clips looked like nothing had ever been attempted. Now a run with
+no outstanding request opens one itself, so there is ALWAYS a row to close:
+satisfied on success, failed with the reason verbatim on any failure, written
+on a separate connection that COMMITS while the kit transaction rolls back.
+
 WHAT IT DELIVERS. With CLPR_POSTKIT_OUT (or --kit-out-dir) set, the run writes
 two files named after the DELIVERED clip so they sort beside its mp4 in Drive:
 `<clip-stem>.vN.txt` (the copy, always) and `<clip-stem>.vN.srt` (the captions,
@@ -107,9 +135,11 @@ import argparse
 import base64
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -152,6 +182,27 @@ DEFAULT_MEDIA_RESOLUTION = 'MEDIA_RESOLUTION_HIGH'
 VISION_TIMEOUT_S = 900
 WRITER_TIMEOUT_S = 180
 PROBE_TIMEOUT_S = 60
+
+# ONE TRUTH for the writer's token ceiling: it is sent in the request AND
+# recorded in post_kits.writer_params, and two copies of it would drift.
+WRITER_MAX_TOKENS = 1400
+
+# TRANSIENT FAILURES RETRY THEMSELVES (measured on the 27-clip batch of
+# 2026-08-07). Six clips failed on the first pass and FIVE of them succeeded on
+# an IDENTICAL later retry with no code change at all: candidates 5, 7, 15, 44
+# and 54 each returned one OPENROUTER_EMPTY_CONTENT and then worked, and a 502
+# from OpenRouter's edge carried a body that itself said
+# `"retryable":true,"retry_after":60`. A failure the provider DECLARES
+# retryable, that this project then measured recovering unchanged, is a
+# transport fault, not a result. It is retried here instead of costing an
+# operator round trip.
+#
+# The cap and the delays are env-tunable because the right numbers depend on
+# the batch: a 27-clip run wants patience, a single hand run wants to fail
+# fast. Defaults are deliberately modest.
+DEFAULT_MAX_ATTEMPTS = 4          # 1 first try + 3 retries
+DEFAULT_RETRY_BASE_DELAY_S = 2.0  # doubled per attempt
+DEFAULT_RETRY_MAX_DELAY_S = 60.0  # also the ceiling on a provider's retry_after
 
 # Research limits, enforced here AND in the 003 CHECK constraints. TikTok's own
 # creative guidance is 5-10 words per second of reading, so a hook read in the
@@ -235,11 +286,85 @@ def read_api_key(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Typed failures. A retry policy that classifies by matching substrings of an
+# error MESSAGE is a proxy for the property (charter 1.5): the property is
+# "what kind of fault was this", and only the raise site knows. So the raise
+# site says so, in the type, and carries the status code and the provider's own
+# retry_after with it.
+# ---------------------------------------------------------------------------
+
+class OpenRouterError(RuntimeError):
+    """Anything that went wrong talking to OpenRouter."""
+
+
+class OpenRouterHTTPError(OpenRouterError):
+    """A real HTTP status came back. `status` decides retryability, never prose."""
+
+    def __init__(self, message: str, status: int, retry_after: float | None = None):
+        super().__init__(message)
+        self.status = int(status)
+        self.retry_after = retry_after
+
+
+class OpenRouterUnreachable(OpenRouterError):
+    """No status at all: DNS, connection, reset, or a timeout. Always transient."""
+
+
+class OpenRouterEmptyContent(OpenRouterError):
+    """A 200 whose completion carried no text. MEASURED transient on this project."""
+
+
+class InventedQuoteError(RuntimeError):
+    """The copy contains a quotation that is NOT in the transcript.
+
+    Its own type because it is the ONE validation failure with a cheap, honest
+    remedy: the quote is optional, so the writer can be asked again for copy
+    with no quoted line at all. Every other validation failure still fails
+    loudly on the first try, and keeping them apart is a TYPE decision rather
+    than a string match so a reworded message can never silently widen the
+    retry (charter gate 10: specify the invariant, never a proxy).
+    """
+
+
+def _find_retry_after(node, depth: int = 0) -> float | None:
+    """OpenRouter's own `retry_after`, wherever in the error body it sits.
+
+    Measured verbatim on this project 2026-08-07: a 502 from the edge returned a
+    body stating `"retryable":true,"retry_after":60`. The exact nesting is not
+    contracted anywhere, so the value is searched for rather than assumed at a
+    path that may move.
+    """
+    if depth > 6:
+        return None
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ('retry_after', 'retryAfter', 'retry_after_seconds') and isinstance(
+                    value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        for value in node.values():
+            found = _find_retry_after(value, depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_retry_after(value, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+# ---------------------------------------------------------------------------
 # HTTP seam — ONE function, so a test can stand in front of the network
 # ---------------------------------------------------------------------------
 
 def _http_json(method: str, url: str, api_key: str, payload: dict | None, timeout: int) -> dict:
-    """The single HTTP seam. Never logs the key, the body, or the base64."""
+    """The single HTTP seam. Never logs the key, the body, or the base64.
+
+    Deliberately carries NO retry logic. The retry lives one level up in
+    openrouter_call(), because this function is the seam a test stubs: a policy
+    implemented below the seam would be deleted by its own test (charter gate
+    14, a stub silently deletes the thing under test).
+    """
     data = None
     headers = {
         'Authorization': f'Bearer {api_key}',
@@ -254,27 +379,201 @@ def _http_json(method: str, url: str, api_key: str, payload: dict | None, timeou
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode('utf-8', errors='replace')
+    # ORDER MATTERS AND IS NOT COSMETIC: HTTPError is a subclass of URLError,
+    # which is a subclass of OSError, and TimeoutError IS socket.timeout and is
+    # also an OSError. A broader clause first would swallow the narrower case
+    # and every 4xx would look like a transient transport fault.
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode('utf-8', errors='replace')[:800]
-        raise RuntimeError(
+        retry_after: float | None = None
+        header_value = None
+        try:
+            header_value = exc.headers.get('Retry-After') if exc.headers else None
+        except Exception:  # noqa: BLE001 - a malformed header must never mask the status
+            header_value = None
+        if header_value:
+            try:
+                retry_after = float(str(header_value).strip())
+            except ValueError:
+                retry_after = None
+        if retry_after is None:
+            try:
+                retry_after = _find_retry_after(json.loads(detail))
+            except (ValueError, TypeError):
+                retry_after = None
+        raise OpenRouterHTTPError(
             f'OPENROUTER_HTTP_ERROR: {method} {url} returned status {exc.code}. '
-            f'Response body (first 800 chars, verbatim): {detail!r}'
+            f'Response body (first 800 chars, verbatim): {detail!r}',
+            status=exc.code,
+            retry_after=retry_after,
         ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f'OPENROUTER_UNREACHABLE: {method} {url} failed: {exc!r}') from exc
+        raise OpenRouterUnreachable(
+            f'OPENROUTER_UNREACHABLE: {method} {url} failed: {exc!r}') from exc
+    except (TimeoutError, OSError) as exc:
+        # A read that times out mid-body raises socket.timeout/OSError directly,
+        # NOT a URLError, so without this clause the single most obviously
+        # transient failure there is would have escaped the retry policy.
+        raise OpenRouterUnreachable(
+            f'OPENROUTER_UNREACHABLE: {method} {url} failed: {exc!r}') from exc
 
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(
+        raise OpenRouterError(
             f'OPENROUTER_BAD_JSON: {method} {url} did not return JSON ({exc}). '
             f'First 400 chars, verbatim: {body[:400]!r}'
         ) from exc
     if not isinstance(parsed, dict):
-        raise RuntimeError(f'OPENROUTER_BAD_JSON: {method} {url} returned a non-object payload')
+        raise OpenRouterError(f'OPENROUTER_BAD_JSON: {method} {url} returned a non-object payload')
     if 'error' in parsed and parsed['error']:
-        raise RuntimeError(f'OPENROUTER_API_ERROR: {parsed["error"]!r}')
+        # AN ERROR CAN ARRIVE INSIDE A 200. When that error object carries a
+        # NUMERIC code, that code is the same fact an HTTP status is, so it is
+        # classified the same way and a rate limit does not stop being a rate
+        # limit for having travelled in the body. Only a genuinely numeric code
+        # is trusted: a string code like 'invalid_request' is left as a plain,
+        # NON-retryable OpenRouterError, which is the conservative direction
+        # (fail loudly rather than pay twice for the same rejection).
+        code = None
+        if isinstance(parsed['error'], dict):
+            raw_code = parsed['error'].get('code')
+            if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+                code = raw_code
+            elif isinstance(raw_code, str) and raw_code.strip().isdigit():
+                code = int(raw_code.strip())
+        message = f'OPENROUTER_API_ERROR: {parsed["error"]!r}'
+        if code is not None and (code == 429 or code >= 500):
+            raise OpenRouterHTTPError(message, status=code,
+                                      retry_after=_find_retry_after(parsed))
+        raise OpenRouterError(message)
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# The retry policy, ABOVE the seam
+# ---------------------------------------------------------------------------
+
+def _env_number(name: str, default: float) -> float:
+    """A numeric env override, or the default. NON-FINITE IS NOT A NUMBER HERE.
+
+    float() happily accepts 'nan', 'inf' and '1e400', and every one of them is
+    poison downstream: int(nan) raises ValueError, int(inf) raises
+    OverflowError, and time.sleep(inf) parks the run forever. Each of those
+    would escape this function's own WARN path and either abort the run from
+    inside a config read or hang it silently, so finiteness is checked HERE,
+    once, rather than at each of the three call sites that could be bitten.
+    """
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f'WARN {name}={raw!r} is not a number, using the default {default}. '
+            'The value is ignored, never guessed at.',
+            file=sys.stderr,
+        )
+        return default
+    if not math.isfinite(value):
+        print(
+            f'WARN {name}={raw!r} is not a finite number, using the default {default}. '
+            'The value is ignored, never guessed at.',
+            file=sys.stderr,
+        )
+        return default
+    return value
+
+
+def retry_policy() -> dict:
+    """Attempts and delays, env-tunable, floored so a bad value cannot disable
+    the first attempt itself."""
+    return {
+        'max_attempts': max(1, int(_env_number('CLPR_POST_KIT_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS))),
+        'base_delay_s': max(0.0, _env_number('CLPR_POST_KIT_RETRY_BASE_DELAY_S',
+                                             DEFAULT_RETRY_BASE_DELAY_S)),
+        'max_delay_s': max(0.0, _env_number('CLPR_POST_KIT_RETRY_MAX_DELAY_S',
+                                            DEFAULT_RETRY_MAX_DELAY_S)),
+    }
+
+
+def classify_failure(exc: BaseException) -> tuple[bool, str]:
+    """(retryable, reason). Retryable means the SAME request may work unchanged.
+
+    Retryable: 429, any 5xx, any transport fault or timeout, and an empty
+    completion. NOT retryable: any other 4xx (a bad request does not fix
+    itself), a non-JSON body, an error object in a 200, and every validation
+    failure, which is about the CONTENT and would come back identical.
+    """
+    if isinstance(exc, OpenRouterEmptyContent):
+        return True, 'empty_completion'
+    if isinstance(exc, OpenRouterUnreachable):
+        return True, 'transport_or_timeout'
+    if isinstance(exc, OpenRouterHTTPError):
+        if exc.status == 429:
+            return True, 'http_429_rate_limited'
+        if exc.status >= 500:
+            return True, f'http_{exc.status}_server'
+        return False, f'http_{exc.status}_client'
+    return False, type(exc).__name__
+
+
+def retry_delay_s(attempt: int, policy: dict, retry_after: float | None) -> float:
+    """Honour the provider's own retry_after when it supplies one, else back off
+    exponentially. Both are capped: a rogue retry_after of 3600 must not park a
+    27-clip batch for an hour."""
+    if retry_after is not None and retry_after > 0:
+        return min(float(retry_after), policy['max_delay_s'])
+    return min(policy['base_delay_s'] * (2 ** (attempt - 1)), policy['max_delay_s'])
+
+
+def openrouter_call(which: str, method: str, url: str, api_key: str, payload: dict | None,
+                    timeout: int, expect_message: bool) -> tuple[dict, str | None]:
+    """One OpenRouter call, retried on transient faults only.
+
+    EVERY retry is logged with its attempt number and its reason, so a run that
+    only succeeded on the third try can never read as a clean first-try success.
+
+    `expect_message` pulls the completion text INSIDE the loop on purpose: an
+    empty completion is a 200, so a policy that only saw the HTTP layer could
+    not retry the single most common transient failure this project measured.
+
+    A retry re-sends the payload it was given and nothing else. The vision
+    payload is the only one that carries video, and the writer payload is text
+    only, so a writer retry can never re-upload a clip.
+    """
+    policy = retry_policy()
+    attempts = policy['max_attempts']
+    for attempt in range(1, attempts + 1):
+        try:
+            response = _http_json(method, url, api_key, payload, timeout)
+            text = message_text(response, which) if expect_message else None
+        except Exception as exc:  # noqa: BLE001 - classified immediately below
+            retryable, reason = classify_failure(exc)
+            if not retryable:
+                if attempt > 1:
+                    print(f'OPENROUTER_RETRY_ABANDONED call={which} attempt={attempt}/{attempts} '
+                          f'reason={reason} (not retryable, failing loudly)')
+                raise
+            if attempt >= attempts:
+                print(f'OPENROUTER_RETRIES_EXHAUSTED call={which} attempts={attempt}/{attempts} '
+                      f'reason={reason} (still failing, failing loudly)')
+                raise
+            delay = retry_delay_s(attempt, policy, getattr(exc, 'retry_after', None))
+            print(
+                f'OPENROUTER_RETRY call={which} attempt={attempt}/{attempts} reason={reason} '
+                f'delay_s={delay:.1f} '
+                f'provider_retry_after={getattr(exc, "retry_after", None)} error={exc}'
+            )
+            time.sleep(delay)
+            continue
+        if attempt > 1:
+            print(f'OPENROUTER_RETRY_SUCCEEDED call={which} attempt={attempt}/{attempts} '
+                  '(this run was NOT a clean first try)')
+        return response, text
+    # Unreachable: the loop either returns or raises. Present so a future edit
+    # to the loop bounds cannot fall through to an implicit None.
+    raise OpenRouterError(f'OPENROUTER_RETRY_LOOP_FELL_THROUGH: call={which}')
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +595,12 @@ def fetch_endpoints(model: str, api_key: str) -> list[dict]:
     video is encoded or uploaded.
     """
     url = f'{OPENROUTER_BASE}/models/{model}/endpoints'
-    payload = _http_json('GET', url, api_key, None, PROBE_TIMEOUT_S)
+    # Retried like every other OpenRouter call: this probe is cheap, carries no
+    # video, and a 502 on it would otherwise abort a run before the paid work
+    # even started. An unknown model slug raises OPENROUTER_NO_ENDPOINTS below,
+    # which is NOT retryable and still fails on the first try.
+    payload, _ = openrouter_call(
+        'endpoints', 'GET', url, api_key, None, PROBE_TIMEOUT_S, expect_message=False)
     data = payload.get('data')
     if isinstance(data, dict):
         endpoints = data.get('endpoints')
@@ -477,7 +781,30 @@ def build_vision_prompt(subject: str, profile: str, transcript_lines: str, durat
 
 
 def build_writer_prompt(subject: str, profile: str, scene: str, transcript_plain: str,
-                        duration_s: float) -> str:
+                        duration_s: float, forbid_quotes: bool = False) -> str:
+    """The writer prompt. With forbid_quotes, the ONLY difference is that no
+    quotation of any kind may appear.
+
+    That variant is the no-quote fallback (see the header): the quote is
+    optional, so a fabricated one costs one cheap writer call rather than the
+    whole kit. Everything else about the prompt is byte-identical, so the
+    retry is a rewrite of the same brief and not a different job.
+    """
+    if forbid_quotes:
+        quote_rule = (
+            '- DO NOT QUOTE ANYTHING AT ALL. Your previous attempt returned a quotation that '
+            'does NOT appear in the transcript, which means it was never said. Write this kit '
+            'with NO quoted line: return null for quoted_line, and use no double quotation '
+            'marks anywhere in the hooks or the video caption. Describe what was said in your '
+            'own words instead. A kit with no quote is completely normal and is what is wanted '
+            'here.\n'
+        )
+    else:
+        quote_rule = (
+            '- If you use a direct quote, it must appear WORD FOR WORD in the transcript, and '
+            'you must also return it in the quoted_line field so it can be checked. If you '
+            'quote nothing, return null for quoted_line.\n'
+        )
     return (
         'You write short-form social copy for one vertical video clip. The copy is a '
         'SUGGESTION: a human reviews and edits every word before anything is posted.\n\n'
@@ -510,9 +837,7 @@ def build_writer_prompt(subject: str, profile: str, scene: str, transcript_plain
         '- NEVER invent a fact, a number, a name, a product or a quote. Everything you '
         'write must be supported by the scene description or the transcript above. If you '
         'do not know something, leave it out.\n'
-        '- If you use a direct quote, it must appear WORD FOR WORD in the transcript, and '
-        'you must also return it in the quoted_line field so it can be checked. If you '
-        'quote nothing, return null for quoted_line.\n'
+        + quote_rule +
         '- Do not use the em dash character (U+2014) anywhere. Use commas, colons, '
         'parentheses or periods.\n'
         '- No emoji in the on-video lines.\n'
@@ -559,7 +884,7 @@ def _reject_invented_quotation(field: str, value: str, transcript_plain: str) ->
         if len(normalised.split()) < MIN_QUOTED_SPAN_WORDS:
             continue
         if not normalised or normalised not in haystack:
-            raise RuntimeError(
+            raise InventedQuoteError(
                 f'INVENTED_QUOTE: {field} contains the quotation {span!r}, which does not '
                 'appear in the transcript of the shipped clip. The model put words in '
                 "somebody's mouth. It is rejected whether or not it was declared in "
@@ -671,7 +996,7 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
         else:
             _reject_banned_dash('quoted_line', quoted)
             if _normalise_quote(quoted) not in _normalise_quote(transcript_plain):
-                raise RuntimeError(
+                raise InventedQuoteError(
                     f'INVENTED_QUOTE: quoted_line {quoted!r} does not appear in the '
                     'transcript of the shipped clip. The model fabricated a line that was '
                     'never said. Zero rows written.'
@@ -690,7 +1015,10 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
 def message_text(response: dict, which: str) -> str:
     choices = response.get('choices') or []
     if not choices:
-        raise RuntimeError(f'OPENROUTER_NO_CHOICES: the {which} response carried no choices')
+        # Same family as an empty completion: a 200 that carried no result. It
+        # is retryable for the same measured reason.
+        raise OpenRouterEmptyContent(
+            f'OPENROUTER_NO_CHOICES: the {which} response carried no choices')
     message = (choices[0] or {}).get('message') or {}
     content = message.get('content')
     if isinstance(content, list):
@@ -700,7 +1028,27 @@ def message_text(response: dict, which: str) -> str:
         )
     text = str(content or '').strip()
     if not text:
-        raise RuntimeError(f'OPENROUTER_EMPTY_CONTENT: the {which} response carried no text content')
+        # An empty completion is LOUD but was not DIAGNOSTIC: on a 27-clip batch
+        # five candidates failed here and the message could not distinguish a
+        # safety refusal from a truncated reasoning budget from a provider that
+        # simply returned nothing. finish_reason and usage are already in the
+        # response and are the only things that tell those apart, so they are
+        # reported. `refusal` and `reasoning` are surfaced as PRESENCE and
+        # LENGTH only: a refusal string can quote the input, and this text is
+        # written to logs the operator reads on stream.
+        choice = choices[0] or {}
+        usage = response.get('usage') or {}
+        reasoning = message.get('reasoning')
+        raise OpenRouterEmptyContent(
+            f'OPENROUTER_EMPTY_CONTENT: the {which} response carried no text content '
+            f'(finish_reason={choice.get("finish_reason")!r} '
+            f'native_finish_reason={choice.get("native_finish_reason")!r} '
+            f'refusal_present={message.get("refusal") is not None} '
+            f'reasoning_chars={len(reasoning) if isinstance(reasoning, str) else 0} '
+            f'prompt_tokens={usage.get("prompt_tokens")} '
+            f'completion_tokens={usage.get("completion_tokens")} '
+            f'provider={response.get("provider")!r})'
+        )
     return text
 
 
@@ -760,7 +1108,7 @@ def fetch_active_kit_full(cur, candidate_id: int) -> dict | None:
     cur.execute(
         'SELECT id, version, origin, hook_withheld, hook_domain, hook_payoff, '
         'video_caption, hashtags, quoted_line, srt_text, srt_segment_count, '
-        'srt_basis, created_at '
+        'srt_basis, created_at, quote_fallback, quote_fallback_reason '
         'FROM post_kits WHERE candidate_id = %s AND is_active = 1',
         (candidate_id,),
     )
@@ -781,6 +1129,10 @@ def fetch_active_kit_full(cur, candidate_id: int) -> dict | None:
         'srt_segment_count': int(row[10] or 0),
         'srt_basis': row[11],
         'created_at': row[12],
+        # 007. Carried so a RE-DELIVERED .txt says the same thing about its
+        # quote as the one written on the day the kit was generated.
+        'quote_fallback': int(row[13] or 0),
+        'quote_fallback_reason': row[14],
     }
 
 
@@ -828,6 +1180,79 @@ def fetch_outstanding_requests(cur, candidate_id: int) -> list[dict]:
     ]
 
 
+SELF_REQUEST_ACTOR = 'worker:generate_post_kit'
+
+
+def open_self_request(candidate_id: int) -> int | None:
+    """Open this worker's OWN request row when nothing else asked for this kit.
+
+    WHY THIS EXISTS, MEASURED. On the 27-clip batch of 2026-08-07 six clips
+    failed and post_kit_requests was left completely EMPTY, because a request
+    row is only ever created by the review server's endpoint and the batch
+    invoked this CLI directly. In the review UI those six clips looked like
+    nothing had ever been attempted, which is exactly the dishonest-failure
+    pattern this project keeps paying for: a failure that leaves no trace is
+    indistinguishable from a clip nobody has got to yet.
+
+    So the worker owns its own record. There is now ALWAYS a row to close:
+    'satisfied' with the version on success, 'failed' with the reason verbatim
+    on any failure.
+
+    THREE PROPERTIES THIS MUST HAVE, and each one is a real trap:
+
+    1. ITS OWN CONNECTION, COMMITTED IMMEDIATELY. The read phase ends in a
+       rollback and the write phase rolls back on any failure, so a row written
+       on either connection would vanish precisely when it is needed.
+    2. IT NEVER CHANGES WHAT THE RUN DOES. An operator's request row means
+       "regenerate". This row means only "a run happened", so the caller never
+       reads it back as an intent: it is created AFTER the skip gates and the
+       regenerate/force decision, and it is deliberately not part of them.
+    3. IT NEVER FAILS THE RUN. It is provenance. If the ledger cannot be
+       written the real work still stands, and the inability to record is
+       itself reported loudly to stderr.
+
+    active_version_at_request is the honest current MAX(version), the same
+    value the review server records, so a row orphaned by a hard kill (SIGKILL,
+    a lost container) reads as an unanswered request and the next run completes
+    the dead run's intent. That is the correct queue semantics, not a leak.
+    """
+    try:
+        conn = db.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                'SELECT COALESCE(MAX(version), 0) FROM post_kits WHERE candidate_id = %s',
+                (candidate_id,),
+            )
+            active_version = int(cur.fetchone()[0])
+            cur.execute(
+                'INSERT INTO post_kit_requests('
+                '  candidate_id, active_version_at_request, force_over_operator_edit, '
+                '  state, requested_by, requested_at'
+                ") VALUES (%s, %s, 0, 'requested', %s, %s) RETURNING id",
+                (candidate_id, active_version, SELF_REQUEST_ACTOR, utc_now_iso()),
+            )
+            new_id = int(cur.fetchone()[0])
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - provenance must never fail the run
+        print(
+            f'REQUEST_SELF_OPEN_FAILED candidate={candidate_id}: {exc!r}. This run will produce '
+            'no post_kit_requests row, so a failure below would be invisible in the review UI. '
+            'The run itself continues.',
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f'REQUEST_SELF_OPENED id={new_id} candidate={candidate_id} by={SELF_REQUEST_ACTOR} '
+        f'active_version_at_request={active_version} (nobody asked for this kit through the '
+        'review UI, so the worker owns the record: there is now something to mark satisfied or '
+        'failed, and a failure cannot look like a clip nobody attempted)'
+    )
+    return new_id
+
+
 def mark_requests_satisfied(cur, request_ids: list[int], version: int) -> int:
     """Close EVERY outstanding request, not just the newest one.
 
@@ -848,11 +1273,22 @@ def mark_requests_satisfied(cur, request_ids: list[int], version: int) -> int:
 def mark_requests_failed(request_ids: list[int], reason: str) -> None:
     """Record a refusal or failure against the requests it answers.
 
-    Its own connection, because the caller's transaction is being rolled back:
-    a failed run persists NO kit (charter gate 9), and this is the loud report,
-    not a partial result. The reason is stored VERBATIM. This function never
-    raises: a marker that cannot be written must not replace the real error
-    with its own, so it prints and returns.
+    THE TRANSACTION BOUNDARY IS THE SUBTLE PART, so it is stated rather than
+    implied. Its own connection, because the caller's transaction is being
+    rolled back: a failed run persists NO kit (charter gate 9), and this is the
+    loud report, not a partial result. The kit rolls back and the FAILURE
+    RECORD commits, and those two facts must be on two different connections
+    for both to be true at once. The reason is stored VERBATIM. This function
+    never raises: a marker that cannot be written must not replace the real
+    error with its own, so it prints and returns.
+
+    ONLY STILL-OPEN REQUESTS ARE MARKED. `state = 'requested'` in the WHERE
+    clause is what stops a failure AFTER the kit committed (a file write, an
+    SRT write) from rewriting an already-satisfied row into a failure and
+    contradicting the kit sitting in the database. The ledger answers "is a kit
+    owed", and once the kit exists the answer is no. The run still exits
+    non-zero, and re-running is free because an existing active kit is
+    re-delivered rather than regenerated.
     """
     if not request_ids:
         return
@@ -862,7 +1298,8 @@ def mark_requests_failed(request_ids: list[int], reason: str) -> None:
         try:
             cur = conn.cursor()
             cur.execute(
-                "UPDATE post_kit_requests SET state = 'failed', error = %s WHERE id = ANY(%s)",
+                "UPDATE post_kit_requests SET state = 'failed', error = %s "
+                "WHERE id = ANY(%s) AND state = 'requested'",
                 (text, request_ids),
             )
             marked = cur.rowcount
@@ -981,6 +1418,35 @@ def render_kit_text(kit: dict, candidate_id: int, version: int, origin: str,
         lines.append('')
         lines.append('QUOTED LINE (checked word for word against the transcript)')
         lines.append(f'  {kit["quoted_line"]}')
+    if int(kit.get('quote_fallback') or 0) == 1:
+        # A kit that silently lost its quote to a fabrication looks exactly
+        # like a clip that never had a quotable line. It is not the same thing,
+        # and the operator reads this file, so it says so here as well as in
+        # the kit row.
+        #
+        # TWO WORDINGS, BECAUSE THE REWRITE DOES NOT ALWAYS DROP THE QUOTE. The
+        # no-quote prompt ASKS for quoted_line null, and a model is free to
+        # return a real one anyway, which validate_kit then checks word for
+        # word against the transcript and accepts. A single wording saying the
+        # copy "was rewritten with no quoted line" would then sit directly
+        # underneath a QUOTED LINE block in the same file and contradict it.
+        # The quote that survives is real, so the note says what is true of
+        # THIS file rather than what was asked for.
+        lines.append('')
+        lines.append('NOTE ON THE QUOTE')
+        if kit.get('quoted_line'):
+            lines.append(
+                '  The first draft of this kit quoted a line that does not appear in the '
+                'transcript of this clip. That draft was rejected in full and the copy was '
+                'rewritten. The quoted line above is from the rewrite and was checked word '
+                'for word against the transcript. Nothing invented reached this file.'
+            )
+        else:
+            lines.append(
+                '  The first draft of this kit quoted a line that does not appear in the '
+                'transcript of this clip. That draft was rejected in full and the copy was '
+                'rewritten with no quoted line. Nothing invented reached this file.'
+            )
     lines.append('')
     return '\n'.join(lines) + '\n'
 
@@ -1061,11 +1527,23 @@ def generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str |
     raises, those rows are marked 'failed' with the reason verbatim and the
     ORIGINAL exception is re-raised unchanged: the review UI gets a failure it
     can render, the exit code stays honest, and no kit row is written.
+
+    BaseException, NOT Exception, AND THE DIFFERENCE IS A REAL ROW. Ctrl-C
+    during the vision call is a KeyboardInterrupt, which `except Exception`
+    does not catch, so the self-request row this run opened would be left
+    'requested' forever and the NEXT run would read that orphan back as an
+    operator's regenerate intent it never expressed. open_self_request's
+    docstring rules that acceptable for a HARD kill (SIGKILL, a lost
+    container), and it is: nothing can run then. An interrupt is different
+    precisely because it IS catchable, so it is caught, the row is closed with
+    the reason verbatim, and the interrupt is re-raised unchanged so the exit
+    code and the traceback are exactly what they were. mark_requests_failed
+    never raises, so this clause cannot swallow the original.
     """
     consumed: list[int] = []
     try:
         return _generate(candidate_id, regenerate, force, slices_dir, srt_out, out_dir, consumed)
-    except Exception as exc:
+    except BaseException as exc:
         mark_requests_failed(consumed, f'{type(exc).__name__}: {exc}')
         raise
 
@@ -1108,11 +1586,27 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         if int(toggle_row[0]) != 1:
             conn.rollback()
             if consumed:
+                # NAME WHO ASKED. fetch_outstanding_requests does not filter on
+                # requested_by, so an outstanding row here is not necessarily
+                # the operator's: a previous run of THIS worker that was killed
+                # after opening its own row leaves an orphan that reads back as
+                # an unanswered request (open_self_request's docstring rules
+                # that the correct queue semantics). Telling the operator "a
+                # regenerate was requested" when only the worker asked would be
+                # a claim about his intent that he never made, so the requesters
+                # are quoted from the rows instead. The behaviour is unchanged
+                # and deliberately so: raising is what closes the row (the
+                # wrapper marks it failed), and a request that can never be
+                # answered must not wait in the review UI forever.
+                by = sorted({r['requested_by'] for r in requests})
                 raise RuntimeError(
                     f'POST_KIT_DISABLED: candidate_id={candidate_id} has clip_candidates'
-                    '.post_kit_enabled = 0, so no kit may be generated for it, but a '
-                    'regenerate was requested. Turn the per-clip generate switch back on in '
-                    'the review UI and ask again. Zero rows written.'
+                    '.post_kit_enabled = 0, so no kit may be generated for it, but request(s) '
+                    f'{consumed} are outstanding, opened by {by}. If that is you, turn the '
+                    'per-clip generate switch back on in the review UI and ask again. If it is '
+                    f'{SELF_REQUEST_ACTOR}, it is an earlier run of this worker that was killed '
+                    'before it could close its own row, and this failure closes it. Zero rows '
+                    'written.'
                 )
             print(
                 f'RESULT generate_post_kit candidate={candidate_id} ok=1 skipped=1 '
@@ -1141,6 +1635,27 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 f'{result_file_fields(files)}'
             )
             return 0
+
+        # PAST EVERY SKIP GATE: this run is now committed to doing the work (or
+        # to refusing it loudly just below), so from here on a failure must be
+        # visible. When nothing in the review UI asked for this kit, the worker
+        # opens its own request row so there is always something to close.
+        # Placed HERE, not earlier, on purpose: a disabled clip and an
+        # already-kitted clip are no-ops that must not leave ledger rows, so a
+        # run that skips at either gate leaves the ledger exactly as it found
+        # it and never manufactures a request nobody made.
+        #
+        # BE PRECISE ABOUT WHAT POST_KIT_DISABLED FIRES ON, because it is NOT
+        # "a real operator request". fetch_outstanding_requests has no
+        # requested_by filter, so an orphaned row from a killed earlier run of
+        # this worker also satisfies it. That is correct (the row is owed an
+        # answer either way) and it is why the raise names its requesters
+        # rather than asserting the operator asked.
+        if not consumed:
+            self_request_id = open_self_request(candidate_id)
+            if self_request_id is not None:
+                consumed.append(self_request_id)
+
         if existing is not None and existing['origin'] == 'operator_edit' and not force:
             raise RuntimeError(
                 f'OPERATOR_EDIT_ACTIVE: candidate_id={candidate_id} has an active kit the '
@@ -1252,10 +1767,27 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     if passthrough['options']:
         vision_body['provider'] = {'options': passthrough['options']}
 
+    chat_url = f'{OPENROUTER_BASE}/chat/completions'
+
     print(f'VISION_CALL model={vision_model} (request body never logged)')
-    vision_response = _http_json(
-        'POST', f'{OPENROUTER_BASE}/chat/completions', api_key, vision_body, VISION_TIMEOUT_S)
-    scene = message_text(vision_response, 'vision')
+    # THE EXPENSIVE CALL, AND THE ONLY ONE CARRYING THE VIDEO.
+    #
+    # SAY THE COST HONESTLY. This is INVOKED once per run, but openrouter_call
+    # retries transient faults internally by re-sending the payload it was
+    # given, and that payload is this one, base64 clip included. So a run that
+    # hits four empty completions uploads the clip four times, and a provider
+    # that hangs costs VISION_TIMEOUT_S per attempt: at the shipped defaults
+    # (900s timeout, 4 attempts, 2+4+8s of backoff) the worst case for ONE clip
+    # is about 3614 seconds. That is the deliberate trade the retry policy was
+    # ruled on (five of six failures in the 27-clip batch recovered unchanged),
+    # and every attempt prints an OPENROUTER_RETRY line, so it is slow and
+    # LOUD, never silent. Tune it with CLPR_POST_KIT_MAX_ATTEMPTS.
+    #
+    # What IS true unconditionally: no WRITER path ever carries video. The
+    # writer payload is text only, so the no-quote fallback below cannot
+    # re-upload the clip no matter how many times it retries.
+    vision_response, scene = openrouter_call(
+        'vision', 'POST', chat_url, api_key, vision_body, VISION_TIMEOUT_S, expect_message=True)
     if len(scene) < MIN_SCENE_DESCRIPTION_CHARS:
         raise RuntimeError(
             f'VISION_RESPONSE_TOO_SHORT: the vision model returned {len(scene)} characters, '
@@ -1271,26 +1803,89 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     vision_generation_id = str(vision_response.get('id') or '')
     print(f'VISION_OK chars={len(scene)} generation_id={vision_generation_id}')
 
-    writer_body = {
-        'model': writer_model,
-        'max_tokens': 1400,
-        'temperature': writer_temperature,
-        'messages': [{
-            'role': 'user',
-            'content': build_writer_prompt(
-                subject, profile_text, scene, product['transcript_plain'], duration_s),
-        }],
-    }
+    transcript_plain = product['transcript_plain']
+
+    def writer_payload(forbid_quotes: bool) -> dict:
+        """The writer request. TEXT ONLY: no video part appears anywhere in it,
+        which is what makes a writer retry cheap and keeps the vision upload at
+        exactly one per run."""
+        return {
+            'model': writer_model,
+            'max_tokens': WRITER_MAX_TOKENS,
+            'temperature': writer_temperature,
+            'messages': [{
+                'role': 'user',
+                'content': build_writer_prompt(
+                    subject, profile_text, scene, transcript_plain, duration_s,
+                    forbid_quotes=forbid_quotes),
+            }],
+        }
+
     print(f'WRITER_CALL model={writer_model} temperature={writer_temperature}')
-    writer_response = _http_json(
-        'POST', f'{OPENROUTER_BASE}/chat/completions', api_key, writer_body, WRITER_TIMEOUT_S)
-    writer_text = message_text(writer_response, 'writer')
+    writer_response, writer_text = openrouter_call(
+        'writer', 'POST', chat_url, api_key, writer_payload(False), WRITER_TIMEOUT_S,
+        expect_message=True)
     writer_generation_id = str(writer_response.get('id') or '')
 
-    kit = validate_kit(writer_text, product['transcript_plain'])
+    # THE NO-QUOTE FALLBACK. A fabricated quote costs ONE cheap writer call, not
+    # the whole kit. Measured 2026-08-07: candidate 45 failed FOUR separate
+    # attempts on INVENTED_QUOTE, fabricating a DIFFERENT plausible sentence
+    # every time, so that clip ended the batch with no kit at all. The quote is
+    # OPTIONAL and several kits that day shipped without one and read fine, so
+    # the honest remedy is to ask for copy with no quoted line rather than to
+    # throw the paid vision call away.
+    #
+    # SCOPED TO THE QUOTE, BY TYPE AND NOT BY MESSAGE. Only InventedQuoteError
+    # is caught. A banned dash, an over-length hook, a missing field or a
+    # hashtag over the cap still fails loudly on the FIRST try exactly as
+    # today, because none of those is fixed by dropping a quote and retrying
+    # them would only pay twice for the same defect.
+    quote_fallback = 0
+    quote_fallback_reason: str | None = None
+    try:
+        kit = validate_kit(writer_text, transcript_plain)
+    except InventedQuoteError as first_exc:
+        quote_fallback_reason = str(first_exc)
+        print(
+            f'QUOTE_FALLBACK candidate={candidate_id} the writer fabricated a quotation, so it '
+            'is being re-asked ONCE for copy with no quoted line. The vision call is NOT '
+            f'repeated. First failure (verbatim): {first_exc}'
+        )
+        # THE RETRY CALL IS INSIDE THIS try, NOT ABOVE IT, AND THAT PLACEMENT IS
+        # THE WHOLE POINT. The failure record written by generate() is built
+        # from whatever escapes here, so a retry that dies in TRANSPORT (a
+        # timeout, a 429 whose retries ran out) escaping bare would put a plain
+        # network error in post_kit_requests.error and the operator would never
+        # learn that a quotation had been fabricated at all. The fabrication is
+        # the fact worth keeping. Both failures travel together or the record is
+        # a half-truth.
+        try:
+            writer_response, writer_text = openrouter_call(
+                'writer_no_quote', 'POST', chat_url, api_key, writer_payload(True),
+                WRITER_TIMEOUT_S, expect_message=True)
+            writer_generation_id = str(writer_response.get('id') or '')
+            kit = validate_kit(writer_text, transcript_plain)
+        except Exception as second_exc:
+            # Deliberately NOT "also failed validation": the second failure may
+            # now be a transport fault, and naming it as a validation failure
+            # would be a paraphrase of a machine outcome. The verbatim SECOND
+            # says which kind it actually was.
+            raise RuntimeError(
+                'QUOTE_FALLBACK_FAILED: the writer fabricated a quotation, and the no-quote '
+                'retry ALSO failed. Both failures, verbatim. FIRST: '
+                f'{first_exc} SECOND: {type(second_exc).__name__}: {second_exc} '
+                'Zero rows written.'
+            ) from second_exc
+        quote_fallback = 1
+        print(
+            f'QUOTE_FALLBACK_OK candidate={candidate_id} the rewritten copy validated. This '
+            'kit LOST ITS QUOTE to a fabrication, and post_kits.quote_fallback records that so '
+            'it cannot be mistaken for a clip that simply had no quotable line.'
+        )
+
     print(
         f'WRITER_OK generation_id={writer_generation_id} hashtags={len(kit["hashtags"])} '
-        f'quoted={"1" if kit["quoted_line"] else "0"}'
+        f'quoted={"1" if kit["quoted_line"] else "0"} quote_fallback={quote_fallback}'
     )
 
     vision_params = json.dumps({
@@ -1304,7 +1899,7 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     writer_params = json.dumps({
         'model': writer_model,
         'temperature': writer_temperature,
-        'max_tokens': writer_body['max_tokens'],
+        'max_tokens': WRITER_MAX_TOKENS,
     }, sort_keys=True)
 
     # ---- Phase 3: ONE transaction. Deactivate-old and insert-new commit
@@ -1351,6 +1946,7 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 vision_model, writer_model, prompt_version,
                 vision_generation_id, writer_generation_id,
                 vision_params, writer_params, passthrough_degraded,
+                quote_fallback, quote_fallback_reason,
                 created_by_run, created_at
             ) VALUES (
                 %s, %s, 'generated', 1,
@@ -1363,6 +1959,7 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 %s, %s, %s,
                 %s, %s,
                 %s, %s, %s,
+                %s, %s,
                 %s, %s
             ) RETURNING id
             ''',
@@ -1379,6 +1976,7 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                 vision_model, writer_model, PROMPT_VERSION,
                 vision_generation_id, writer_generation_id,
                 vision_params, writer_params, 1 if passthrough['degraded'] else 0,
+                quote_fallback, quote_fallback_reason,
                 run_id, utc_now_iso(),
             ),
         )
@@ -1413,6 +2011,7 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
             'quoted_line': kit['quoted_line'],
             'srt_text': product['srt_text'],
             'srt_segment_count': product['cue_count'],
+            'quote_fallback': quote_fallback,
         },
         candidate_id, version, 'generated',
         {'file_path': info['clip_file_path'], 'drive_sync_path': info['drive_sync_path']},
@@ -1423,7 +2022,8 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         f'version={version} deactivated={deactivated} wrote_rows=1 '
         f'srt_cues={product["cue_count"]} srt_basis={geom["basis"]} '
         f'hashtags={len(kit["hashtags"])} subject={subject_kind} '
-        f'passthrough_degraded={1 if passthrough["degraded"] else 0}'
+        f'passthrough_degraded={1 if passthrough["degraded"] else 0} '
+        f'quote_fallback={quote_fallback}'
         f'{result_file_fields(files)}'
     )
     return 0
