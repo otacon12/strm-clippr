@@ -86,8 +86,39 @@ def is_obs_gate_refusal(exc: Exception) -> bool:
     return 'OBS is actively' in str(exc)
 
 
-def delivered_name(session_label: str, candidate_id: int, category: str) -> str:
-    return f'{session_label}_c{candidate_id}_{category}.mp4'
+def offset_label(start_s: float) -> str:
+    """Format a within-recording offset as fixed-width HHhMMmSSs (D-068).
+
+    Zero-padding is load-bearing: this string is what the delivered filename
+    sorts on, and alphabetical sort must equal chronological sort within a
+    session. Without fixed width, '14m32s' sorts ABOVE '1h02m11s' as text (the
+    character '1' is compared to '1' first, then 'h' vs '4' decides it wrong).
+    Hours are NOT clamped or wrapped: a 474-minute stream offset is
+    '07h54m00s', two digits regardless of how large the hour count gets.
+    """
+    total_s = int(start_s)
+    hours, remainder = divmod(total_s, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours:02d}h{minutes:02d}m{seconds:02d}s'
+
+
+def delivered_name(session_label: str, start_s: float, category: str, candidate_id: int) -> str:
+    """The ONE delivered-clip filename convention (D-068), built here and
+    nowhere else: <session_label>_<offset>_<category>_c<candidate_id>.mp4,
+    e.g. 2026-08-04_1910_00h14m32s_funny_c109.mp4.
+
+    - session_label already carries date + stream start (Clip Finder derives
+      it from the VOD filename); it is used exactly as given, never
+      reformatted here.
+    - offset is start_s (the candidate's position within the recording)
+      formatted fixed-width via offset_label() so that alphabetical sort
+      equals chronological sort — see offset_label's docstring for why the
+      zero-padding is load-bearing.
+    - category is 'unknown' when absent, as today.
+    - candidate_id is last, always in the same position, as the handle back
+      to the row.
+    """
+    return f'{session_label}_{offset_label(start_s)}_{category}_c{candidate_id}.mp4'
 
 
 def fetch_approved(cur) -> list[dict]:
@@ -226,7 +257,7 @@ def is_sync_eligible(cand: dict) -> bool:
 
 def dest_path_for(drive_sync_dir: str, cand: dict) -> Path:
     return Path(drive_sync_dir) / delivered_name(
-        cand['session_label'], cand['candidate_id'], cand['category']
+        cand['session_label'], cand['start_s'], cand['category'], cand['candidate_id']
     )
 
 

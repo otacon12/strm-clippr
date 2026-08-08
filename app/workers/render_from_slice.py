@@ -32,8 +32,10 @@ cut_clip.py — those settings are operator-proven on a live Instagram post
 (D-023); change nothing.
 
 Output: $CLPR_RENDER_OUT (default /home/node/.n8n-files, the n8n file-node
-allow-list dir, D-044) / <session_label>_c<candidate_id>_<category>.mp4 —
-the descriptive delivery name (deliver_approved.py naming ruling, 2026-08-06).
+allow-list dir, D-044) / <session_label>_<offset>_<category>_c<candidate_id>.mp4
+(e.g. 2026-08-04_1910_00h14m32s_funny_c109.mp4) — the ONE delivered-clip
+naming convention, built by deliver_approved.delivered_name() and imported
+here rather than reimplemented (D-068, 2026-08-07).
 
 D-063 BURNED-IN SPEECH CAPTIONS (2026-08-07 ruling: "C" — on demand, a UI
 option while approving). When clip_candidates.burn_captions = 1 this render
@@ -91,6 +93,22 @@ from pathlib import Path
 
 import db
 import slice_geometry
+
+try:
+    import deliver_approved
+except ModuleNotFoundError:
+    from . import deliver_approved
+# NOTE: imported as the WHOLE module (deliver_approved.delivered_name), not
+# `from deliver_approved import delivered_name` -- the latter is a real
+# ImportError here. deliver_approved imports cut_clip, which imports THIS
+# module (render_from_slice), which was importing deliver_approved: a
+# 3-module cycle. `from X import Y` needs Y to already exist on X's
+# (partially-initialized) module object at that point in the chain, and it
+# does not yet -- deliver_approved's `import cut_clip` line runs before its
+# `delivered_name` def. `import X` (binding the module, not the name) defers
+# attribute access to call time, by which point every module has finished
+# loading, so it is safe -- confirmed empirically (see verification output).
+# This matches cut_clip.py's own existing pattern for importing THIS module.
 
 # Containment tolerance (seconds): absorbs container-duration rounding; this
 # check is a safety net against edits the slice cannot serve, not frame-exact.
@@ -749,7 +767,9 @@ def render_from_slice(candidate_id: int) -> int:
             )
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f'{cand["session_label"]}_c{candidate_id}_{cand["category"]}.mp4'
+        out_path = out_dir / deliver_approved.delivered_name(
+            cand['session_label'], cand['start_s'], cand['category'], candidate_id
+        )
 
         if out_path.exists():
             out_path.unlink()
