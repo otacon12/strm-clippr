@@ -107,10 +107,12 @@ def offset_label(start_s: float) -> str:
     return f'{hours:02d}h{minutes:02d}m{seconds:02d}s'
 
 
-def delivered_name(session_label: str, start_s: float, category: str, candidate_id: int) -> str:
+def delivered_name(session_label: str, start_s: float, category: str, candidate_id: int,
+                    render_seq: int = 1) -> str:
     """The ONE delivered-clip filename convention (D-068), built here and
     nowhere else: <session_label>_<offset>_<category>_c<candidate_id>.mp4,
-    e.g. 2026-08-04_1910_00h14m32s_funny_c109.mp4.
+    e.g. 2026-08-04_1910_00h14m32s_funny_c109.mp4 — and, versioned re-renders
+    (migration 011): ..._c<candidate_id>_r<render_seq>.mp4 for render_seq > 1.
 
     - session_label already carries date + stream start (Clip Finder derives
       it from the VOD filename); it is used exactly as given, never
@@ -122,8 +124,22 @@ def delivered_name(session_label: str, start_s: float, category: str, candidate_
     - category is 'unknown' when absent, as today.
     - candidate_id is last, always in the same position, as the handle back
       to the row.
+    - render_seq (clips.render_seq, migration 011) defaults to 1 — a fresh
+      clips row's own DEFAULT — and at 1 this function returns EXACTLY the
+      name it has always produced, byte-identical to every pre-migration-011
+      caller and every existing delivered file. Only render_seq > 1 (a
+      RE-render of the SAME candidate — the ON CONFLICT (candidate_id) DO
+      UPDATE path every render worker's upsert already takes, bumping this
+      column) appends _r<render_seq> before the extension, so a re-render
+      never lands on the same, indistinguishable filename as the render it
+      replaces (operator ask, 2026-08-09: "regen should save a new video
+      with descriptive txt, ie reg1 or something like that").
     """
-    return f'{session_label}_{offset_label(start_s)}_{category}_c{candidate_id}.mp4'
+    base = f'{session_label}_{offset_label(start_s)}_{category}_c{candidate_id}'
+    seq = int(render_seq) if render_seq is not None else 1
+    if seq <= 1:
+        return f'{base}.mp4'
+    return f'{base}_r{seq}.mp4'
 
 
 def fetch_approved(cur) -> list[dict]:
@@ -149,7 +165,8 @@ def fetch_approved(cur) -> list[dict]:
                cl.file_path, cl.state, cl.drive_synced_at,
                {category_select} AS category,
                c.burn_captions, cl.captions_burned,
-               cl.captions_requested, cl.captions_cue_count
+               cl.captions_requested, cl.captions_cue_count,
+               cl.render_seq
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
         LEFT JOIN clips cl ON cl.candidate_id = c.id
@@ -182,6 +199,12 @@ def fetch_approved(cur) -> list[dict]:
             # one of them is a reason to refuse a delivery.
             'captions_requested': int(r[10]) if r[10] is not None else None,
             'captions_cue_count': int(r[11]) if r[11] is not None else None,
+            # migration 011: NULL only when no clips row exists yet (never
+            # rendered) — reads as 1, matching the DEFAULT a fresh render's
+            # own INSERT will take, so dest_path_for's name for an as-yet-
+            # unrendered candidate agrees with what the render is about to
+            # produce.
+            'render_seq': int(r[12]) if r[12] is not None else 1,
         })
     return out
 
@@ -262,7 +285,8 @@ def is_sync_eligible(cand: dict) -> bool:
 
 def dest_path_for(drive_sync_dir: str, cand: dict) -> Path:
     return Path(drive_sync_dir) / delivered_name(
-        cand['session_label'], cand['start_s'], cand['category'], cand['candidate_id']
+        cand['session_label'], cand['start_s'], cand['category'], cand['candidate_id'],
+        cand.get('render_seq', 1),
     )
 
 
@@ -382,14 +406,27 @@ def sync_candidate(conn, cur, cand: dict, dest: Path) -> None:
 
 
 def refresh_clip_fields(cur, cand: dict) -> None:
+    """Re-read file_path/state/render_seq from the clips row a render just
+    wrote (or updated). render_seq is refreshed here too (migration 011),
+    not only file_path/state: render_candidate() above runs the render in
+    ITS OWN connection/transaction (cut_clip.render_clip and
+    render_adjusted_clip each call db.connect() themselves), which bumps
+    clips.render_seq and commits before returning here. Without re-reading
+    it, the caller's dest_path_for(drive_sync_dir, cand) below would build
+    the Drive destination name from the STALE pre-render render_seq still
+    sitting in `cand` from fetch_approved()'s earlier SELECT — i.e. it would
+    ship a fresh re-render under the OLD version's filename, exactly the
+    indistinguishable-overwrite failure migration 011 exists to fix.
+    """
     cur.execute(
-        'SELECT file_path, state FROM clips WHERE candidate_id = %s',
+        'SELECT file_path, state, render_seq FROM clips WHERE candidate_id = %s',
         (cand['candidate_id'],),
     )
     row = cur.fetchone()
     if row:
         cand['clip_file_path'] = str(row[0]) if row[0] is not None else None
         cand['clip_state'] = str(row[1]) if row[1] is not None else None
+        cand['render_seq'] = int(row[2]) if row[2] is not None else 1
 
 
 def fetch_adjusted_window(cur, candidate_id: int) -> tuple[float | None, float | None]:
@@ -558,6 +595,12 @@ def render_adjusted_clip(candidate_id: int) -> int:
                     captions_requested = 0,
                     captions_burned = 0,
                     captions_cue_count = NULL,
+                    -- migration 011: a re-render of the SAME candidate bumps
+                    -- the version counter delivered_name() reads to build a
+                    -- distinct Drive filename. A fresh INSERT never reaches
+                    -- this DO UPDATE branch, so it takes the column's own
+                    -- DEFAULT 1 -- unedited.
+                    render_seq = clips.render_seq + 1,
                     -- A RE-RENDER INVALIDATES THE DELIVERY WITNESS (2026-08-08).
                     --
                     -- drive_synced_at is D-056's proof that the bytes in Drive
