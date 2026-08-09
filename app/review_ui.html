@@ -262,10 +262,23 @@
     /* The post as it reads under the video. Same card treatment as the phone
        so the left column is two deliberate objects, not a frame with loose
        text hanging off it. */
-    .postmeta { width: 300px; margin-top: 12px; font-size: 12.5px; color: var(--paper-text);
+    .postmeta { position: relative; width: 300px; margin-top: 12px; font-size: 12.5px; color: var(--paper-text);
                 background: var(--panel-raised); border: 1px solid var(--hairline);
                 border-radius: var(--radius-md); padding: 14px 16px; line-height: 1.5; }
-    .postmeta .handle { font-family: var(--font-serif); font-weight: 500; margin-bottom: 6px; letter-spacing: .01em; }
+    /* FIX (2026-08-08): this was named .handle, which collides with the trim
+       slider's bare, unscoped .handle rule below (position:absolute; top/
+       bottom:4px; width:14px; background:var(--pop) -- the drag-handle
+       styling for #handleIn/#handleOut). Nothing here scoped that rule to
+       the slider, so it applied to THIS div too wherever it appeared (the
+       post kit view only): with no positioned ancestor between it and the
+       viewport, top/bottom:4px resolved against the initial containing
+       block, painting a full-viewport-height, 14px-wide, var(--pop)-orange
+       bar over the post kit page. Renamed to break the collision at its
+       root (two unrelated things sharing one bare class name); .postmeta's
+       own position:relative above is added as defense-in-depth so ANY
+       future absolutely-positioned descendant here is bounded to the card,
+       never the viewport, even if this class is reused again by mistake. */
+    .postmeta .kit-handle { font-family: var(--font-serif); font-weight: 500; margin-bottom: 6px; letter-spacing: .01em; }
     .postmeta .cap { color: var(--paper-text); white-space: pre-wrap; word-break: break-word; }
     .postmeta .tags { color: var(--pop); margin-top: 6px; word-break: break-word; }
     .coverage { margin-top: 10px; font-size: 11.5px; color: var(--muted); line-height: 1.5;
@@ -1123,7 +1136,7 @@
             </div>
             <div class="coverage" id="coverage"></div>
             <div class="postmeta">
-              <div class="handle">${esc(profileState && profileState.handle ? profileState.handle : 'your handle')}</div>
+              <div class="kit-handle">${esc(profileState && profileState.handle ? profileState.handle : 'your handle')}</div>
               <div class="cap" id="postCaption">${esc(v.video_caption)}</div>
               <div class="tags" id="postTags">${esc(v.hashtags)}</div>
             </div>
