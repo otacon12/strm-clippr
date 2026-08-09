@@ -39,6 +39,35 @@ SLICE_PAD_S = 10.0
 # constant; if either value ever changes, both must change together.
 PUBLISH_PAD_S = 1.5
 
+# ---------------------------------------------------------------------------
+# Sidecar schema version (SRD-06 / golden-review F9 fixer, 2026-08-08): the
+# ONE TRUTH for the c<id>.json geometry sidecar's schema.
+#
+# Why it lives HERE: the stager (slice_candidates.py, which WRITES sidecars)
+# and the renderer (render_from_slice.py, which READS and validates them)
+# each carried their OWN hardcoded `SIDECAR_SCHEMA = 1`, kept in sync only by
+# a comment ("must match slice_candidates.SIDECAR_SCHEMA") -- an honor-system
+# duplicate with no import edge enforcing it, i.e. exactly the "two copies of
+# one thing always drift" trap. Both modules already import slice_geometry
+# for the staging-geometry formulas above, so the constant now has exactly
+# one home and the drift is structurally impossible instead of merely
+# commented against.
+#
+# Why 2: schema 1 sidecars recorded geometry only (abs_start_s, abs_end_s,
+# actual_duration_s) -- never the SOURCE VIDEO's identity, even though the
+# stager always has it in hand. A geometry-valid slice was therefore silently
+# REUSED after its source video changed underneath it: recordings.path
+# repointed to a different file, or a candidate id recycled by --reset-ids
+# across wipe generations. render_from_slice's STALE_SLICE check cannot catch
+# this, because it compares ffprobe'd length against a window the stager
+# itself anchored FROM THAT SAME (wrong) file, so an intact stale slice
+# passes with a difference of ~0. Schema 2 adds the source-identity witness
+# (source_path, source_size_bytes, source_duration_s) so a source swap is
+# detectable. The bump is INTENTIONALLY BREAKING: every existing schema-1
+# sidecar fails validation and its slice is restaged on the next run -- the
+# designed heal path, not a cost.
+SIDECAR_SCHEMA = 2
+
 
 def slice_start(original_start_s: float) -> float:
     """NOMINAL absolute start of the staged slice, from the ORIGINAL window
