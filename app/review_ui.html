@@ -1728,6 +1728,11 @@
       if (saveBtn) saveBtn.style.display = hasUnsaved(c) ? 'inline-flex' : 'none';
       const flag = document.getElementById('unsavedFlag');
       if (flag) flag.style.display = hasUnsaved(c) ? 'inline-flex' : 'none';
+      // Every draft mutation (drag, nudge, I/O, reset, loadedmetadata's
+      // tightened bounds) can change whether the region start still matches
+      // the playhead, so the snap chip is re-evaluated from here too, not
+      // only from the video's own pause/seek events below.
+      updateSnapAffordance(c);
     }
 
     function renderPlayheadPosition(c, seconds) {
@@ -1781,6 +1786,7 @@
         <div class="trimwrap">
           <div class="trimhead">
             <span class="trimlabel">Clip window</span>
+            ${editable ? '<button class="nudge" id="btnSnapStart" style="display:none;" title="Move the clip start to the current paused position, keeping the same length">Move clip start here</button>' : ''}
             ${lockedChip}
           </div>
           <div class="slider${editable ? '' : ' disabled'}" id="trimSlider">
@@ -1954,20 +1960,40 @@
 
       let dragTarget = null; // 'start' | 'end' | 'region' | 'playhead'
 
-      vid.addEventListener('timeupdate', () => {
-        if (dragTarget === null) renderPlayheadPosition(c, vid.currentTime);
-      });
+      // Shared sync: paints the tracker from the video's OWN authoritative
+      // currentTime and re-checks the snap-chip visibility, gated on
+      // not-mid-drag (a live pointer-capture drag already drives the tracker
+      // itself via applyDraft/the region-move handler, so this must not
+      // fight it). Reused by timeupdate, the rAF tick below, and the
+      // pause-accurate sync that follows -- one code path, one behaviour.
+      const syncPlayheadFromVideo = () => {
+        if (dragTarget !== null) return;
+        renderPlayheadPosition(c, vid.currentTime);
+        updateSnapAffordance(c);
+      };
+      vid.addEventListener('timeupdate', syncPlayheadFromVideo);
       // D-073 perf gate (charter §19 / spec constraint 3): exactly one rAF
       // loop while the video is PLAYING, started on 'play' and cancelled on
       // 'pause'/'ended' -- never a persistent idle loop.
       let rafId = null;
       const tick = () => {
-        if (dragTarget === null) renderPlayheadPosition(c, vid.currentTime);
+        syncPlayheadFromVideo();
         rafId = requestAnimationFrame(tick);
       };
-      vid.addEventListener('play', () => { if (rafId === null) rafId = requestAnimationFrame(tick); });
+      vid.addEventListener('play', () => {
+        if (rafId === null) rafId = requestAnimationFrame(tick);
+        updateSnapAffordance(c); // hides the chip the instant playback resumes
+      });
       const stopTick = () => { if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } };
-      vid.addEventListener('pause', stopTick);
+      // Pause-accurate playhead (operator ask, 2026-08-08): the rAF loop
+      // stops on pause, so its last painted frame can be up to one frame
+      // stale relative to the exact paused currentTime. 'pause' forces one
+      // final sync BEFORE the loop is torn down; 'seeked' covers a seek that
+      // lands while already paused (including scrubbing via the native
+      // controls, which fires 'seeked'/'timeupdate' but never 'play') -- so
+      // the tracker always lands on the exact paused frame.
+      vid.addEventListener('pause', () => { syncPlayheadFromVideo(); stopTick(); });
+      vid.addEventListener('seeked', syncPlayheadFromVideo);
       vid.addEventListener('ended', stopTick);
 
       if (!sliderEl || !editable) return; // disabled visual state only, no drag/keyboard wired
@@ -2084,6 +2110,8 @@
         playhead.addEventListener('pointerup', endPlayheadDrag);
         playhead.addEventListener('pointercancel', endPlayheadDrag);
       }
+      const snapBtn = document.getElementById('btnSnapStart');
+      if (snapBtn) snapBtn.onclick = () => moveWindowToPlayhead(c);
     }
 
     // I/O (editor convention): set in/out at the CURRENT playhead position.
@@ -2099,6 +2127,44 @@
       const next = edge === 'start' ? { start: vid.currentTime, end: cur.end } : { start: cur.start, end: vid.currentTime };
       drafts[c.id] = clampWindowDraft(next, c, edge);
       renderSliderPositions(c);
+      updateVerdictLock(c);
+    }
+
+    // Snap chip visibility (operator ask, 2026-08-08, simplest rule as
+    // specified): visible whenever the video is PAUSED and the playhead
+    // sits anywhere other than the current region start. Reads the video
+    // and the region start fresh each call rather than caching either, so
+    // it never goes stale relative to whichever draft/playhead event fired.
+    function updateSnapAffordance(c) {
+      const btn = document.getElementById('btnSnapStart');
+      if (!btn) return;
+      const vid = document.getElementById('vid');
+      if (!vid) { btn.style.display = 'none'; return; }
+      const ed = editorValues(c);
+      const show = vid.paused && Math.abs(vid.currentTime - ed.start) > 0.05;
+      btn.style.display = show ? 'inline-flex' : 'none';
+    }
+
+    // The snap chip's action -- the one-click version of "drag the section
+    // picked to there". Moves the WHOLE region (both edges together, same
+    // shape as the region-drag pointermove handler above) so the new start
+    // sits exactly at the paused playhead, preserving the current duration
+    // rather than just relocating the start edge. Clamped to the slice
+    // bounds the same way the region drag is. Writes the identical
+    // drafts[c.id] = {start, end} shape every other window mutation writes,
+    // so Save's payload is unchanged in form regardless of how the draft
+    // was produced.
+    function moveWindowToPlayhead(c) {
+      const vid = document.getElementById('vid');
+      if (!vid) return;
+      const { lo, hi } = sliceBounds(c);
+      const cur = editorValues(c);
+      const durSecs = cur.end - cur.start;
+      let newStart = Math.max(lo, Math.min(hi - durSecs, vid.currentTime));
+      newStart = Math.round(newStart * 10) / 10;
+      drafts[c.id] = { start: newStart, end: Math.round((newStart + durSecs) * 10) / 10 };
+      renderSliderPositions(c);
+      renderPlayheadPosition(c, vid.currentTime);
       updateVerdictLock(c);
     }
 
