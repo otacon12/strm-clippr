@@ -855,8 +855,25 @@ def render_from_slice(candidate_id: int) -> int:
         # never destroy a previous good render sitting at out_path, because
         # out_path is never opened for writing until the NEW encode has
         # already succeeded (see the os.replace below).
+        #
+        # LIVE FIXER (2026-08-08): the suffix MUST end in `.mp4`. B6 shipped
+        # `suffix='.part'`, and real ffmpeg infers its output MUXER from the
+        # output filename's extension when no `-f` is given -- a temp path
+        # ending in `.part` has no extension ffmpeg recognizes, so it refused
+        # with "Unable to find a suitable output format" on the very first
+        # live render. B6's own control stubbed ffmpeg (a fake executable that
+        # never inspects its argv), so this never had a chance to fire in
+        # review: the host's container-by-extension inference is part of the
+        # code (charter gate 6) and only the real binary can exercise it.
+        # `.part.mp4` keeps both properties at once: unique + same-dir (so
+        # os.replace onto out_path stays an atomic same-filesystem rename) AND
+        # ends in `.mp4` (so ffmpeg's extension sniff still resolves to the
+        # mp4 muxer). `-f mp4` was deliberately NOT added instead: the
+        # extension fix also keeps any other extension-sniffing tool (ffprobe,
+        # a future glob) working against the temp name, and is a smaller,
+        # more literal diff against the B6 baseline.
         tmp_fd, tmp_name = tempfile.mkstemp(
-            prefix=f'{out_path.name}.', suffix='.part', dir=str(out_dir)
+            prefix=f'{out_path.name}.', suffix='.part.mp4', dir=str(out_dir)
         )
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
