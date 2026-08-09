@@ -572,6 +572,11 @@
     const subjectPick = {};
     let profileState = null;   // the ACTIVE creator_profile row, or null
     let showGuides = true;
+    // Post-kit declutter: Subject and Profile collapse behind menu buttons.
+    // Closed by default, in-memory only (session-scoped, same discipline as
+    // showGuides above) -- persists across re-renders of this view but not
+    // across a page reload.
+    let kitPanelOpen = { profile: false, subject: false };
 
     // D-074: unsaved burn_hook/caption_color/hook_color edits, keyed by
     // candidate id. Same discipline as `drafts` (the D-055 window edits) and
@@ -1316,24 +1321,17 @@
           renderer that actually shipped this file, not guessed.</div>`;
     }
 
-    function profilePanel(c) {
+    // Staleness is an INTEGER comparison against the version this kit was
+    // written against, not a timestamp: post_kits records the exact profile
+    // and context versions it used.
+    function profileEditorPanel(c) {
       const p = profileState;
       const kitProfileV = c.kit_profile_version;
-      const kitCtxV = c.kit_recording_context_version;
-      // Staleness is an INTEGER comparison against the version this kit was
-      // written against, not a timestamp: post_kits records the exact profile
-      // and context versions it used.
       const profileStale = (p && hasKit(c) && kitProfileV !== null && kitProfileV !== undefined
                             && Number(p.version) > Number(kitProfileV));
-      const ctxStale = (c.context_version !== null && c.context_version !== undefined
-                        && hasKit(c) && kitCtxV !== null && kitCtxV !== undefined
-                        && Number(c.context_version) > Number(kitCtxV));
       const f = (k) => esc(p ? (p[k] ?? '') : '');
-      const subjKind = c.subject_kind || '';
       return `
         <div class="ctxbox">
-          <h3 style="margin:0 0 2px;font-size:13px;">Context that produced this kit</h3>
-          <p class="why">The generator sees exactly this. If it is wrong or stale, the copy is wrong.</p>
           <div class="kitmeta${profileStale ? ' warn' : ''}">
             Global profile: ${p ? 'v' + esc(p.version) + ', saved ' + esc(p.created_at) : 'not set yet'}.
             ${hasKit(c) ? ' This kit was written against ' + (kitProfileV === null || kitProfileV === undefined ? 'no profile' : 'v' + esc(kitProfileV)) + '.' : ''}
@@ -1349,8 +1347,18 @@
             <button class="savewin" id="btnSaveProfile">Save profile</button>
             <span class="hint">Edit once, applies to every clip.</span>
           </div>
+        </div>`;
+    }
 
-          <div class="kitmeta${ctxStale ? ' warn' : ''}" style="margin-top:12px;">
+    function subjectEditorPanel(c) {
+      const kitCtxV = c.kit_recording_context_version;
+      const ctxStale = (c.context_version !== null && c.context_version !== undefined
+                        && hasKit(c) && kitCtxV !== null && kitCtxV !== undefined
+                        && Number(c.context_version) > Number(kitCtxV));
+      const subjKind = c.subject_kind || '';
+      return `
+        <div class="ctxbox">
+          <div class="kitmeta${ctxStale ? ' warn' : ''}">
             Subject of recording ${c.vod_id} (${esc(c.session_label)}): who the clip is about.
             ${c.context_version ? ' Context v' + esc(c.context_version) + '.' : ' Not set. The generator treats this as unknown, never as you.'}
             ${ctxStale ? ' Changed after this kit was generated.' : ''}
@@ -1473,6 +1481,14 @@
         <h2 style="margin:0 0 8px;">Candidate #${c.id} &middot; Post kit</h2>
         <div class="hint">Session ${esc(c.session_label)} &middot; vod ${c.vod_id} &middot; delivered ${esc(c.drive_synced_at)}</div>
         <div class="winline">${kitStampHtml(c)}</div>
+        <div class="editrow" style="margin:0 0 14px;">
+          <button class="pick${kitPanelOpen.profile ? ' on' : ''}" id="btnMenuProfile">Profile</button>
+          <button class="pick${kitPanelOpen.subject ? ' on' : ''}" id="btnMenuSubject">Subject</button>
+          <span class="hint">Global profile and who this clip is about: what the generator sees.
+            Wrong or stale here means wrong copy.</span>
+        </div>
+        ${kitPanelOpen.profile ? profileEditorPanel(c) : ''}
+        ${kitPanelOpen.subject ? subjectEditorPanel(c) : ''}
         <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
           Generate a post kit for this clip. Intent only: the generator reads this.</label>
         <label class="genrow"><input type="checkbox" id="burnCaps" ${c.burn_captions === 1 ? 'checked' : ''} />
@@ -1518,17 +1534,21 @@
               <div class="cap" id="postCaption">${esc(v.video_caption)}</div>
               <div class="tags" id="postTags">${esc(v.hashtags)}</div>
             </div>
-            <div class="kitmeta">Dashed regions are covered by the platform's own UI. By default the hook
-              is a CSS overlay on top of the video only, per D-061: you type it into the platform's own
-              text tool, and nothing here is burned. Tick "Burn hook text into video" above to burn it
-              into the file itself instead, in your chosen color. Speech captions burn the same way, only
-              when you tick the box above, in their own chosen color. Burned captions sit along the
-              bottom; a burned hook sits in the band shown here. The sample caption line below is a color
-              preview only, it does not track real speech.</div>
+            <details class="fineedit">
+              <summary>How burning works</summary>
+              <div class="editpanel">
+                <div class="kitmeta">Dashed regions are covered by the platform's own UI. By default the hook
+                  is a CSS overlay on top of the video only, per D-061: you type it into the platform's own
+                  text tool, and nothing here is burned. Tick "Burn hook text into video" above to burn it
+                  into the file itself instead, in your chosen color. Speech captions burn the same way, only
+                  when you tick the box above, in their own chosen color. Burned captions sit along the
+                  bottom; a burned hook sits in the band shown here. The sample caption line below is a color
+                  preview only, it does not track real speech.</div>
+              </div>
+            </details>
           </div>
           <div>
             ${copyBlocks}
-            ${profilePanel(c)}
           </div>
         </div>`;
 
@@ -1551,6 +1571,14 @@
       const guidesBtn = document.getElementById('btnGuides');
       if (guidesBtn) {
         guidesBtn.onclick = () => { showGuides = !showGuides; renderDetail(); };
+      }
+      const menuProfileBtn = document.getElementById('btnMenuProfile');
+      if (menuProfileBtn) {
+        menuProfileBtn.onclick = () => { kitPanelOpen.profile = !kitPanelOpen.profile; renderDetail(); };
+      }
+      const menuSubjectBtn = document.getElementById('btnMenuSubject');
+      if (menuSubjectBtn) {
+        menuSubjectBtn.onclick = () => { kitPanelOpen.subject = !kitPanelOpen.subject; renderDetail(); };
       }
       const genEl = document.getElementById('genKit');
       if (genEl) genEl.onchange = () => setGenerate(c, genEl.checked);
