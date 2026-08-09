@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """cut_all_approved: render approved candidates in batch via cut_clip.render_clip.
 Connects via the shared adapter app/workers/db.py (CLPR_DB_URL); exits non-zero
-only for wrapper-level failures.
-Per-candidate render failures are isolated and reported; batch continues.
+if any candidate failed to render (wrapper-level failures OR per-candidate
+render failures), so a caller cannot mistake an all-failed batch for success.
+Per-candidate render failures are isolated (the batch continues to the next
+candidate) and reported to both stdout and stderr.
 Prints machine-parseable RESULT line last.
 
 PostgreSQL port (D-052 P3): tables and columns per app/docs/naming-map.md.
@@ -69,7 +71,9 @@ def main() -> int:
             succeeded += 1
         except Exception as exc:
             failed += 1
-            print(f'CANDIDATE_FAILED candidate={candidate_id} error="{exc}"')
+            failure_line = f'CANDIDATE_FAILED candidate={candidate_id} error="{exc}"'
+            print(failure_line)
+            print(failure_line, file=sys.stderr)
             continue
 
     print(
@@ -79,7 +83,7 @@ def main() -> int:
         f'failed={failed} '
         f'skipped_already_rendered={skipped_already_rendered}'
     )
-    return 0
+    return 0 if failed == 0 else 1
 
 
 if __name__ == '__main__':
