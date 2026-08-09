@@ -75,6 +75,19 @@ class CaptionRefused(RuntimeError):
     """
 
 
+class HookRefused(RuntimeError):
+    """A candidate refused because it asked for a burned-in hook this Mac-side
+    renderer cannot honor.
+
+    Mirrors CaptionRefused (D-063) for the sibling column D-074 added: a
+    TYPE, not a message prefix, so the refusal is unambiguous rather than a
+    proxy on error text. Subclasses RuntimeError so every existing
+    per-candidate handler (here and in deliver_approved.py) keeps treating it
+    as the failure it is — counted into `failed`, same as any other
+    per-candidate error.
+    """
+
+
 def require_no_caption_request(candidate_id: int, burn_captions: int, stage: str) -> None:
     """ONE TRUTH for the Mac-side caption refusal (D-063).
 
@@ -107,6 +120,49 @@ def require_no_caption_request(candidate_id: int, burn_captions: int, stage: str
         'not have. The rest of the batch is unaffected. Fixes: approve it so the n8n '
         'server lane renders it (that ffmpeg has libass), or untick captions for this '
         'clip in the review UI, or install an ffmpeg build that includes libass here.'
+    )
+
+
+def require_no_hook_request(candidate_id: int, burn_hook: int, stage: str) -> None:
+    """ONE TRUTH for the Mac-side hook-burn refusal (D-074 gap fix).
+
+    Mirrors require_no_caption_request exactly, for the sibling column D-074
+    added: this Mac-side renderer's ffmpeg has no `subtitles` filter (no
+    libass), so it cannot burn a hook any more than it can burn captions.
+    Before this fix, neither cut_clip.render_clip nor
+    deliver_approved.render_adjusted_clip checked burn_hook at all, so a
+    burn_hook=1 candidate rendered through either one silently shipped
+    WITHOUT the burned hook — the exact silent-wrong-output failure D-063
+    already fixed for captions, left open for the column D-074 added after it.
+
+    Every Mac-side render entry point routes through here: cut_clip.render_clip
+    (also reached from cut_all_approved.py) and
+    deliver_approved.render_adjusted_clip.
+
+    The capability is PROBED and quoted in the message rather than asserted, so
+    the error stays true on a machine that later gains libass: this renderer
+    still does not implement hook-burning, and the message says which of the
+    two reasons applies here.
+    """
+    if int(burn_hook) != 1:
+        return
+    has_filter = render_from_slice.ffmpeg_has_subtitles_filter()
+    capability = (
+        'this ffmpeg HAS the subtitles filter, but this Mac-side renderer does not '
+        'implement hook-burning at all'
+        if has_filter else
+        'this ffmpeg has no `subtitles` filter, so it was built without libass and '
+        'cannot burn anything'
+    )
+    raise HookRefused(
+        f'HOOK_UNSUPPORTED_HERE: candidate_id={candidate_id} asks for a burned-in '
+        f'hook (clip_candidates.burn_hook=1) at stage={stage}, but on host '
+        f'"{socket.gethostname()}" {capability}. Refusing this candidate: nothing is '
+        'rendered, nothing is delivered, and no clip row will claim a hook it does '
+        'not have. The rest of the batch is unaffected. Fixes: approve it so the '
+        'render_from_slice lane renders it (the n8n server lane; that ffmpeg has '
+        'libass), or untick "Burn hook text into this clip" for this clip in the '
+        'review UI, or install an ffmpeg build that includes libass here.'
     )
 
 
@@ -144,12 +200,12 @@ def measure_duration_s(path: Path) -> float:
 
 def fetch_candidate(
     cur, candidate_id: int
-) -> tuple[int, float, float, float | None, float | None, str, str, float, int]:
+) -> tuple[int, float, float, float | None, float | None, str, str, float, int, int]:
     cur.execute(
         '''
         SELECT c.recording_id, c.start_s, c.end_s,
                c.adjusted_start_s, c.adjusted_end_s,
-               c.state, r.path, r.duration_s, c.burn_captions
+               c.state, r.path, r.duration_s, c.burn_captions, c.burn_hook
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
         WHERE c.id = %s
@@ -161,7 +217,7 @@ def fetch_candidate(
         raise RuntimeError(f'candidate_id not found: {candidate_id}')
 
     (recording_id, start_s, end_s, adjusted_start_s, adjusted_end_s, state,
-     recording_path, recording_duration_s, burn_captions) = row
+     recording_path, recording_duration_s, burn_captions, burn_hook) = row
     if recording_duration_s is None:
         raise RuntimeError(f'recording duration_s is NULL for candidate_id={candidate_id}')
 
@@ -175,6 +231,7 @@ def fetch_candidate(
         str(recording_path),
         float(recording_duration_s),
         int(burn_captions),
+        int(burn_hook),
     )
 
 
@@ -199,7 +256,8 @@ def render_clip(candidate_id: int) -> int:
             raise RuntimeError('clips table missing; apply migrations_pg/001 before cut_clip')
 
         (recording_id, start_s, end_s, adjusted_start_s, adjusted_end_s, state,
-         recording_path, recording_duration_s, burn_captions) = fetch_candidate(cur, candidate_id)
+         recording_path, recording_duration_s, burn_captions,
+         burn_hook) = fetch_candidate(cur, candidate_id)
 
         if state != 'approved':
             raise RuntimeError(
@@ -209,6 +267,11 @@ def render_clip(candidate_id: int) -> int:
         # D-063: refuse BEFORE any work, so a candidate that wants captions
         # never produces a file this machine would have to lie about.
         require_no_caption_request(candidate_id, burn_captions, 'cut_clip.render_clip')
+
+        # D-074 gap fix: same refusal, for the sibling column this lane never
+        # checked — a burn_hook=1 candidate rendered here would otherwise ship
+        # silently WITHOUT the burned hook.
+        require_no_hook_request(candidate_id, burn_hook, 'cut_clip.render_clip')
 
         # D-074 ruling 1 (MK-03): cut the EFFECTIVE window (COALESCE(adjusted,
         # original)) with the one-truth PUBLISH_PAD_S, matching
