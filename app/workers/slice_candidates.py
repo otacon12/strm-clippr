@@ -21,12 +21,28 @@ name). abs_end from a -to copy cut is near-exact while the head snaps to
 the keyframe BEFORE the requested start, so the sidecar anchors
 abs_start_s = abs_end_s - actual_duration_s, absorbing the snap.
 
-Idempotent: slice + valid sidecar => skip; a slice WITHOUT a valid sidecar
-is RESTAGED (both files regenerated) — this heals stale pre-D-055 slices
-staged under the same c<id>.mp4 name with different geometry. Both files
-are written via a .part temp + atomic os.replace, sidecar LAST (it is the
-commit marker: a crash between mp4 and sidecar leaves slice-without-sidecar,
-which the restage rule self-heals).
+SOURCE WITNESS (schema 2, SRD-06 / golden-review F9 fixer): the sidecar also
+records source_path, source_size_bytes and source_duration_s — the SOURCE
+VIDEO's identity at cut time. Geometry alone cannot detect a slice cut from
+the WRONG video: a geometry-valid, intact slice reused after recordings.path
+was repointed to a different file (this happened live: recording 19
+repointed to a local Drive-streamed mp4, commit 36c6e91), or after a
+candidate id was recycled by --reset-ids across wipe generations, is
+invisible to render_from_slice's STALE_SLICE ffprobe check, because that
+check compares length against a window the stager itself anchored FROM THE
+SAME (wrong) file. The schema is now the ONE TRUTH in slice_geometry.py
+(SIDECAR_SCHEMA), imported by both this stager and render_from_slice —
+previously each carried its own hardcoded copy, synced only by comment.
+
+Idempotent: slice + valid sidecar whose SOURCE WITNESS matches the current
+video (source_path + source_size_bytes) => skip; anything else is RESTAGED
+(both files regenerated) — a slice without a valid sidecar heals stale
+pre-D-055 slices staged under the same c<id>.mp4 name with different
+geometry, and a slice whose sidecar witnesses a DIFFERENT source file heals
+a stale slice cut from the wrong video. Both files are written via a .part
+temp + atomic os.replace, sidecar LAST (it is the commit marker: a crash
+between mp4 and sidecar leaves slice-without-sidecar, which the restage rule
+self-heals).
 
 Connects via the shared adapter app/workers/db.py (CLPR_DB_URL). CLPR_SLICES_DIR
 is REQUIRED (fail loudly when unset); the n8n node exports it, local tests set a
@@ -50,8 +66,6 @@ import db
 import slice_geometry
 
 SLICE_STATES = ('candidate', 'maybe', 'approved')
-
-SIDECAR_SCHEMA = 1
 
 
 def utc_now_iso() -> str:
@@ -98,8 +112,11 @@ def sidecar_path_for(out_path: Path) -> Path:
 
 def load_valid_sidecar(sidecar_path: Path, candidate_id: int) -> dict | None:
     """Parse + validate an existing sidecar. None on ANY defect (missing,
-    unparseable, wrong schema, wrong candidate_id, non-finite coordinates) —
-    the caller treats None as 'restage both files'."""
+    unparseable, wrong schema, wrong candidate_id, non-finite coordinates,
+    missing/invalid source witness) — the caller treats None as 'restage
+    both files'. NOTE: a VALID sidecar's source fields may still not match
+    the CURRENT video; that is a separate check the caller makes (source
+    identity, not sidecar validity — see the skip rule in run())."""
     try:
         raw = sidecar_path.read_text(encoding='utf-8')
         data = json.loads(raw)
@@ -107,14 +124,20 @@ def load_valid_sidecar(sidecar_path: Path, candidate_id: int) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    if data.get('schema') != SIDECAR_SCHEMA:
+    if data.get('schema') != slice_geometry.SIDECAR_SCHEMA:
         return None
     if data.get('candidate_id') != candidate_id:
         return None
-    for key in ('abs_start_s', 'abs_end_s', 'actual_duration_s'):
+    for key in ('abs_start_s', 'abs_end_s', 'actual_duration_s', 'source_duration_s'):
         v = data.get(key)
         if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
             return None
+    source_path = data.get('source_path')
+    if not isinstance(source_path, str) or not source_path:
+        return None
+    source_size_bytes = data.get('source_size_bytes')
+    if not isinstance(source_size_bytes, int) or isinstance(source_size_bytes, bool) or source_size_bytes < 0:
+        return None
     return data
 
 
@@ -126,7 +149,7 @@ def write_sidecar_atomic(sidecar_path: Path, payload: dict) -> None:
     os.replace(part, sidecar_path)
 
 
-def slice_one(video: Path, video_duration_s: float, candidate_id: int,
+def slice_one(video: Path, video_duration_s: float, video_size_bytes: int, candidate_id: int,
               start_s: float, end_s: float, out_path: Path) -> None:
     # D-055: staging bounds from the ORIGINAL window only, SLICE_PAD_S headroom,
     # end clamped to the video duration here at staging time (slice_geometry).
@@ -187,9 +210,16 @@ def slice_one(video: Path, video_duration_s: float, candidate_id: int,
     # requested_* are the PRE-CLAMP formula values (diagnostic only — a
     # staging-time video-end clamp is visible as requested_end_s > abs_end_s;
     # the renderer must never use them for math).
+    #
+    # source_* (schema 2, SRD-06 fixer): the SOURCE VIDEO's identity at cut
+    # time, so a later run can tell a genuinely-unchanged source apart from a
+    # repointed/recycled one — geometry alone cannot (see module docstring).
     sidecar = {
-        'schema': SIDECAR_SCHEMA,
+        'schema': slice_geometry.SIDECAR_SCHEMA,
         'candidate_id': candidate_id,
+        'source_path': str(video),
+        'source_size_bytes': video_size_bytes,
+        'source_duration_s': video_duration_s,
         'abs_start_s': cut_end_s - actual_duration_s,
         'abs_end_s': cut_end_s,
         'requested_start_s': cut_start_s,
@@ -206,7 +236,13 @@ def run(vod_id: int, video: Path) -> int:
     if not video.is_file():
         raise RuntimeError(f'video file not found: {video}')
     video_duration_s = measure_duration_s(video)
-    print(f'VIDEO {video} duration_s={video_duration_s:.3f}')
+    # Measured once here and passed to every slice_one() call below, same
+    # pattern as video_duration_s — the source video is a fixed input for the
+    # whole run. Written into every sidecar as the source-identity witness
+    # (schema 2, SRD-06 fixer) so a later run can tell this exact file apart
+    # from a repointed/recycled one.
+    video_size_bytes = os.stat(video).st_size
+    print(f'VIDEO {video} duration_s={video_duration_s:.3f} size_bytes={video_size_bytes}')
 
     conn = db.connect()
     try:
@@ -231,20 +267,37 @@ def run(vod_id: int, video: Path) -> int:
     for candidate_id, start_s, end_s, state in rows:
         out_path = slices_dir / f'c{int(candidate_id)}.mp4'
         sidecar_path = sidecar_path_for(out_path)
-        # Idempotency (D-055 fixer): only slice + VALID sidecar counts as done.
-        # A slice without one is restaged — that is the heal path for stale
-        # pre-D-055 slices staged under the same name with other geometry.
+        # Idempotency (D-055 fixer + SRD-06 source witness): only a slice +
+        # a VALID sidecar whose SOURCE WITNESS matches the CURRENT video
+        # counts as done. A slice without a valid sidecar is restaged — the
+        # heal path for stale pre-D-055 slices staged under the same name
+        # with other geometry. A slice with a valid sidecar witnessing a
+        # DIFFERENT source (recordings.path repointed, or an id recycled by
+        # --reset-ids) is also restaged — geometry alone cannot see this;
+        # only the source identity can.
         if out_path.exists() and out_path.stat().st_size > 0:
-            if load_valid_sidecar(sidecar_path, int(candidate_id)) is not None:
-                skipped_existing += 1
-                print(f'SKIP_EXISTING candidate={int(candidate_id)} path={out_path}')
-                continue
-            print(
-                f'RESTAGE candidate={int(candidate_id)} path={out_path} '
-                'reason=missing_or_invalid_sidecar'
-            )
+            sidecar_data = load_valid_sidecar(sidecar_path, int(candidate_id))
+            if sidecar_data is not None:
+                if (sidecar_data.get('source_path') == str(video)
+                        and sidecar_data.get('source_size_bytes') == video_size_bytes):
+                    skipped_existing += 1
+                    print(f'SKIP_EXISTING candidate={int(candidate_id)} path={out_path}')
+                    continue
+                print(
+                    f'RESTAGE candidate={int(candidate_id)} path={out_path} '
+                    f'reason=source_mismatch '
+                    f'sidecar_source_path={sidecar_data.get("source_path")!r} '
+                    f'sidecar_source_size_bytes={sidecar_data.get("source_size_bytes")!r} '
+                    f'current_source_path={str(video)!r} '
+                    f'current_source_size_bytes={video_size_bytes}'
+                )
+            else:
+                print(
+                    f'RESTAGE candidate={int(candidate_id)} path={out_path} '
+                    'reason=missing_or_invalid_sidecar'
+                )
         try:
-            slice_one(video, video_duration_s, int(candidate_id),
+            slice_one(video, video_duration_s, video_size_bytes, int(candidate_id),
                       float(start_s), float(end_s), out_path)
             sliced += 1
             print(

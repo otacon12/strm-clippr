@@ -119,7 +119,7 @@ CONTAIN_TOL_S = 0.25
 # c<id>.mp4 is not the file the sidecar witnessed => STALE_SLICE.
 STALE_TOL_S = 0.35
 
-SIDECAR_SCHEMA = 1  # must match slice_candidates.SIDECAR_SCHEMA
+SIDECAR_SCHEMA = slice_geometry.SIDECAR_SCHEMA  # single source of truth now (was a hand-synced duplicate, SRD-06)
 
 # ---------------------------------------------------------------------------
 # D-063 BURNED-IN CAPTIONS
