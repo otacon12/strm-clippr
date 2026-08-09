@@ -18,6 +18,24 @@ paying for. Everything about the render itself is unchanged: with the flag off
 (the default, and every clip that exists today) not one byte of the D-023
 command differs, and the clips row records captions_requested = 0,
 captions_burned = 0 — which is TRUE of every file this renderer can produce.
+
+D-074 ruling 1 (MK-03) geometry fixer: this renderer used to cut a private
+1.5s local pad around the ORIGINAL window (clip_candidates.start_s/end_s)
+only, never looking at adjusted_start_s/adjusted_end_s. That was fine when
+this was reached exclusively through deliver_approved.py's D-055 dispatch
+(which routes edited candidates to render_adjusted_clip instead), but
+cut_all_approved.py calls render_clip() directly for EVERY approved
+candidate, so an edited-then-approved candidate rendered through that path
+cut the pre-edit window while build_srt.py's formula basis (which has always
+assumed the EFFECTIVE window here — see its module docstring) derived
+captions against the post-edit one: the video and the captions disagreed on
+geometry. This renderer now cuts slice_geometry.effective_window(start_s,
+end_s, adjusted_start_s, adjusted_end_s) +/- slice_geometry.PUBLISH_PAD_S —
+the same one truth deliver_approved.render_adjusted_clip already used — so
+every Mac-side cut path agrees regardless of entry point. Unedited candidates
+(both adjusted columns NULL) are byte-identical to the old behavior:
+PUBLISH_PAD_S equals the old local pad (1.5s) and effective_window falls back
+to the original start_s/end_s.
 """
 
 from __future__ import annotations
@@ -30,6 +48,7 @@ import sys
 from pathlib import Path
 
 import db
+import slice_geometry
 
 try:
     from obs_guard import require_obs_idle_or_raise
@@ -40,8 +59,6 @@ try:
     import render_from_slice
 except ModuleNotFoundError:  # pragma: no cover - package-relative import
     from . import render_from_slice
-
-PAD_SECONDS = 1.5  # small default padding so cuts do not feel abrupt; tunable later.
 
 
 class CaptionRefused(RuntimeError):
@@ -125,11 +142,14 @@ def measure_duration_s(path: Path) -> float:
     return float(raw)
 
 
-def fetch_candidate(cur, candidate_id: int) -> tuple[int, float, float, str, str, float, int]:
+def fetch_candidate(
+    cur, candidate_id: int
+) -> tuple[int, float, float, float | None, float | None, str, str, float, int]:
     cur.execute(
         '''
-        SELECT c.recording_id, c.start_s, c.end_s, c.state, r.path, r.duration_s,
-               c.burn_captions
+        SELECT c.recording_id, c.start_s, c.end_s,
+               c.adjusted_start_s, c.adjusted_end_s,
+               c.state, r.path, r.duration_s, c.burn_captions
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
         WHERE c.id = %s
@@ -140,8 +160,8 @@ def fetch_candidate(cur, candidate_id: int) -> tuple[int, float, float, str, str
     if not row:
         raise RuntimeError(f'candidate_id not found: {candidate_id}')
 
-    (recording_id, start_s, end_s, state, recording_path, recording_duration_s,
-     burn_captions) = row
+    (recording_id, start_s, end_s, adjusted_start_s, adjusted_end_s, state,
+     recording_path, recording_duration_s, burn_captions) = row
     if recording_duration_s is None:
         raise RuntimeError(f'recording duration_s is NULL for candidate_id={candidate_id}')
 
@@ -149,6 +169,8 @@ def fetch_candidate(cur, candidate_id: int) -> tuple[int, float, float, str, str
         int(recording_id),
         float(start_s),
         float(end_s),
+        float(adjusted_start_s) if adjusted_start_s is not None else None,
+        float(adjusted_end_s) if adjusted_end_s is not None else None,
         str(state),
         str(recording_path),
         float(recording_duration_s),
@@ -176,8 +198,8 @@ def render_clip(candidate_id: int) -> int:
         if cur.fetchone() is None:
             raise RuntimeError('clips table missing; apply migrations_pg/001 before cut_clip')
 
-        (recording_id, start_s, end_s, state, recording_path, recording_duration_s,
-         burn_captions) = fetch_candidate(cur, candidate_id)
+        (recording_id, start_s, end_s, adjusted_start_s, adjusted_end_s, state,
+         recording_path, recording_duration_s, burn_captions) = fetch_candidate(cur, candidate_id)
 
         if state != 'approved':
             raise RuntimeError(
@@ -188,8 +210,17 @@ def render_clip(candidate_id: int) -> int:
         # never produces a file this machine would have to lie about.
         require_no_caption_request(candidate_id, burn_captions, 'cut_clip.render_clip')
 
-        cut_start_s = clamp(start_s - PAD_SECONDS, 0.0, recording_duration_s)
-        cut_end_s = clamp(end_s + PAD_SECONDS, 0.0, recording_duration_s)
+        # D-074 ruling 1 (MK-03): cut the EFFECTIVE window (COALESCE(adjusted,
+        # original)) with the one-truth PUBLISH_PAD_S, matching
+        # deliver_approved.render_adjusted_clip exactly. Unedited candidates
+        # (both adjusted columns NULL) fall back to the original window and
+        # PUBLISH_PAD_S equals the old local pad (1.5s), so their output is
+        # byte-identical to before.
+        eff_start_s, eff_end_s = slice_geometry.effective_window(
+            start_s, end_s, adjusted_start_s, adjusted_end_s,
+        )
+        cut_start_s = clamp(eff_start_s - slice_geometry.PUBLISH_PAD_S, 0.0, recording_duration_s)
+        cut_end_s = clamp(eff_end_s + slice_geometry.PUBLISH_PAD_S, 0.0, recording_duration_s)
         if cut_end_s <= cut_start_s:
             raise RuntimeError(
                 f'invalid cut window after padding/clamp: candidate_id={candidate_id} '

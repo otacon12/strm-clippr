@@ -32,7 +32,9 @@ whether some file happens to exist on this machine:
 
   'cut_clip_*' / 'deliver_adjusted_*'  -> basis 'formula'.  The Mac rendered
       from the full recording, so t0 = clamp(eff_start - pad, 0, recording duration),
-      which is cut_clip.py line 117 and deliver_approved.py line 332.
+      which is cut_clip.py line 222 (D-074 ruling 1 (MK-03) geometry fixer:
+      cut_clip.py now cuts the effective window too, so this line cites the
+      same computation on both renderers) and deliver_approved.py line 332.
 
   anything else -> LOUD FAILURE. An unknown renderer means unknown geometry,
       and misaligned captions on a public post are exactly the kind of
