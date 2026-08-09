@@ -30,12 +30,21 @@ cut the pre-edit window while build_srt.py's formula basis (which has always
 assumed the EFFECTIVE window here — see its module docstring) derived
 captions against the post-edit one: the video and the captions disagreed on
 geometry. This renderer now cuts slice_geometry.effective_window(start_s,
-end_s, adjusted_start_s, adjusted_end_s) +/- slice_geometry.PUBLISH_PAD_S —
+end_s, adjusted_start_s, adjusted_end_s) +/- slice_geometry.render_pad_s(...) —
 the same one truth deliver_approved.render_adjusted_clip already used — so
 every Mac-side cut path agrees regardless of entry point. Unedited candidates
 (both adjusted columns NULL) are byte-identical to the old behavior:
-PUBLISH_PAD_S equals the old local pad (1.5s) and effective_window falls back
-to the original start_s/end_s.
+render_pad_s returns PUBLISH_PAD_S (the old local pad, 1.5s) and
+effective_window falls back to the original start_s/end_s.
+
+NO PAD ON AN OPERATOR EDIT (live fix, 2026-08-08): render_pad_s returns 0.0
+the moment either adjusted column is set. PUBLISH_PAD_S exists to give the
+DETECTOR's unedited guess breathing room; applied on top of an explicit
+operator trim it silently un-trims up to 1.5s per side (live case: a
+0.8->9.5 trim of a 0->10.02 original rendered back at 11.08s -- the padded
+start clamped to 0 and the trimmed-away opening came back). See
+slice_geometry.render_pad_s, the single source every consumer (all three
+renderers + build_srt's t=0 derivation) now routes through.
 """
 
 from __future__ import annotations
@@ -274,16 +283,18 @@ def render_clip(candidate_id: int) -> int:
         require_no_hook_request(candidate_id, burn_hook, 'cut_clip.render_clip')
 
         # D-074 ruling 1 (MK-03): cut the EFFECTIVE window (COALESCE(adjusted,
-        # original)) with the one-truth PUBLISH_PAD_S, matching
+        # original)) with the one-truth pad, matching
         # deliver_approved.render_adjusted_clip exactly. Unedited candidates
         # (both adjusted columns NULL) fall back to the original window and
-        # PUBLISH_PAD_S equals the old local pad (1.5s), so their output is
-        # byte-identical to before.
+        # render_pad_s returns PUBLISH_PAD_S (the old local pad, 1.5s), so
+        # their output is byte-identical to before. An operator edit gets
+        # ZERO pad (live fix, 2026-08-08): see slice_geometry.render_pad_s.
         eff_start_s, eff_end_s = slice_geometry.effective_window(
             start_s, end_s, adjusted_start_s, adjusted_end_s,
         )
-        cut_start_s = clamp(eff_start_s - slice_geometry.PUBLISH_PAD_S, 0.0, recording_duration_s)
-        cut_end_s = clamp(eff_end_s + slice_geometry.PUBLISH_PAD_S, 0.0, recording_duration_s)
+        pad = slice_geometry.render_pad_s(adjusted_start_s, adjusted_end_s)
+        cut_start_s = clamp(eff_start_s - pad, 0.0, recording_duration_s)
+        cut_end_s = clamp(eff_end_s + pad, 0.0, recording_duration_s)
         if cut_end_s <= cut_start_s:
             raise RuntimeError(
                 f'invalid cut window after padding/clamp: candidate_id={candidate_id} '
