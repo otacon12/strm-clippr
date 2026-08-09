@@ -320,6 +320,9 @@ POST_GENERATE_RE = re.compile(r'^/api/candidates/(\d+)/generate$')
 # D-063 captions toggle. Its own route, for the same reason as the others: a
 # typo must 404, never fall through into a verdict.
 POST_CAPTIONS_RE = re.compile(r'^/api/candidates/(\d+)/captions-toggle$')
+# D-074 amendment. Its own route, same reason as every other one here: a typo
+# must 404, never fall through into a verdict.
+POST_STYLE_RE = re.compile(r'^/api/candidates/(\d+)/render-style$')
 POST_RERENDER_RE = re.compile(r'^/api/candidates/(\d+)/rerender$')
 POST_KIT_RE = re.compile(r'^/api/candidates/(\d+)/kit$')
 POST_KIT_REGEN_RE = re.compile(r'^/api/candidates/(\d+)/kit/regenerate$')
@@ -351,6 +354,12 @@ GET_CLIP_MEDIA_RE = re.compile(r'^/clipmedia/(\d+)$')
 #                        spoke in this window" case, which is not a failure.
 # A surface that showed the candidate flag on a delivered clip would be
 # claiming a property of a FILE from a field about an INTENTION.
+#
+# D-074: three more intent fields ride along the same way burn_captions does
+# (migration 010) — burn_hook, caption_color, hook_color. All three are
+# candidate-level INTENT ONLY, same as burn_captions; there is no clips-table
+# fact column for "was the hook really burned" (unlike captions_burned),
+# because the migration deliberately did not add one — see 010's own header.
 CANDIDATE_PAYLOAD_COLUMNS = '''
           c.id,
           c.recording_id AS vod_id,
@@ -374,7 +383,10 @@ CANDIDATE_PAYLOAD_COLUMNS = '''
           c.burn_captions,
           cl.captions_requested,
           cl.captions_burned,
-          cl.captions_cue_count'''
+          cl.captions_cue_count,
+          c.burn_hook,
+          c.caption_color,
+          c.hook_color'''
 
 # One truth for the payload FROM clause (every query that SELECTs
 # CANDIDATE_PAYLOAD_COLUMNS uses exactly these joins).
@@ -463,6 +475,26 @@ def dict_cursor(conn):
 
 def json_bytes(obj: object) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode('utf-8')
+
+
+# D-074: the SAME regex migration 010's CHECK constraints enforce on
+# caption_color/hook_color. Validating it here too means a malformed value
+# 400s with a plain message instead of surfacing as a raw psycopg2
+# IntegrityError from the database CHECK.
+HEX_COLOR_RE = re.compile(r'^#?[0-9A-Fa-f]{6}$')
+
+
+def _validate_hex_or_null(value: object) -> tuple[bool, Optional[str]]:
+    """(True, None) for a JSON null (clears the color); (True, value.strip())
+    for a string matching HEX_COLOR_RE; (False, None) for anything else."""
+    if value is None:
+        return True, None
+    if not isinstance(value, str):
+        return False, None
+    stripped = value.strip()
+    if not HEX_COLOR_RE.match(stripped):
+        return False, None
+    return True, stripped
 
 
 def fire_verdict_webhook(candidate_id: int, recording_id: int, old_state: str, new_state: str) -> str:
@@ -1291,6 +1323,93 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
         self._send_json(HTTPStatus.OK, updated)
 
+    def _set_render_style(self, candidate_id: int, body_raw: bytes) -> None:
+        """The per-clip RENDER STYLE (clip_candidates.burn_hook /
+        caption_color / hook_color, migration 010), D-074's amendment to
+        D-063 and D-061.
+
+        Same shape as _set_captions in every way that matters: records
+        INTENT ONLY, fires no render, touches no clips column, and is
+        deliberately NOT locked after approval or delivery for the identical
+        reason _set_captions and _set_generate are not (see there) — the
+        ruling grants a permission, it does not impose a prohibition, and
+        locking it would leave an approved or delivered clip's style
+        permanently unfixable. Flipping this cannot change a file that has
+        already shipped; the review UI says so with the same "applies to the
+        next render" wording _set_captions's own docstring explains.
+
+        All three fields travel together in ONE request because the review
+        UI saves them as one unit (the toggle plus both color pickers via a
+        single "Save style" action, the window editor's dirty/save
+        convention — see review_ui.html), not three independent PATCHes. So
+        this endpoint requires all three keys present, not a partial update:
+        a request missing one is a client bug, not a legitimate partial
+        write, and 400s rather than guessing what was meant.
+        """
+        ok, body = self._parse_json_body(body_raw)
+        if not ok:
+            return
+
+        if 'burn_hook' not in body or not isinstance(body['burn_hook'], bool):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {'error': 'body must be a JSON object with boolean key burn_hook'},
+            )
+            return
+        burn_hook = body['burn_hook']
+
+        if 'caption_color' not in body:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {'error': 'body must include key caption_color (a 6-hex-digit color string or null)'},
+            )
+            return
+        cap_ok, caption_color = _validate_hex_or_null(body['caption_color'])
+        if not cap_ok:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {'error': 'caption_color must be null or a 6-hex-digit color, e.g. "#FFE600"'},
+            )
+            return
+
+        if 'hook_color' not in body:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {'error': 'body must include key hook_color (a 6-hex-digit color string or null)'},
+            )
+            return
+        hook_ok, hook_color = _validate_hex_or_null(body['hook_color'])
+        if not hook_ok:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {'error': 'hook_color must be null or a 6-hex-digit color, e.g. "#00E676"'},
+            )
+            return
+
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            try:
+                cur.execute(
+                    'UPDATE clip_candidates SET burn_hook = %s, caption_color = %s, hook_color = %s '
+                    'WHERE id = %s',
+                    (1 if burn_hook else 0, caption_color, hook_color, candidate_id),
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND, {'error': f'candidate not found: {candidate_id}'}
+                    )
+                    return
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            updated = fetch_delivered_payload(cur, candidate_id)
+        finally:
+            conn.close()
+        self._send_json(HTTPStatus.OK, updated)
+
     def _save_kit(self, candidate_id: int, body_raw: bytes) -> None:
         """Save an operator edit as a NEW VERSION with origin='operator_edit'.
 
@@ -1965,6 +2084,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             (POST_KIT_RE, self._save_kit),
             (POST_GENERATE_RE, self._set_generate),
             (POST_CAPTIONS_RE, self._set_captions),
+            (POST_STYLE_RE, self._set_render_style),
             (POST_RERENDER_RE, self._rerender_clip),
             (POST_SUBJECT_RE, self._set_subject),
         ):

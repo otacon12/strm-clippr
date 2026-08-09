@@ -61,6 +61,27 @@ has no captions is the exact failure class this project keeps paying for):
     later reader has to infer anything from a candidate flag the operator may
     have flipped since.
 
+D-074 BURNED HOOK + OPERATOR COLOR CHOICES (2026-08-08 amendment to D-063 and
+D-061). Three more opt-in columns on clip_candidates (migration 010), all
+additive/nullable-or-defaulted: burn_hook (same intent shape as
+burn_captions, DEFAULT 0), caption_color and hook_color (nullable hex, NULL =
+renderer default). D-061 still holds by default -- the hook stays a CSS
+overlay the operator types into the platform's own tool -- but ticking
+burn_hook now burns it into the SAME render pass as the clip, via a SECOND
+`subtitles` filter chained after the captions one (own .ass file, own style,
+so D-063's calibrated caption geometry is never touched by the hook path).
+Both the caption ink and the hook ink are operator-chosen colors, each with
+its own AUTO-CONTRAST backing (WCAG relative luminance decides whether the
+outline/box stays this renderer's original dark treatment or flips to a
+light one) rather than a fixed style, per the operator's own rule:
+"background and foreground should change based on readability." With
+burn_hook=0 and both colors NULL -- every existing candidate, unedited --
+the ffmpeg argv is byte-identical to the pre-D-074 build, same discipline as
+D-063's own default path. The active post kit's hook_withheld variant is
+what gets burned (post_kits has no selected-variant column; withheld is the
+deliberate default, see fetch_active_hook_variant). No kit yet is NOT an
+error: the render proceeds without the hook, logged loudly.
+
 Deliberately NO obs_guard: this worker runs server-side in the n8n container
 (no OBS, no encoder to protect) and its input is a seconds-long slice, not a
 multi-hour VOD. D-009's gate protects the streaming Macs, not this box.
@@ -454,12 +475,235 @@ def escape_filter_value(value: str) -> str:
     return ''.join(('\\' + ch) if ch in FILTER_ESCAPE_PASS1 else ch for ch in inner)
 
 
-def subtitles_filter(srt_path: str) -> str:
-    """The single filter appended to the D-023 chain when captions are on."""
+def subtitles_filter(srt_path: str, caption_color: str | None = None) -> str:
+    """The single filter appended to the D-023 chain when captions are on.
+
+    caption_color (clip_candidates.caption_color, D-074) is None on every
+    pre-D-074 candidate and on any candidate the operator never touched, and
+    None reproduces CAPTION_FORCE_STYLE's original literal byte for byte via
+    build_caption_force_style -- see that function.
+    """
     return (
         f'subtitles=filename={escape_filter_value(str(srt_path))}'
-        f':force_style={escape_filter_value(CAPTION_FORCE_STYLE)}'
+        f':force_style={escape_filter_value(build_caption_force_style(caption_color))}'
     )
+
+
+# ---------------------------------------------------------------------------
+# D-074 HOOK BURN + OPERATOR COLOR CHOICES (2026-08-08)
+#
+# An amendment to D-063, not a replacement: burning the hook is an OPT-IN
+# (clip_candidates.burn_hook, migration 010, DEFAULT 0), and picking a color
+# is optional too (caption_color / hook_color, both nullable). With every one
+# of those three columns at its default/NULL, this renderer's output is
+# byte-identical to the pre-D-074 build -- verified by the inert proof.
+#
+# THE OPERATOR'S OWN REQUIREMENT: "background and foreground should change
+# based on readability." So the backing (outline + semi-opaque box) is never
+# a fixed choice, it is DERIVED from the chosen ink color's WCAG relative
+# luminance -- light ink keeps this renderer's original dark backing, dark
+# ink flips to a light one. The review UI duplicates this exact formula in
+# JavaScript for its live preview (review_ui.html); THIS function is the
+# truth, the preview is presentation-only.
+# ---------------------------------------------------------------------------
+
+HEX_COLOR_RE = re.compile(r'^#?([0-9A-Fa-f]{6})$')
+
+# The ink every reader falls back to when the operator has not chosen one, or
+# chose something migration 010's CHECK would have rejected. White, because
+# it is EXACTLY the color CAPTION_FORCE_STYLE has always burned, so
+# parse_hex_color(None) reproduces today's caption style byte for byte.
+DEFAULT_INK_HEX = 'FFFFFF'
+
+
+def parse_hex_color(value: str | None) -> str:
+    """A bare 6-hex-digit RRGGBB string (no '#', uppercase) for `value`, or
+    DEFAULT_INK_HEX when `value` is None or fails the same regex migration
+    010 enforces at the database. The CHECK constraint already stops a bad
+    value from being stored; this is the second line of defense for any
+    caller (a stale row from before the CHECK existed, a hand-built test
+    fixture) and the ONE place that decides what "no real color" renders as.
+    """
+    if isinstance(value, str):
+        m = HEX_COLOR_RE.match(value.strip())
+        if m:
+            return m.group(1).upper()
+    return DEFAULT_INK_HEX
+
+
+def relative_luminance(hex_rgb: str) -> float:
+    """WCAG relative luminance of a 6-hex-digit RRGGBB string, in [0, 1].
+    https://www.w3.org/TR/WCAG21/#dfn-relative-luminance -- the standard
+    formula, not a perceptual approximation: each channel is normalized to
+    [0, 1], gamma-expanded, then combined with the ITU-R BT.709 weights.
+    """
+    def channel(cc: str) -> float:
+        v = int(cc, 16) / 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = channel(hex_rgb[0:2]), channel(hex_rgb[2:4]), channel(hex_rgb[4:6])
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def ass_bgr(hex_rgb: str, alpha_hex: str) -> str:
+    """A 6-hex-digit RRGGBB string to an ASS &HAABBGGRR color literal. ASS
+    stores color channels in BLUE-GREEN-RED order (the reverse of CSS/HTML
+    hex), behind a leading alpha byte where 00 is fully opaque and FF is
+    fully transparent -- the opposite sense of a CSS alpha channel.
+    """
+    rr, gg, bb = hex_rgb[0:2], hex_rgb[2:4], hex_rgb[4:6]
+    return f'&H{alpha_hex}{bb}{gg}{rr}'.upper()
+
+
+def auto_contrast_backing(hex_rgb: str) -> tuple[str, str]:
+    """(OutlineColour, BackColour) ASS literals that stay legible against
+    `hex_rgb` ink, the operator's readability rule made concrete. Light ink
+    (relative luminance > 0.5) gets this renderer's ORIGINAL dark outline and
+    dark semi-opaque box (the exact literals CAPTION_FORCE_STYLE has always
+    used); dark ink flips to a white outline and a light semi-opaque box.
+    0.5 is the WCAG mid-point, not a tuned threshold -- there was no prior
+    art to tune against, and the mid-point is the honest "which one is it
+    closer to" boundary.
+    """
+    if relative_luminance(hex_rgb) > 0.5:
+        return ass_bgr('000000', '00'), ass_bgr('000000', '80')
+    return ass_bgr('FFFFFF', '00'), ass_bgr('FFFFFF', '80')
+
+
+def build_caption_force_style(caption_color: str | None) -> str:
+    """The caption ASS force_style string, dynamic on the operator's chosen
+    ink (clip_candidates.caption_color). Every field but PrimaryColour/
+    OutlineColour/BackColour is exactly the geometry measured and retuned
+    2026-08-08 (see the block comment above CAPTION_FORCE_STYLE) -- unchanged
+    by this function. With caption_color None or invalid this reproduces the
+    pre-D-074 literal 'PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,
+    BackColour=&H80000000' byte for byte (the inert proof asserts this
+    equality against the original CAPTION_FORCE_STYLE constant).
+    """
+    ink_hex = parse_hex_color(caption_color)
+    primary = ass_bgr(ink_hex, '00')
+    outline, back = auto_contrast_backing(ink_hex)
+    return (
+        'FontName=Liberation Sans,Bold=1,FontSize=9,'
+        f'PrimaryColour={primary},OutlineColour={outline},BackColour={back},'
+        'BorderStyle=1,Outline=1.6,Shadow=0.8,'
+        'Alignment=2,MarginL=30,MarginR=30,MarginV=68'
+    )
+
+
+# ---------------------------------------------------------------------------
+# THE BURNED HOOK. A second, independent `subtitles` filter pass rather than
+# a second style folded into the captions' own .ass, for two reasons:
+#   1. The captions path is SRT + force_style, proven and calibrated (the
+#      block comment above CAPTION_FORCE_STYLE). Reusing it completely
+#      unchanged means adding the hook can never regress D-063's captions
+#      geometry, whatever the hook path does.
+#   2. A dedicated .ass file for the hook ALONE can declare its own
+#      PlayResX/PlayResY matching the final frame (1080x1920) exactly, so
+#      every geometry number below is a REAL PIXEL VALUE -- no need for the
+#      288x384-canvas scaling math the caption style carries (that scaling
+#      exists only because ffmpeg's SRT-to-ASS auto-conversion assumes a
+#      384x288 default canvas when the SRT itself declares none; a hand-
+#      authored .ass has no such default to work around).
+# Two `subtitles` filters chain in one linear filter_complex exactly like any
+# other pair of sequential filters: the second reads the first's output.
+#
+# GEOMETRY, matching the review UI mockup's .hookband CSS (review_ui.html):
+#   top: 16%       -> MarginV = 0.16 * 1920 = 307.2 px, rounded to 307.
+#   left/right: 6% -> MarginL = MarginR = 0.06 * 1080 = 64.8 px, rounded to 65.
+# FontSize = 90: "~1.5x caption size" per the brief -- the caption em is
+#   FontSize=9 on the 288-tall canvas = 9 * (1920/288) = 60 real px; 60 * 1.5
+#   = 90, and this file's own PlayResY=1920 makes 90 a real pixel value with
+#   no further scaling.
+# Outline=16 / Shadow=8: the SAME stroke-to-em ratio measured for captions
+#   (Outline 1.6 * 6.667 = 10.67 real px on a 60px em = 17.8% of the em),
+#   scaled by the identical 1.5x as FontSize: 10.67 * 1.5 = 16.0,
+#   5.33 * 1.5 = 8.0 -- both land on clean integers.
+# BorderStyle=1 (stroke + shadow, never a box) for the same reason D-063's
+#   caption style uses it: a box reads as "majority text" faster than a
+#   stroke does, and majority-text framing is exactly what D-061 exists to
+#   avoid.
+# Alignment=8 (top-center): libass's numpad-style alignment, top row.
+# ---------------------------------------------------------------------------
+
+HOOK_PLAY_RES_W = 1080
+HOOK_PLAY_RES_H = 1920
+HOOK_FONT_SIZE = 90
+HOOK_MARGIN_V = 307
+HOOK_MARGIN_LR = 65
+HOOK_OUTLINE = 16
+HOOK_SHADOW = 8
+
+
+def ass_escape_hook_text(text: str) -> str:
+    """Escape a human-typed hook for safe inclusion in an ASS Dialogue Text
+    field. `{` and `}` open/close an ASS override block; unescaped, either
+    one in operator-typed text would be parsed as (almost certainly invalid)
+    styling and could swallow everything after it. `\\{` / `\\}` are ASS's
+    own literal-brace escapes. A real newline becomes `\\N`, ASS's hard line
+    break (plain `\\n` is a soft break libass does not always honor). Commas
+    need no escaping: Text is the LAST field of a Dialogue line, so the ASS
+    spec itself takes everything after the 9th comma verbatim to end of line.
+    """
+    escaped = text.replace('{', '\\{').replace('}', '\\}')
+    return re.sub(r'\r\n|\r|\n', r'\\N', escaped)
+
+
+def ass_timestamp(seconds: float) -> str:
+    """H:MM:SS.CC -- the ASS Dialogue timestamp format (centiseconds)."""
+    total_cs = round(max(0.0, seconds) * 100)
+    cs = total_cs % 100
+    total_s = total_cs // 100
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f'{h}:{m:02d}:{s:02d}.{cs:02d}'
+
+
+def build_hook_ass_text(hook_text: str, hook_color: str | None, duration_s: float) -> str:
+    """A complete, self-contained .ass burning ONE static hook line for the
+    whole clip. Its own PlayResX/PlayResY = the real 1080x1920 output frame,
+    so every field below is a real pixel value (see the geometry block
+    above) with none of the caption style's canvas-scaling arithmetic.
+    """
+    ink_hex = parse_hex_color(hook_color)
+    primary = ass_bgr(ink_hex, '00')
+    outline, back = auto_contrast_backing(ink_hex)
+    style = (
+        f'Style: Hook,Liberation Sans,{HOOK_FONT_SIZE},{primary},&H000000FF,'
+        f'{outline},{back},-1,0,0,0,100,100,0,0,1,{HOOK_OUTLINE},{HOOK_SHADOW},'
+        f'8,{HOOK_MARGIN_LR},{HOOK_MARGIN_LR},{HOOK_MARGIN_V},1'
+    )
+    dialogue = (
+        f'Dialogue: 0,{ass_timestamp(0)},{ass_timestamp(duration_s)},Hook,,0,0,0,,'
+        f'{ass_escape_hook_text(hook_text)}'
+    )
+    return (
+        '[Script Info]\n'
+        'ScriptType: v4.00+\n'
+        f'PlayResX: {HOOK_PLAY_RES_W}\n'
+        f'PlayResY: {HOOK_PLAY_RES_H}\n'
+        'WrapStyle: 0\n'
+        'ScaledBorderAndShadow: yes\n'
+        '\n'
+        '[V4+ Styles]\n'
+        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, '
+        'BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, '
+        'BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n'
+        f'{style}\n'
+        '\n'
+        '[Events]\n'
+        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
+        f'{dialogue}\n'
+    )
+
+
+def hook_subtitles_filter(ass_path) -> str:
+    """The single filter that burns the hook. No force_style: the style
+    lives IN the .ass file's own [V4+ Styles] section (build_hook_ass_text),
+    so there is nothing to override at the filter level.
+    """
+    return f'subtitles=filename={escape_filter_value(str(ass_path))}'
 
 
 def ffmpeg_has_subtitles_filter() -> bool:
@@ -481,10 +725,26 @@ def ffmpeg_has_subtitles_filter() -> bool:
     return False
 
 
-def require_subtitles_capability(candidate_id: int) -> None:
-    """Fail loudly, naming this machine, when asked to burn on a build that cannot."""
+def require_subtitles_capability(candidate_id: int, feature: str = 'captions') -> None:
+    """Fail loudly, naming this machine, when asked to burn on a build that
+    cannot. Shared by BOTH burn paths (D-063 captions, D-074 hook): the probe
+    is identical either way, since both ride the same `subtitles` filter.
+    `feature` only changes which flag/label the message names.
+    """
     if ffmpeg_has_subtitles_filter():
         return
+    if feature == 'hook':
+        raise RuntimeError(
+            f'HOOK_UNSUPPORTED: candidate_id={candidate_id} asks for a burned-in hook '
+            f'(clip_candidates.burn_hook=1) but the ffmpeg on host '
+            f'"{socket.gethostname()}" has no `subtitles` filter, so it was built without '
+            'libass and cannot burn anything. Refusing to render: a hook silently dropped '
+            'from a file delivered against an explicit request is exactly the lie this '
+            'check exists to prevent. Fixes: render this candidate on the n8n server lane '
+            '(its ffmpeg has libass), or install an ffmpeg build that includes libass on '
+            'this machine, or untick "Burn hook text into video" for this clip in the '
+            'review UI.'
+        )
     raise RuntimeError(
         f'CAPTIONS_UNSUPPORTED: candidate_id={candidate_id} asks for burned-in captions '
         f'(clip_candidates.burn_captions=1) but the ffmpeg on host '
@@ -541,6 +801,37 @@ def build_caption_srt_text(cur, recording_id: int, clip_t0_abs_s: float,
     # delivered artifact this ruling never touched.
     cues = split_long_cues(cues)
     return build_srt.render_srt(cues), len(cues)
+
+
+def fetch_active_hook_variant(cur, candidate_id: int) -> str | None:
+    """The active post kit's on-video hook text, or None when no active kit
+    exists (or its hook_withheld is somehow blank -- the schema forbids that
+    for a 'generated' kit, but an 'operator_edit' kit is not held to the same
+    length CHECK, so this stays defensive rather than trusting the row).
+
+    VARIANT A (hook_withheld) ONLY. post_kits (003) stores three deliberately
+    different hook variants (withheld/domain/payoff, D-061) and no column
+    records which one the operator is treating as "the" hook: the review
+    UI's own selection (hookPick) is LOCAL browser state, never persisted
+    (its own comment: "The choice is persisted only by Save, as part of the
+    version he was reading"). So there is no selected-variant fact to read
+    here. hook_withheld is the deliberate default: it is the first variant
+    offered in the UI, the one every kit view opens on
+    (selectedHookKey() falls back to 'withheld'), and withholding is the
+    least presumptive of the three concreteness levels (003's own reasoning
+    for spreading the variants along that axis, rather than guessing which
+    level reads best). A real selected-variant column is a follow-up
+    decision, not this one's.
+    """
+    cur.execute(
+        'SELECT hook_withheld FROM post_kits WHERE candidate_id = %s AND is_active = 1',
+        (candidate_id,),
+    )
+    row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    text = str(row[0])
+    return text if text.strip() else None
 
 
 def load_sidecar(sidecar_path: Path, candidate_id: int) -> dict:
@@ -648,7 +939,8 @@ def fetch_candidate(cur, candidate_id: int) -> dict:
                c.adjusted_start_s, c.adjusted_end_s,
                c.state, r.session_label,
                {category_select} AS category,
-               c.burn_captions
+               c.burn_captions,
+               c.burn_hook, c.caption_color, c.hook_color
         FROM clip_candidates c
         JOIN recordings r ON r.id = c.recording_id
         WHERE c.id = %s
@@ -669,6 +961,9 @@ def fetch_candidate(cur, candidate_id: int) -> dict:
         'session_label': str(row[6]),
         'category': str(row[7]) if row[7] is not None else 'unknown',
         'burn_captions': int(row[8]),
+        'burn_hook': int(row[9]),
+        'caption_color': row[10],
+        'hook_color': row[11],
     }
 
 
@@ -682,6 +977,8 @@ def render_from_slice(candidate_id: int) -> int:
     # D-063: declared out here so the OUTERMOST finally can remove the scratch
     # SRT on literally every exit path, not merely the ones around the encode.
     srt_path: Path | None = None
+    # D-074: same reasoning, for the scratch hook .ass.
+    hook_ass_path: Path | None = None
 
     conn = db.connect()
     try:
@@ -798,12 +1095,17 @@ def render_from_slice(candidate_id: int) -> int:
             cand['session_label'], cand['start_s'], cand['category'], candidate_id
         )
 
-        # Copied EXACTLY from cut_clip.py (operator-proven live on Instagram, D-023).
-        filter_complex = FILTER_COMPLEX_D023
+        # `filter_stages` starts as ONLY the D-023 body (no label). Copied
+        # EXACTLY from cut_clip.py (operator-proven live on Instagram, D-023).
+        # With NEITHER captions NOR the hook requested, `','.join([body]) +
+        # '[v]'` below reduces to `body + '[v]'`, which is FILTER_COMPLEX_D023
+        # itself, byte for byte -- the D-074 refactor that lets captions AND
+        # the hook chain onto the SAME linear filtergraph changes nothing on
+        # the default path (asserted by the inert proof).
+        filter_stages = [FILTER_COMPLEX_D023_BODY]
 
         # ---- D-063 captions: build the SRT and splice ONE filter in ---------
-        # Everything in this block is skipped entirely when the flag is 0, and
-        # `filter_complex` above is then the pre-D-063 literal byte for byte.
+        # Everything in this block is skipped entirely when the flag is 0.
         captions_requested = 1 if cand['burn_captions'] == 1 else 0
         captions_burned = 0
         captions_cue_count = None
@@ -833,14 +1135,53 @@ def render_from_slice(candidate_id: int) -> int:
                 with os.fdopen(fd, 'w', encoding='utf-8') as fh:
                     fh.write(srt_text)
                 srt_path = Path(tmp_name)
-                filter_complex = (
-                    FILTER_COMPLEX_D023_BODY + ',' + subtitles_filter(srt_path) + '[v]'
-                )
+                filter_stages.append(subtitles_filter(srt_path, cand['caption_color']))
                 captions_burned = 1
                 print(
                     f'CAPTIONS_ON candidate={candidate_id} cues={captions_cue_count} '
                     f'srt="{srt_path}" bytes={len(srt_text.encode("utf-8"))}'
                 )
+
+        # ---- D-074 hook: fetch the active kit's variant A and splice ONE ----
+        # more filter in, chained AFTER captions (order does not matter here:
+        # the two bands, top and bottom, never overlap). Everything in this
+        # block is skipped entirely when the flag is 0.
+        hook_requested = 1 if cand['burn_hook'] == 1 else 0
+        hook_burned = 0
+
+        if hook_requested == 1:
+            hook_text = fetch_active_hook_variant(cur, candidate_id)
+            if hook_text is None:
+                # No active kit yet (the common case: kits generate AFTER
+                # delivery, D-061). Nothing to burn, nothing written, and the
+                # render proceeds exactly as if burn_hook were 0 -- this is
+                # NOT an error, matching the captions no-speech case above.
+                print(
+                    f'HOOK_NO_KIT candidate={candidate_id} burn_skipped=1 '
+                    'render_continues=1'
+                )
+            else:
+                # Capability first, same discipline as captions -- but only
+                # once there is genuinely something to burn, so a machine
+                # without libass never fails a render that would have skipped
+                # the hook anyway (the no-kit case above).
+                require_subtitles_capability(candidate_id, feature='hook')
+
+                ass_text = build_hook_ass_text(hook_text, cand['hook_color'], cut_duration_s)
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f'clpr_c{candidate_id}_hook_', suffix='.ass'
+                )
+                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                    fh.write(ass_text)
+                hook_ass_path = Path(tmp_name)
+                filter_stages.append(hook_subtitles_filter(hook_ass_path))
+                hook_burned = 1
+                print(
+                    f'HOOK_ON candidate={candidate_id} text="{hook_text}" '
+                    f'ass="{hook_ass_path}" bytes={len(ass_text.encode("utf-8"))}'
+                )
+
+        filter_complex = ','.join(filter_stages) + '[v]'
 
         # D-055: ALWAYS trim — the slice carries SLICE_PAD_S headroom, so
         # rendering it whole would ship a ~20s-too-long clip. The trim is
@@ -959,7 +1300,8 @@ def render_from_slice(candidate_id: int) -> int:
                 f'RESULT render_from_slice candidate={candidate_id} ok=1 '
                 f'file="{out_path}" duration_s={duration_s:.3f} '
                 f'captions_requested={captions_requested} captions_burned={captions_burned} '
-                f'captions_cue_count={"" if captions_cue_count is None else captions_cue_count}'
+                f'captions_cue_count={"" if captions_cue_count is None else captions_cue_count} '
+                f'hook_requested={hook_requested} hook_burned={hook_burned}'
             )
             return 0
         except Exception:
@@ -984,6 +1326,9 @@ def render_from_slice(candidate_id: int) -> int:
         # failure between writing it and reaching the encode.
         if srt_path is not None and srt_path.exists():
             srt_path.unlink()
+        # D-074: the hook .ass is scratch too, same discipline.
+        if hook_ass_path is not None and hook_ass_path.exists():
+            hook_ass_path.unlink()
 
 
 def parse_args() -> argparse.Namespace:
