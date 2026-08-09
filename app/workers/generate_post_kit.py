@@ -16,31 +16,51 @@ Per clip it produces THREE distinct things, in the operator's own vocabulary
      from the whisper segments already stored for this window.
   3. VIDEO CAPTION — the post descriptor, plus at most three hashtags.
 
-TWO MODEL CALLS, BOTH THROUGH OPENROUTER (D-062 ruling 3). OpenRouter was the
-operator's preference AND is the only path that can honour his quality ruling:
-n8n's native Gemini node exposes no fps and no media_resolution control, so it
-would silently run at provider defaults, which is exactly the lever D-061
-ruled on.
+TWO MODEL CALLS. ONLY ONE OF THEM STILL GOES THROUGH OPENROUTER (D-066 moved
+the other one off it). D-062 ruling 3 originally routed BOTH calls through
+OpenRouter because n8n's native Gemini node exposes no fps and no
+media_resolution control, and OpenRouter's provider.options passthrough was
+the only path that could reach those knobs. D-066 replaced that path for the
+vision call with a direct upload to the Gemini Files API
+(app/workers/gemini_files.py), which takes fps and media_resolution
+natively, has no comparable request-body ceiling, and was measured
+2026-08-07 to stop the downscale-driven fabrication that motivated the
+change: a downscaled copy of a clip reported black-frame cuts that do not
+exist in the full-quality file.
 
-  CALL 1 — Gemini WATCHES the clip. The clip travels as a base64 data URL in a
-  video_url content part, together with the VERBATIM transcript, because the
-  model hears the audio natively but mis-hears this project's vocabulary
-  (n8n, psycopg2, Coolify) and whisper already got it right.
+  CALL 1 — Gemini WATCHES the clip, via gemini_files.py, NOT OpenRouter. The
+  DELIVERED clip is uploaded to Google's Files API at full quality (no
+  base64 inlining, no downscale, no video_url content part), the upload is
+  verified before anything downstream trusts it (sha256 + createTime
+  witnesses), generateContent runs against the uploaded file_uri, and the
+  file is deleted afterward. It travels together with the VERBATIM
+  transcript, because the model hears the audio natively but mis-hears this
+  project's vocabulary (n8n, psycopg2, Coolify) and whisper already got it
+  right.
 
   CALL 2 — Haiku WRITES the kit from Gemini's description PLUS the same
-  verbatim transcript. Haiku holding the real transcript is a CORRECTNESS
-  requirement, not a quality preference: the strongest hooks are lines the
-  speaker actually said, and a model reconstructing a quote from a prose
-  summary would be inventing one. An invented quote on a public post is
-  exactly the over-claim the charter forbids.
+  verbatim transcript. This call is still text-only through OpenRouter (see
+  writer_payload: no video part anywhere in it). Haiku holding the real
+  transcript is a CORRECTNESS requirement, not a quality preference: the
+  strongest hooks are lines the speaker actually said, and a model
+  reconstructing a quote from a prose summary would be inventing one. An
+  invented quote on a public post is exactly the over-claim the charter
+  forbids.
 
-QUALITY PASSTHROUGH, DEGRADED LOUDLY, NEVER SILENTLY. OpenRouter forwards
-provider-specific keys under provider.options keyed by provider slug, and each
-endpoint publishes allowed_passthrough_parameters. This worker READS that list
-at runtime and sends only what the endpoint accepts, then records what was
-requested, what was accepted and what was dropped, both on stdout and in the
-kit row (passthrough_degraded). A kit that ran at provider defaults is
-queryable afterwards instead of being a log line nobody reads.
+QUALITY PASSTHROUGH IS DEAD CODE ON THE LIVE PATH (D-066). OpenRouter
+forwards provider-specific keys under provider.options keyed by provider
+slug, and each endpoint publishes allowed_passthrough_parameters -- that is
+what fetch_endpoints/build_provider_options/log_passthrough below implement.
+None of the three has a call site left in this file: grepped, each name
+appears only at its own `def`, plus one further shared mention where all
+three are named together in the in-body comment at the D-066 cutover below
+-- never inside a call expression. They existed to get fps and media_resolution onto
+an OpenRouter vision request; now that the vision call goes to Gemini's own
+API directly, there is nothing left to negotiate, so they stay defined but
+unwired rather than deleted (this pass is docs-only). The INSERT into
+post_kits now passes passthrough_degraded=None, not 0: NULL means "the
+negotiation does not apply to this row", a different fact from "nothing was
+refused".
 
 THE ANTI-INVENTION GATES (any failure writes ZERO rows and fails loudly, the
 same shape as transcript_signal_ingest.py's response gating):
@@ -89,23 +109,36 @@ ask's, so a wobble on the rewrite does not burn the whole kit after the vision
 call is already paid. A transport fault or a second invented quote on the
 rewrite still exits immediately, exactly as before this fix.
 
-THE PAYLOAD CEILING, CHECKED BEFORE SENDING (D-064). OpenRouter sits behind
-Cloudflare, whose standard maximum request body is 100 MB, and base64 inflates a
-file by 4/3. Measured 2026-08-07 against the live API: a 4.7 MB clip made a
-6.2 MB payload and worked, a 35.4 MB clip made a 47.2 MB payload and worked, and
-an 89.4 MB clip made a 119.2 MB payload that returned 502 five times out of five.
-That 502 called ITSELF retryable, so the retry policy below would have re-uploaded
-the whole video until the attempt cap, every run, forever. So the exact body size
-is computed from the file's size BEFORE the request is built, and when it would
-breach the ceiling (CLPR_POST_KIT_MAX_PAYLOAD_BYTES, default 50,000,000) a
-THROWAWAY downscaled copy is transcoded for the model alone and deleted the
-moment it is encoded. Operator ruling 2026-08-07, verbatim: "for now downscale".
-THE DELIVERED CLIP IS NEVER MODIFIED, a clip under the ceiling produces a
-byte-identical request to the one it produced before this existed, and a kit
-written from a degraded input records that fact with the real numbers
-(post_kits.analysis_downscaled and friends, migration 008). When even a
-downscaled copy cannot fit, the run fails loudly with the numbers and names the
-real fix, which is the Gemini Files API.
+THE PAYLOAD CEILING MACHINERY BELOW IS DEAD ON THE LIVE PATH (D-064, then
+D-066 shipped the fix D-064 itself named). D-064 first mitigated OpenRouter's
+Cloudflare-fronted request ceiling: Cloudflare's standard maximum request
+body is 100 MB, and base64 inflates a file by 4/3. Measured 2026-08-07
+against the live API: a 4.7 MB clip made a 6.2 MB payload and worked, a
+35.4 MB clip made a 47.2 MB payload and worked, and an 89.4 MB clip made a
+119.2 MB payload that returned 502 five times out of five. That 502 called
+ITSELF retryable, so the retry policy below would have re-uploaded the whole
+video until the attempt cap, every run, forever. D-064's mitigation computed
+the exact body size from the file's size BEFORE the request was built, and
+when it would breach the ceiling (CLPR_POST_KIT_MAX_PAYLOAD_BYTES, default
+50,000,000) transcoded a THROWAWAY downscaled copy for the model alone,
+deleted the moment it was encoded (operator ruling 2026-08-07, verbatim:
+"for now downscale"). THAT DOWNSCALE WAS ITSELF MEASURED FABRICATING SCENE
+DESCRIPTIONS (see gemini_files.py's module docstring): full quality reported
+"the feed is intact for the whole clip" while a downscaled copy of the same
+15 seconds reported black-frame cuts that do not exist in the file. So the
+"real fix" this section used to point to, the Gemini Files API, is no longer
+a future direction -- D-066 shipped it. The vision call now uploads the
+DELIVERED clip at full quality through gemini_files.py, which has no
+comparable request-body ceiling, so no downscale copy is ever built for
+analysis anymore. payload_ceiling_bytes, transcode_for_analysis,
+ffprobe_video and their constants (CLOUDFLARE_ASSUMED_MAX_BODY_BYTES,
+DEFAULT_PAYLOAD_CEILING_BYTES, the ANALYSIS_* block) are still defined below
+-- this pass is docs-only, it does not delete them -- but grepped, none has
+a call site left outside its own definition (transcode_for_analysis calls
+ffprobe_video internally; that is dead code calling dead code, not a live
+caller). post_kits.analysis_downscaled is always written 0 on the live path
+now (see the INSERT), which is the honest record of "no downscale ever
+happens here", not the degraded case migration 008 was built to describe.
 
 TRANSIENT TRANSPORT FAULTS RETRY THEMSELVES. Of 27 clips in that same batch, 6
 failed and 5 of those succeeded on an IDENTICAL later retry with no code
