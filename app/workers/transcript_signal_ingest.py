@@ -62,13 +62,23 @@ def load_responses(path: str) -> dict:
     return data
 
 
-def collect_scan_rows(scan_items: list, responses: dict[str, str], duration_s: float) -> list[Row]:
-    """Mirror detect_transcript_categories' per-response handling exactly."""
+def collect_scan_rows(scan_items: list, responses: dict[str, str], duration_s: float) -> tuple[list[Row], int]:
+    """Mirror detect_transcript_categories' per-response handling exactly.
+
+    R4/ID-03: a single malformed candidate object (missing/None/non-numeric
+    start_s or end_s, etc.) used to raise out of this loop, aborting the
+    whole VOD after every already-paid-for LLM call with an undiagnosable
+    "ERROR: 'start_s'". Now that item is counted + logged (call_id + the
+    item verbatim) and skipped; every other candidate still lands. A numeric
+    STRING like '12.5' is valid (float() parses it fine) and is not counted.
+    """
     out: list[Row] = []
     seen: set[tuple[int, int, str]] = set()
+    malformed = 0
 
     for meta, _prompt in scan_items:
-        raw = responses[scan_call_id(meta['chunk_index'])]
+        call_id = scan_call_id(meta['chunk_index'])
+        raw = responses[call_id]
         # Malformed payload raises -> whole run fails, zero rows (monolith parity:
         # json.loads raises inside call_claude_structured, uncaught in the scan loop).
         data = json.loads(ts.extract_json_payload(raw))
@@ -82,9 +92,18 @@ def collect_scan_rows(scan_items: list, responses: dict[str, str], duration_s: f
             category = str(item.get('category', '')).strip()
             if category not in ts.CATEGORIES:
                 continue
-            start_s, end_s = ts.normalize_window(float(item['start_s']), float(item['end_s']), duration_s)
-            reason = str(item.get('reason', '')).strip() or 'model-selected transcript moment'
-            confidence = ts.clamp(float(item.get('confidence', 0.0)), 0.0, 1.0)
+
+            try:
+                start_s, end_s = ts.normalize_window(float(item['start_s']), float(item['end_s']), duration_s)
+                reason = str(item.get('reason', '')).strip() or 'model-selected transcript moment'
+                confidence = ts.clamp(float(item.get('confidence', 0.0)), 0.0, 1.0)
+            except (KeyError, TypeError, ValueError) as exc:
+                malformed += 1
+                print(
+                    f'MALFORMED scan candidate call_id={call_id} error={exc!r} item={item!r}',
+                    file=sys.stderr,
+                )
+                continue
 
             key = (int(round(start_s * 1000)), int(round(end_s * 1000)), category)
             if key in seen:
@@ -92,7 +111,7 @@ def collect_scan_rows(scan_items: list, responses: dict[str, str], duration_s: f
             seen.add(key)
             out.append((start_s, end_s, category, reason, confidence, 'transcript_scan', None))
 
-    return out
+    return out, malformed
 
 
 def collect_zebra_rows(zebra_items: list, responses: dict[str, str], duration_s: float) -> list[Row]:
@@ -174,7 +193,7 @@ def run(recording_id: int, responses_path: str) -> int:
 
         responses = {str(item['call_id']): str(item.get('response_text') or '') for item in items}
 
-        transcript_rows = collect_scan_rows(scan_items, responses, duration_s)
+        transcript_rows, malformed = collect_scan_rows(scan_items, responses, duration_s)
         zebra_rows = collect_zebra_rows(zebra_items, responses, duration_s)
 
         # autocommit is OFF: the reads above already opened the transaction
@@ -194,7 +213,7 @@ def run(recording_id: int, responses_path: str) -> int:
         f'RESULT transcript_signal_ingest recording={recording_id} items={len(items)} '
         f'rows_inserted={inserted} rows_skipped_duplicate={attempted - inserted} '
         f'scan_rows={len(transcript_rows)} scan_inserted={inserted_transcript} '
-        f'zebra_rows={len(zebra_rows)} zebra_inserted={inserted_zebra}'
+        f'zebra_rows={len(zebra_rows)} zebra_inserted={inserted_zebra} malformed={malformed}'
     )
     return 0
 

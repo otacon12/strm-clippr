@@ -235,6 +235,12 @@ def run(recording_id: int) -> int:
                         beat_written += 1
                     else:
                         signal_written += 1
+
+        # R6/ID-12: state never left 'transcribed' — advance it here, in the
+        # same transaction as the candidate writes above, so a rollback on
+        # failure also rolls back the state (CHECK constraint: 001 allows
+        # 'detected').
+        cur.execute("UPDATE recordings SET state = 'detected' WHERE id = %s", (recording_id,))
         conn.commit()
     except Exception:
         conn.rollback()

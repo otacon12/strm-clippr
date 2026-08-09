@@ -70,7 +70,13 @@ def ingest(recording_id: int) -> int:
     conn = db.connect()
     try:
         cur = conn.cursor()
-        recording_path, session_label, duration_s = fetch_recording(cur, recording_id)
+        # R7/LO-16: session_label is derived from the LOCAL insert date
+        # (chat_capture.today_session_label()), so filtering on it here
+        # dropped post-midnight-local chat that the UTC instant window below
+        # would otherwise accept. The window filter is already correct
+        # (proper tz-aware datetime comparison); session_label was the
+        # defect, so it is no longer part of the selection at all.
+        recording_path, _session_label, duration_s = fetch_recording(cur, recording_id)
         recording_start = parse_obs_filename_start_utc(recording_path)
         recording_end = recording_start + dt.timedelta(seconds=duration_s)
 
@@ -78,10 +84,8 @@ def ingest(recording_id: int) -> int:
             '''
             SELECT id, ts_utc, author, text
             FROM chat_raw
-            WHERE session_label = %s
             ORDER BY id
-            ''',
-            (session_label,),
+            '''
         )
         raw_rows = cur.fetchall()
 

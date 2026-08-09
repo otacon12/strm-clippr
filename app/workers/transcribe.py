@@ -138,6 +138,13 @@ def transcribe(recording_id: int) -> int:
                 end_s = ts_to_seconds(to_ts)
                 segments.append((start_s, end_s, text))
 
+            if not segments:
+                raise RuntimeError(
+                    f'whisper produced 0 transcript segments for recording_id={recording_id} '
+                    f'vod_path="{recording_path}" json="{json_path}"; refusing to write, '
+                    f'existing transcript (if any) left untouched'
+                )
+
             # autocommit is OFF: the reads above already opened the transaction
             # implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
             persist_segments(cur, recording_id, segments)
