@@ -160,6 +160,15 @@ def _clip_fetch_lock(candidate_id: int) -> threading.Lock:
         return _clip_fetch_locks[candidate_id]
 
 
+# Find-clips (2026-08-09 operator ask: "the button to find clips should
+# actually live on the reviewer"). One global run at a time -- a
+# non-blocking acquire so a second overlapping POST refuses LOUDLY (409)
+# instead of silently firing a second finder run in n8n. The client already
+# guards against a fast double-click (its own in-flight flag), so this is
+# the backstop for any other path that reaches the handler concurrently.
+_find_clips_lock = threading.Lock()
+
+
 def _parse_iso_utc(text: str) -> datetime:
     """Parse the project's ISO-8601 'Z'-suffixed UTC timestamp format
     (see utc_now_iso, and render_from_slice.py's identical helper that writes
@@ -542,6 +551,46 @@ def fire_verdict_webhook(candidate_id: int, recording_id: int, old_state: str, n
             file=sys.stderr,
         )
         return 'failed'
+
+
+def fire_find_clips_webhook() -> tuple[str, int]:
+    """POST an empty form submission to CLPR_FINDER_WEBHOOK_URL -- the n8n
+    Form Trigger that starts a new clip-finding run. UNLIKE
+    fire_verdict_webhook this is NOT fire-and-forget: the operator clicked a
+    button and is watching for the result, so the raw outcome (the upstream
+    status code, or 0 when no response was ever received) is returned for
+    the caller to put straight in the HTTP response, never just swallowed
+    into a generic 'failed'.
+
+    Same UA lesson as fire_verdict_webhook (D-053/2026-08-07): the edge in
+    front of n8n (Cloudflare) 403s urllib's default `Python-urllib/<ver>`
+    User-Agent as a bot signature, so the identical header override is used
+    here.
+
+    Returns ('unconfigured', 0) | ('ok', <2xx status>) |
+    ('failed', <status, or 0 if the request never got a response at all>).
+    """
+    url = os.environ.get('CLPR_FINDER_WEBHOOK_URL', '').strip()
+    if not url:
+        return 'unconfigured', 0
+    req = urllib.request.Request(
+        url,
+        data=b'',
+        headers={
+            # An empty form's default HTML encoding: no fields, no boundary.
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'clpr-review-server/1.0',
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 'ok', resp.status
+    except urllib.error.HTTPError as exc:
+        return 'failed', exc.code
+    except Exception as exc:  # noqa: BLE001 -- report loudly, start nothing
+        print(f'FIND_CLIPS_WEBHOOK_FAILED error={exc!r}', file=sys.stderr)
+        return 'failed', 0
 
 
 def fetch_candidate_payload(cur, candidate_id: int) -> Optional[dict]:
@@ -1624,6 +1673,38 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
         self._send_json(HTTPStatus.OK, updated)
 
+    def _find_clips(self) -> None:
+        """POST /api/find-clips: fire the n8n Form Trigger that starts a new
+        clip-finding run over the operator's recordings. No DB row here --
+        n8n owns everything about the run itself; this endpoint only starts
+        it and reports whether the start succeeded.
+        """
+        if not _find_clips_lock.acquire(blocking=False):
+            self._send_json(HTTPStatus.CONFLICT, {
+                'started': False,
+                'error': 'A find-clips run is already starting. Wait a moment and try again.',
+            })
+            return
+        try:
+            result, status = fire_find_clips_webhook()
+            if result == 'unconfigured':
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                    'started': False,
+                    'error': 'CLPR_FINDER_WEBHOOK_URL is not set, so nothing would run the '
+                             'clip search. Set it in the environment before using this button.',
+                })
+                return
+            if result == 'ok' and 200 <= status < 300:
+                self._send_json(HTTPStatus.OK, {'started': True})
+                return
+            self._send_json(HTTPStatus.BAD_GATEWAY, {
+                'started': False,
+                'error': f'The find-clips webhook did not succeed (status={status}).',
+                'status': status,
+            })
+        finally:
+            _find_clips_lock.release()
+
     def _rerender_clip(self, candidate_id: int, body_raw: bytes) -> None:
         """RE-RENDER an already-rendered clip, so a caption decision taken after
         delivery can actually reach Drive.
@@ -2104,6 +2185,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
             content_len = int(self.headers.get('Content-Length', '0') or '0')
             body_raw = self.rfile.read(content_len) if content_len > 0 else b''
             self._save_profile(body_raw)
+            return
+
+        if parsed.path == '/api/find-clips':
+            content_len = int(self.headers.get('Content-Length', '0') or '0')
+            if content_len > 0:
+                _ = self.rfile.read(content_len)  # the client sends no body; drain defensively
+            self._find_clips()
             return
 
         m = POST_ACTION_RE.match(parsed.path)
