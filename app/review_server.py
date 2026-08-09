@@ -652,6 +652,58 @@ def is_finite_number(v: object) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+# ---------------------------------------------------------------- run progress
+# GET /api/run-progress (2026-08-09 operator ask: "anyway to add a progress
+# bar to shpw real dynamic progressiom" — REAL progress from real witnesses,
+# never a fake timer). compute_run_stages is the one place the four-stage
+# pipeline model lives, so the HTTP handler and this project's own test
+# harness can both exercise the identical function.
+RUN_STAGES = ('fetch', 'transcribe', 'detect', 'score')
+
+# Membership sets, NOT a lexicographic '>=' compare on recordings.state text.
+# Alphabetically 'detected' < 'transcribed', so a naive string '>=' would
+# call a detected-or-later recording NOT yet transcribed — exactly the trap
+# charter gate 21 (one instant, one format) warns about. Same shape as this
+# codebase's own zebra_detect.is_recording_ready() (app/workers/zebra_detect.py).
+TRANSCRIBED_OR_LATER = {'transcribed', 'detected', 'done'}
+# score_fusion.py (app/workers/score_fusion.py) writes state='detected' once
+# fusion/scoring finishes, WHETHER OR NOT it produced any candidates — 'done'
+# included for forward-compatibility though nothing in this codebase writes
+# it today. cand_count alone would leave 'score' stuck 'active' forever on a
+# recording that legitimately scored zero.
+SCORED_STATES = {'detected', 'done'}
+
+
+def compute_run_stages(recording_state: str, seg_count: int, signal_count: int,
+                        cand_count: int) -> dict:
+    """The four-stage pipeline model, in pipeline order. Each stage's DONE
+    condition is evidence-first (a real row count) with a state-vocabulary
+    fallback for the legitimate-zero case (see SCORED_STATES above). The
+    FIRST stage that is not done becomes 'active'; every stage after it is
+    'waiting' regardless of its own condition — the ordering rule is applied
+    literally, left to right, not per-stage independently."""
+    done = {
+        # The caller only reaches this function once it has confirmed a
+        # recording row exists (that is what makes it non-idle), so fetch —
+        # "a recording row exists" — is always already satisfied here.
+        'fetch': True,
+        'transcribe': recording_state in TRANSCRIBED_OR_LATER or seg_count > 0,
+        'detect': signal_count > 0,
+        'score': cand_count > 0 or recording_state in SCORED_STATES,
+    }
+    stages: dict = {}
+    active_assigned = False
+    for name in RUN_STAGES:
+        if active_assigned:
+            stages[name] = 'waiting'
+        elif done[name]:
+            stages[name] = 'done'
+        else:
+            stages[name] = 'active'
+            active_assigned = True
+    return stages
+
+
 class ReviewHandler(BaseHTTPRequestHandler):
     server_version = 'clpr-review/0.1'
 
@@ -1116,6 +1168,107 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
 
         self._send_json(HTTPStatus.OK, updated)
+
+    def _serve_run_progress(self) -> None:
+        """GET /api/run-progress: the pipeline's honest state, for the
+        operator's progress bar (2026-08-09 ask: "anyway to add a progress
+        bar to shpw real dynamic progressiom" — REAL witnesses, never a fake
+        timer).
+
+        Every number comes from ONE REPEATABLE READ read-only snapshot (same
+        pattern as _serve_delivered below), so the counts in one response
+        can never straddle a concurrent write mid-request — e.g. transcribe
+        finishing and writing segments between two counts taken under READ
+        COMMITTED, which could report 'detect active' with a segment count
+        that never actually existed at any single instant.
+
+        idle=true means the recordings table has no row at all: no run has
+        ever started. A recording that finished (state='detected') is NOT
+        idle — it is fully done, every stage 'done', none 'active'.
+
+        pending_count is GLOBAL (every recording's queue), not scoped to the
+        latest recording — it is the signal the UI uses to know this run
+        produced reviewable output. Its WHERE clause MUST stay byte-identical
+        to _serve_candidates('candidate')'s (D-056 delivery-gated pending);
+        duplicated here rather than shared so this addition never touches
+        that already-verified, live endpoint."""
+        conn = db.connect()
+        try:
+            conn.set_session(isolation_level='REPEATABLE READ', readonly=True)
+            cur = dict_cursor(conn)
+            cur.execute('SELECT id, state, ingested_at FROM recordings ORDER BY id DESC LIMIT 1')
+            latest = cur.fetchone()
+
+            cur.execute(
+                '''
+                SELECT count(*) AS n
+                FROM clip_candidates c
+                LEFT JOIN clips cl ON cl.candidate_id = c.id
+                WHERE (c.state = 'candidate' OR (c.state = 'approved' AND cl.drive_synced_at IS NULL))
+                '''
+            )
+            pending_count = int(cur.fetchone()['n'])
+
+            if latest is None:
+                self._send_json(HTTPStatus.OK, {
+                    'idle': True,
+                    'recording_id': None,
+                    'recording_state': None,
+                    'started_at': None,
+                    'stages': None,
+                    'counts': None,
+                    'pending_count': pending_count,
+                })
+                return
+
+            recording_id = int(latest['id'])
+            recording_state = str(latest['state'])
+
+            cur.execute(
+                'SELECT count(*) AS n FROM transcript_segments WHERE recording_id = %s',
+                (recording_id,),
+            )
+            seg_count = int(cur.fetchone()['n'])
+
+            cur.execute(
+                'SELECT count(*) AS n FROM llm_signal_candidates WHERE recording_id = %s',
+                (recording_id,),
+            )
+            signal_count = int(cur.fetchone()['n'])
+
+            cur.execute(
+                'SELECT count(*) AS n FROM clip_candidates WHERE recording_id = %s',
+                (recording_id,),
+            )
+            cand_count = int(cur.fetchone()['n'])
+
+            cur.execute(
+                '''
+                SELECT count(*) AS n
+                FROM clips cl
+                JOIN clip_candidates c ON c.id = cl.candidate_id
+                WHERE c.recording_id = %s
+                ''',
+                (recording_id,),
+            )
+            clip_count = int(cur.fetchone()['n'])
+        finally:
+            conn.close()
+
+        self._send_json(HTTPStatus.OK, {
+            'idle': False,
+            'recording_id': recording_id,
+            'recording_state': recording_state,
+            'started_at': latest['ingested_at'],
+            'stages': compute_run_stages(recording_state, seg_count, signal_count, cand_count),
+            'counts': {
+                'transcript_segments': seg_count,
+                'llm_signal_candidates': signal_count,
+                'clip_candidates': cand_count,
+                'clips': clip_count,
+            },
+            'pending_count': pending_count,
+        })
 
     # ---------------------------------------------------------------- D-061
     # THE POST KIT endpoints. None of them touches the verdict webhook or the
@@ -2202,6 +2355,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
         # digits.
         if path == '/api/candidates/delivered':
             self._serve_delivered()
+            return
+        if path == '/api/run-progress':
+            self._serve_run_progress()
             return
         if path == '/api/profile':
             self._serve_profile()

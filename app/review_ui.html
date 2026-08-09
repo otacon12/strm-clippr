@@ -128,6 +128,29 @@
     a.linklike, button.linklike { background: transparent; color: var(--pop); padding: 0; font-weight: 600;
       text-decoration: underline; text-underline-offset: 2px; }
 
+    /* ---- Run progress: REAL witnesses only, never a fake timer (operator
+       ask, 2026-08-09: "anyway to add a progress bar to shpw real dynamic
+       progressiom"). Every step below is exactly what GET /api/run-progress
+       reports from the DB -- this is paint, not simulation. ---- */
+    .progress-card { margin: 10px 0 0; padding: 12px 14px; border: 1px solid var(--hairline);
+      border-radius: var(--radius-md); background: var(--panel-raised); }
+    .progress-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
+    .progress-title { font-size: 10.5px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+    .progress-elapsed { font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--muted); font-family: var(--font-serif); }
+    .progress-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+    .pstep { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .pstep-dot { width: 15px; height: 15px; border-radius: 50%; flex: 0 0 auto; border: 1.5px solid var(--hairline);
+      display: flex; align-items: center; justify-content: center; font-size: 9px; line-height: 1; color: transparent; }
+    .pstep.done .pstep-dot { background: var(--pop); border-color: var(--pop); color: #1A0900; }
+    .pstep.done .pstep-dot::before { content: '\2713'; }
+    .pstep.done .pstep-label { color: var(--paper-text); }
+    .pstep.active .pstep-dot { border-color: var(--pop); background: var(--pop-tint); animation: pstep-pulse 1.2s ease-in-out infinite; }
+    .pstep.active .pstep-label { color: var(--paper-text); font-weight: 600; }
+    .pstep.waiting .pstep-dot, .pstep.waiting .pstep-label { opacity: .55; }
+    @keyframes pstep-pulse { 0%, 100% { box-shadow: 0 0 0 0 var(--pop-tint-strong); }
+      50% { box-shadow: 0 0 0 5px transparent; } }
+    @media (prefers-reduced-motion: reduce) { .pstep.active .pstep-dot { animation: none; } }
+
     /* ---- Fine-edit numeric fallback: kept functional, visually secondary
        to the trim slider above it (spec section 2: "inputs remain as a
        fine-edit fallback, visually secondary"). ---- */
@@ -502,6 +525,18 @@
         </div>
         <div class="findclips-row">
           <button id="findClipsBtn" class="findclips" type="button">Find clips</button>
+        </div>
+        <div id="progressCard" class="progress-card" hidden>
+          <div class="progress-head">
+            <span class="progress-title">Finding clips</span>
+            <span id="progressElapsed" class="progress-elapsed">0:00</span>
+          </div>
+          <ol id="progressSteps" class="progress-steps">
+            <li class="pstep" data-stage="fetch"><span class="pstep-dot" aria-hidden="true"></span><span class="pstep-label">Fetching the recording</span></li>
+            <li class="pstep" data-stage="transcribe"><span class="pstep-dot" aria-hidden="true"></span><span class="pstep-label">Transcribing speech</span></li>
+            <li class="pstep" data-stage="detect"><span class="pstep-dot" aria-hidden="true"></span><span class="pstep-label">Reading the transcript for moments</span></li>
+            <li class="pstep" data-stage="score"><span class="pstep-dot" aria-hidden="true"></span><span class="pstep-label">Scoring and building clips</span></li>
+          </ol>
         </div>
         <div class="kbd">j/k or arrows move<span class="kbdchip">J K</span> &middot; approve<span class="kbdchip">A</span> &middot; reject, not in Rejected<span class="kbdchip">R</span> &middot; maybe, Pending/Rejected<span class="kbdchip">M</span> &middot; toggle Rejected<span class="kbdchip">X</span> &middot; set in/out at the playhead<span class="kbdchip">I</span><span class="kbdchip">O</span><br />Keys are inert while typing in a field.</div>
       </div>
@@ -1939,6 +1974,7 @@
         }
         notify('Run started. New clips will appear in Pending when the run completes.',
           { kind: 'info' });
+        beginRunProgress();
       } catch (e) {
         notify('Could not start the find-clips run. Check your connection and try again.',
           { technical: String(e) });
@@ -1949,6 +1985,105 @@
       }
     }
     findClipsBtnEl.onclick = () => findClips();
+
+    // ---------------------------------------------------------------- D-076
+    // RUN PROGRESS. REAL witnesses only (operator ask, 2026-08-09: "anyway
+    // to add a progress bar to shpw real dynamic progressiom" -- never a
+    // fake timer). Every stage state below is exactly what GET
+    // /api/run-progress reports from the DB in one snapshot; this block only
+    // paints it and ticks a clock from a real started_at.
+    // ---- BEGIN run-progress block ----
+    const progressCardEl = document.getElementById('progressCard');
+    const progressStepsEl = document.getElementById('progressSteps');
+    const progressElapsedEl = document.getElementById('progressElapsed');
+    const RUN_PROGRESS_POLL_MS = 5000;
+    let progressPollTimer = null;
+    let progressElapsedTimer = null;
+    let progressStartedAtMs = null;
+    // The pending count observed the moment this run began (captured by
+    // beginRunProgress; 0 by default, which is also the correct baseline for
+    // the on-load path). "Candidates arrived" means the count rose ABOVE
+    // this baseline, not merely that it is nonzero -- a pre-existing backlog
+    // must never read as this run's own output and hide the card before the
+    // run has actually produced anything.
+    let progressBaselinePending = 0;
+
+    function formatElapsed(ms) {
+      const total = Math.max(0, Math.floor(ms / 1000));
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      const mm = String(m).padStart(2, '0');
+      const ss = String(s).padStart(2, '0');
+      return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+    }
+
+    function tickProgressElapsed() {
+      if (progressStartedAtMs === null || !progressElapsedEl) return;
+      progressElapsedEl.textContent = formatElapsed(Date.now() - progressStartedAtMs);
+    }
+
+    function renderProgressStages(stages) {
+      if (!progressStepsEl) return;
+      progressStepsEl.querySelectorAll('.pstep').forEach((li) => {
+        const stage = li.getAttribute('data-stage');
+        const status = (stages && stages[stage]) || 'waiting';
+        li.className = 'pstep ' + status;
+      });
+    }
+
+    function stopProgressPolling() {
+      if (progressPollTimer !== null) { clearInterval(progressPollTimer); progressPollTimer = null; }
+      if (progressElapsedTimer !== null) { clearInterval(progressElapsedTimer); progressElapsedTimer = null; }
+    }
+
+    function hideProgressCard() {
+      stopProgressPolling();
+      if (progressCardEl) progressCardEl.hidden = true;
+    }
+
+    async function pollRunProgress() {
+      let data;
+      try {
+        const res = await fetch('/api/run-progress', { cache: 'no-store' });
+        if (!res.ok) return;
+        data = await res.json();
+      } catch (_) {
+        return; // background poll only -- never surface a transient fetch error
+      }
+      if (!data || data.idle) { hideProgressCard(); return; }
+      if (typeof data.pending_count === 'number' && data.pending_count > progressBaselinePending) {
+        // This run's candidates landed -- the existing pending-list poll
+        // (pollRefresh) takes it from here.
+        hideProgressCard();
+        return;
+      }
+      if (progressCardEl) progressCardEl.hidden = false;
+      progressStartedAtMs = data.started_at ? Date.parse(data.started_at) : null;
+      renderProgressStages(data.stages);
+      tickProgressElapsed();
+    }
+
+    function startProgressPolling() {
+      if (progressPollTimer !== null) return; // already running
+      pollRunProgress();
+      progressPollTimer = setInterval(pollRunProgress, RUN_PROGRESS_POLL_MS);
+      progressElapsedTimer = setInterval(tickProgressElapsed, 1000);
+    }
+
+    async function beginRunProgress() {
+      // Baseline the CURRENT pending count so a pre-existing backlog never
+      // reads as "this run's candidates arrived" and hides the card early.
+      try {
+        const res = await fetch('/api/run-progress', { cache: 'no-store' });
+        const data = await res.json().catch(() => null);
+        progressBaselinePending = (data && typeof data.pending_count === 'number') ? data.pending_count : 0;
+      } catch (_) {
+        progressBaselinePending = 0;
+      }
+      startProgressPolling();
+    }
+    // ---- END run-progress block ----
 
     async function requestRegenerate(c) {
       if (kitHasUnsaved(c)) {
@@ -3052,6 +3187,10 @@
     loadCandidates().catch((err) => {
       detailEl.innerHTML = rawLoadErrorHtml(err);
     });
+    // On-load progress check: progressBaselinePending defaults to 0, so this
+    // shows the card only when a run is mid-flight AND has not yet produced
+    // any pending candidates -- exactly the on-load condition asked for.
+    startProgressPolling();
   </script>
 </body>
 </html>
