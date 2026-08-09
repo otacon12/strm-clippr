@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>clpr review surface</title>
   <style>
     /* =====================================================================
@@ -197,6 +197,12 @@
     .trimwrap { margin: 14px 0; }
     .trimhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     .trimlabel { font-size: 10.5px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+    /* touch-action:none here covers the handle/region/playhead children too:
+       none of them declare their own touch-action, and the used value for a
+       descendant with no explicit touch-action is the intersection of its
+       ancestors' values up to the nearest one that sets it -- verified, per
+       the mobile-pass brief, rather than assumed. Drags on any of them
+       already can't trigger a page scroll. */
     .slider { position: relative; height: 56px; border-radius: var(--radius-md); background: var(--panel-raised);
       border: 1px solid var(--hairline); margin: 0 8px; touch-action: none; }
     .slider.disabled { opacity: .5; pointer-events: none; }
@@ -234,7 +240,7 @@
 
     /* The phone frame: a real 9:16 box, the aspect the platforms actually
        render, so "is this frame majority text?" is judgeable by eye. */
-    .phone { position: relative; width: 300px; aspect-ratio: 9 / 16; background: #000;
+    .phone { position: relative; width: min(300px, 100%); aspect-ratio: 9 / 16; background: #000;
              border-radius: var(--radius-xl); overflow: hidden; border: 2px solid var(--hairline); }
     .phone video { position: absolute; inset: 0; width: 100%; height: 100%;
                    max-height: none; object-fit: cover; border-radius: 0; background: #000; }
@@ -262,7 +268,7 @@
     /* The post as it reads under the video. Same card treatment as the phone
        so the left column is two deliberate objects, not a frame with loose
        text hanging off it. */
-    .postmeta { position: relative; width: 300px; margin-top: 12px; font-size: 12.5px; color: var(--paper-text);
+    .postmeta { position: relative; width: min(300px, 100%); margin-top: 12px; font-size: 12.5px; color: var(--paper-text);
                 background: var(--panel-raised); border: 1px solid var(--hairline);
                 border-radius: var(--radius-md); padding: 14px 16px; line-height: 1.5; }
     /* FIX (2026-08-08): this was named .handle, which collides with the trim
@@ -386,6 +392,88 @@
     .swatch.none { background: var(--panel); display: flex; align-items: center; justify-content: center;
                    color: var(--muted); font-size: 14px; font-weight: 700; }
     .colorhex { max-width: 130px; font-variant-numeric: tabular-nums; text-transform: uppercase; }
+
+    /* ---------------------------------------------------------------- MOBILE
+       RESPONSIVE PASS (operator ask: "can i get to the clipper review on
+       phone? ... built to accomodate mobile view seamlessly, functionally,
+       and cozy"). Breakpoint ~720px. CSS-only reflow of the existing markup
+       plus ONE additive wrapper div (`.stickytop`, added around the video +
+       trim block in renderDetail()'s template) -- no routes, no JS logic,
+       no class renamed or removed on any existing element.
+
+       LAYOUT CHOICE (stated per the brief, "your call"): the left list
+       COLLAPSES TO A HORIZONTAL, SWIPEABLE CHIP STRIP at the top, not a
+       drawer. A drawer needs new open/close JS state; a strip is pure CSS
+       reflow of the exact .item markup renderList() already emits, so it
+       carries no behavioural risk and nothing new to wire.
+
+       SCROLL MODEL, MOBILE ONLY: D-056's viewport-pinned grid (.wrap
+       height:100vh, independent per-pane scroll) is desktop-only and
+       UNTOUCHED above this block. On mobile the page scrolls normally
+       (single column) and the video+trim-slider pins via position:sticky on
+       `.stickytop` instead -- same operator intent (the player stays on
+       screen) via the mechanism that actually fits one phone-width column
+       instead of two independently-scrolling panes. */
+    @media (max-width: 720px) {
+      .wrap { display: block; height: auto; min-height: 100vh;
+        padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);
+        padding-bottom: env(safe-area-inset-bottom); }
+      .left { border-right: 0; border-bottom: 1px solid var(--hairline); overflow: visible; }
+      .right { padding: 14px; overflow: visible; }
+
+      /* Header condenses to the wordmark: the sub-label and the
+         keyboard-shortcut hint (no keyboard on touch) drop out, so the
+         sticky header stays short on a small screen. The keydown handlers
+         stay wired either way -- a hidden hint is a display change, not a
+         behavior change. */
+      .head { padding-top: calc(14px + env(safe-area-inset-top)); }
+      .brand-sub, .kbd, .kbdchip { display: none; }
+      .tabs { flex-wrap: wrap; }
+
+      /* The list: horizontal swipeable chip strip instead of a vertical
+         column, so it costs one short row of vertical space, not the first
+         screenful. scroll-snap makes a swipe land cleanly on a card; this
+         strip scrolls on its own axis and does not cause page-level
+         horizontal scroll (overflow-x:auto here is a contained scroller). */
+      .list { display: flex; flex-direction: row; overflow-x: auto; overflow-y: visible;
+        -webkit-overflow-scrolling: touch; scroll-snap-type: x proximity; gap: 8px; }
+      .item { flex: 0 0 auto; width: 78vw; max-width: 320px; margin-bottom: 0;
+        scroll-snap-align: start; }
+
+      /* The video + trim slider stay on screen while the copy/actions below
+         scroll under them -- the phone-width equivalent of D-056's pinned
+         player. Background matches the ground so scrolled content never
+         shows through the seam. */
+      .stickytop { position: sticky; top: 0; z-index: 2; background: var(--studio);
+        padding-top: 4px; padding-bottom: 6px; }
+
+      /* Touch targets >=44px (Apple HIG / WCAG 2.5.5 minimum). Buttons grow
+         for real -- there is no reason to keep them cursor-slim on a screen
+         with no cursor ("cozy": generous tap spacing, nothing cramped).
+         Trim handles + the playhead stay visually slim (D-073's precision
+         affordance) and get an INVISIBLE enlarged hit area via a ::before
+         box instead, so the track itself doesn't look fatter. */
+      button { min-height: 44px; min-width: 44px; padding: 11px 18px; }
+      .tab { padding: 11px 16px; }
+      .copybtn, .pick, .nudge { padding: 11px 14px; }
+      .swatch { width: 44px; height: 44px; }
+      .notice-close { min-width: 44px; min-height: 44px; top: 2px; right: 2px;
+        display: flex; align-items: center; justify-content: center; }
+
+      .handle::before { content: ''; position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 44px; transform: translateX(-50%); }
+      .slider-playhead::before { content: ''; position: absolute; top: 0; bottom: 0; left: 50%;
+        width: 44px; transform: translateX(-50%); }
+
+      /* Post kit: variant rows (pick chip + textarea + copy button) and
+         their buttons stack instead of squeezing into one row; textareas
+         already inherit width:100% (the global textarea rule above) and now
+         get the full stacked row to use. The phone mockup + post-meta card
+         already scale via width:min(300px,100%) (unconditional, above), so
+         no override is needed here for those. */
+      .variant { flex-direction: column; align-items: stretch; }
+      .variant .pick { width: 100%; }
+    }
   </style>
 </head>
 <body>
@@ -2198,8 +2286,10 @@
           Burn speech captions into this clip (default off). Captions go in during the render itself,
           so tick this before or at approval.</label>
         ${captionsIntentNote(c)}
-        <video id="vid" controls preload="metadata" src="${videoSrc}"></video>
-        ${renderTrimBlock(c, ed, editable)}
+        <div class="stickytop">
+          <video id="vid" controls preload="metadata" src="${videoSrc}"></video>
+          ${renderTrimBlock(c, ed, editable)}
+        </div>
         <div class="actions">
           <button class="approve" id="btnApprove">Approve clip<span class="kbdchip">A</span></button>
           ${view !== 'rejected' ? '<button class="reject" id="btnReject">Reject clip<span class="kbdchip">R</span></button>' : ''}

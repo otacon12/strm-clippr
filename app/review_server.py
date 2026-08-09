@@ -37,7 +37,12 @@ import psycopg2.extras
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'workers'))
 import db  # noqa: E402  (app/workers/db.py — the shared adapter)
 
-HOST = '127.0.0.1'
+# CLPR_BIND overrides the bind address; unset/default behavior (loopback-only)
+# is unchanged. The UI has no auth, so binding anything other than 127.0.0.1
+# is for a private network only (e.g. a tailnet IP, CLPR_BIND=<tailnet-ip>,
+# or CLPR_BIND=0.0.0.0 to bind all interfaces) — never expose this on a
+# public/untrusted network. Single address only; the server binds one socket.
+HOST = os.environ.get('CLPR_BIND', '127.0.0.1')
 PORT = int(os.environ.get('CLPR_REVIEW_PORT', '8737'))
 
 # THE TWO-VOCABULARIES RULE (2026-08-08).
