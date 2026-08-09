@@ -233,11 +233,19 @@ def load_env_file(path: Path) -> tuple[list[str], list[str]]:
 
 
 class StageFailure(Exception):
-    """A stage failed. `exit_code` carries the classified reason."""
+    """A stage failed. `exit_code` carries the classified reason.
 
-    def __init__(self, message: str, exit_code: int = EXIT_FAIL):
+    LO-10 (golden-review F21): `stage` names WHICH of the 8 STAGE_ORDER
+    entries failed, so the final RESULT line can report the stage NAME
+    (failed_stage=transcribe) rather than only the classified exit code
+    (an integer that collapses several different stages onto the same
+    EXIT_FAIL=1).
+    """
+
+    def __init__(self, message: str, exit_code: int = EXIT_FAIL, stage: str = ''):
         super().__init__(message)
         self.exit_code = exit_code
+        self.stage = stage
 
 
 class StageResult:
@@ -579,6 +587,7 @@ def require_registered(stage: str, recording_id: Optional[int], video: str) -> N
         'registered, check near_miss_paths() / the NOTE printed above for a path mismatch '
         '(trailing slash, /Volumes vs symlink, a renamed file).',
         EXIT_FAIL,
+        stage=stage,
     )
 
 
@@ -605,6 +614,7 @@ def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
             'worker refuses while OBS is live. Come back when you are off air and re-run '
             'the exact same command; everything already done will be skipped.',
             EXIT_OBS_GATE,
+            stage=stage,
         )
 
     if stage == 'quality' and res.result_line.startswith('RESULT quality_gate') and ' FAIL ' in res.result_line:
@@ -615,6 +625,7 @@ def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
             'hour job is not thrown away); the gate stops everything downstream of it. '
             'The gate\'s own guidance is quoted verbatim above.',
             EXIT_QUALITY_GATE,
+            stage=stage,
         )
     # A non-zero exit from `quality` WITHOUT a genuine quality_gate RESULT/FAIL
     # verdict line (e.g. an argparse usage error, an unhandled crash before the
@@ -629,10 +640,11 @@ def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
             'digitally silent. Nothing was extracted and nothing was written. Check the '
             'recorder\'s audio source. Its refusal text is quoted verbatim above.',
             EXIT_EXTRACT_REFUSED,
+            stage=stage,
         )
 
     tail = err_lines[-1] if err_lines else (out_lines[-1] if out_lines else '(no output)')
-    raise StageFailure(f'stage {stage}: exit {rc}. Last output line: {tail}', EXIT_FAIL)
+    raise StageFailure(f'stage {stage}: exit {rc}. Last output line: {tail}', EXIT_FAIL, stage=stage)
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +801,12 @@ def final_report(
     chat = count_for('chat_messages', recording_id)
     say(f'  zebra beats            {beats}')
     say(f'  audio energy buckets   {buckets}')
-    say(f'  chat messages          {chat}' + ('   <- EMPTY: the chat signal contributes nothing' if chat == 0 else ''))
+    # LO-12: this driver has no 'chat' stage in STAGE_ORDER at all -- chat_messages
+    # is never populated by run_vod.py, so 0 here is not evidence of anything
+    # missing or broken, it is the honest, structural, EVERY-run value. The old
+    # wording ("EMPTY: the signal contributes nothing") read as a defect report.
+    say(f'  chat messages          {chat}' +
+        ('   <- 0 by construction (no chat stage in this driver)' if chat == 0 else ''))
     for source, n in db_rows(
         'SELECT source, COUNT(*) FROM llm_signal_candidates WHERE recording_id = %s GROUP BY source ORDER BY source',
         (recording_id,),
@@ -1034,7 +1051,7 @@ def main() -> int:
                     )
                     if misses:
                         msg += ' Rows with the same filename but a different path: ' + '; '.join(misses)
-                    raise StageFailure(msg, EXIT_FAIL)
+                    raise StageFailure(msg, EXIT_FAIL, stage=stage)
                 recording_id, duration_s = found[0], found[1]
                 # D-074 ruling 12 / LO-09: ingest_vods.py scans its whole
                 # directory and can report ok=1 while some OTHER file in that
@@ -1106,9 +1123,29 @@ def main() -> int:
         say('were produced from incomplete inputs. Every worker owns its own transaction and')
         say('rolls back on failure, so this stage persisted nothing partial.')
         say('Re-running the exact same command is safe: completed stages will be skipped.')
-        final_report(video, recording_id, duration_s, results, time.monotonic() - run_started)
+        # LO-15 (golden-review F21): final_report opens fresh DB connections
+        # (count_for/db_rows) to build the report, and it is being called
+        # HERE, inside the failure handler, where the DB itself may be the
+        # very thing that just failed. Without this try/except, a DB-caused
+        # StageFailure would have final_report raise a SECOND time trying to
+        # read the DB for the report, and that second exception would escape
+        # this handler uncaught -- crashing before the RESULT line below ever
+        # printed, so the classified exit code (exc.exit_code) would never
+        # reach the operator or a caller parsing this driver's output.
+        try:
+            final_report(video, recording_id, duration_s, results, time.monotonic() - run_started)
+        except Exception as report_exc:  # noqa: BLE001 - the ORIGINAL failure is what matters
+            say('')
+            say(f'  WARNING: final_report itself failed ({report_exc!r}) while reporting a stage '
+                'failure -- possibly the same DB outage that caused it. Continuing to the RESULT '
+                'line so the classified exit code below is not swallowed by a report-time crash.')
         say('')
-        say(f'RESULT run_vod ok=0 recording={recording_id} failed_stage={exc.exit_code} '
+        # LO-10: the STAGE NAME (e.g. "transcribe"), not the classified exit
+        # code integer -- exit= right after it already carries that integer,
+        # and several different stages can share one exit code (EXIT_FAIL=1
+        # covers require_registered's refusal AND execute_stage's generic
+        # fallback), which collapsed "which stage" into "what kind of exit".
+        say(f'RESULT run_vod ok=0 recording={recording_id} failed_stage={exc.stage or "unknown"} '
             f'exit={exc.exit_code} video="{video}"')
         return exc.exit_code
 

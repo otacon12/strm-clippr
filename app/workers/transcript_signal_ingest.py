@@ -114,9 +114,23 @@ def collect_scan_rows(scan_items: list, responses: dict[str, str], duration_s: f
     return out, malformed
 
 
-def collect_zebra_rows(zebra_items: list, responses: dict[str, str], duration_s: float) -> list[Row]:
-    """Mirror detect_zebra_boundaries' per-trigger handling exactly."""
+def collect_zebra_rows(zebra_items: list, responses: dict[str, str], duration_s: float) -> tuple[list[Row], int, int]:
+    """Mirror detect_zebra_boundaries' per-trigger handling exactly.
+
+    ID-10 (golden-review F21): a swallowed zebra LLM failure here (the except
+    Exception below) still produces a normal-looking fallback row, which
+    score_fusion.py then floors at score >= 0.9 (beat-sourced) and exempts
+    from the signal cap entirely -- a silently-degraded row spends the same
+    "trust" as a genuinely model-selected boundary. zebra_model_errors counts
+    the swallowed-exception case specifically; zebra_fallbacks counts every
+    row that ended up on the fallback_start/0.0-confidence path for ANY
+    reason (no prompt at all, a model error, or a low-confidence model
+    response) so a run's true reliance on the 60s-lookback default is visible
+    even when nothing raised.
+    """
     out: list[Row] = []
+    model_errors = 0
+    fallbacks = 0
 
     for meta, prompt in zebra_items:
         trigger_offset = meta['trigger_offset_s']
@@ -125,6 +139,7 @@ def collect_zebra_rows(zebra_items: list, responses: dict[str, str], duration_s:
         chosen_start = fallback_start
         chosen_conf = 0.0
         reason = 'fallback 60s lookback from zebra trigger'
+        used_fallback = True
 
         if prompt is not None:
             raw = responses[zebra_call_id(trigger_offset)]
@@ -137,8 +152,13 @@ def collect_zebra_rows(zebra_items: list, responses: dict[str, str], duration_s:
                     chosen_start = model_start
                     chosen_conf = conf
                     reason = model_reason
+                    used_fallback = False
             except Exception as exc:
                 reason = f'fallback 60s lookback from zebra trigger (model error: {exc})'
+                model_errors += 1
+
+        if used_fallback:
+            fallbacks += 1
 
         end_s = ts.clamp(trigger_offset + 15.0, 0.0, duration_s)
         if end_s <= chosen_start:
@@ -146,7 +166,7 @@ def collect_zebra_rows(zebra_items: list, responses: dict[str, str], duration_s:
 
         out.append((chosen_start, end_s, 'context', reason, chosen_conf, 'zebra_boundary', trigger_offset))
 
-    return out
+    return out, model_errors, fallbacks
 
 
 def run(recording_id: int, responses_path: str) -> int:
@@ -194,7 +214,7 @@ def run(recording_id: int, responses_path: str) -> int:
         responses = {str(item['call_id']): str(item.get('response_text') or '') for item in items}
 
         transcript_rows, malformed = collect_scan_rows(scan_items, responses, duration_s)
-        zebra_rows = collect_zebra_rows(zebra_items, responses, duration_s)
+        zebra_rows, zebra_model_errors, zebra_fallbacks = collect_zebra_rows(zebra_items, responses, duration_s)
 
         # autocommit is OFF: the reads above already opened the transaction
         # implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
@@ -209,11 +229,20 @@ def run(recording_id: int, responses_path: str) -> int:
 
     attempted = len(transcript_rows) + len(zebra_rows)
     inserted = inserted_transcript + inserted_zebra
+    if zebra_model_errors or zebra_fallbacks:
+        print(
+            f'NOTE transcript_signal_ingest recording={recording_id} '
+            f'zebra_model_errors={zebra_model_errors} zebra_fallbacks={zebra_fallbacks} '
+            '(a fallback row scores 0.0 raw confidence but score_fusion.py floors any '
+            "source='zebra_boundary' row at 0.9 and exempts it from the signal cap)",
+            file=sys.stderr,
+        )
     print(
         f'RESULT transcript_signal_ingest recording={recording_id} items={len(items)} '
         f'rows_inserted={inserted} rows_skipped_duplicate={attempted - inserted} '
         f'scan_rows={len(transcript_rows)} scan_inserted={inserted_transcript} '
-        f'zebra_rows={len(zebra_rows)} zebra_inserted={inserted_zebra} malformed={malformed}'
+        f'zebra_rows={len(zebra_rows)} zebra_inserted={inserted_zebra} malformed={malformed} '
+        f'zebra_model_errors={zebra_model_errors} zebra_fallbacks={zebra_fallbacks}'
     )
     return 0
 
