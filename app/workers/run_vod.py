@@ -312,6 +312,19 @@ def count_for(table: str, recording_id: int, extra_sql: str = '') -> int:
     return int(db_scalar(sql, (recording_id,)) or 0)
 
 
+def recording_state(recording_id: int) -> Optional[str]:
+    """The authoritative done-witness for stages gated on state, not row count.
+
+    A row count cannot distinguish "genuinely zero segments" from "never ran" —
+    both are 0. The state column is written inside the SAME transaction as the
+    stage's real work (transcribe.persist_segments sets state='transcribed' in
+    the same commit as the segment INSERT — verified by reading transcribe.py),
+    so it is a witness a partial or failed run cannot forge (golden-review F15).
+    """
+    val = db_scalar('SELECT state FROM recordings WHERE id = %s', (recording_id,))
+    return None if val is None else str(val)
+
+
 # ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------
@@ -439,10 +452,16 @@ def stage_done(stage: str, recording_id: Optional[int], video: str, duration_s: 
         return extract_already_done(video, duration_s)
 
     if stage == 'transcribe':
+        # Gated on recordings.state, NOT on transcript_segments row count: a
+        # legitimately zero-segment transcript (silent VOD) is done, and a
+        # count-based check would re-run a 4-to-8 hour whisper pass forever on
+        # exactly that recording (golden-review F15). See recording_state()
+        # for why this witness cannot be forged by a partial run.
+        state = recording_state(recording_id)
         n = count_for('transcript_segments', recording_id)
-        if n > 0:
-            return True, f'{n} transcript segments already present'
-        return False, 'no transcript segments'
+        if state in ('transcribed', 'detected', 'done'):
+            return True, f'{n} transcript segments, state={state} (done-check gates on state, not row count)'
+        return False, f'{n} transcript segments, state={state or "?"} — not transcribed yet'
 
     if stage in ('quality', 'zebra'):
         # Deliberately never skipped. quality_gate is a read-only verdict that
@@ -493,6 +512,26 @@ def stage_command(stage: str, video: str, recording_id: Optional[int]) -> list[s
     return [py, str(WORKERS_DIR / worker), '--vod-id', str(recording_id)]
 
 
+def require_registered(stage: str, recording_id: Optional[int], video: str) -> None:
+    """Every stage but ingest needs a real recording id.
+
+    Passing recording_id=None through stage_command() produces the literal
+    string 'None' as --vod-id (golden-review F16a: reachable via --from,
+    --skip ingest, or --only on a later stage) instead of failing loudly
+    here, before a child is even spawned with garbage arguments.
+    """
+    if stage == 'ingest' or recording_id is not None:
+        return
+    raise StageFailure(
+        f'stage {stage}: no recording is registered for "{video}" yet, so this stage cannot '
+        'run — there is no recording id to pass it. Register it first with `--only ingest` '
+        '(or run the pipeline from the start). If you expected this video to already be '
+        'registered, check near_miss_paths() / the NOTE printed above for a path mismatch '
+        '(trailing slash, /Volumes vs symlink, a renamed file).',
+        EXIT_FAIL,
+    )
+
+
 def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
     started = time.monotonic()
     rc, out_lines, err_lines = run_child(stage, cmd)
@@ -518,7 +557,7 @@ def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
             EXIT_OBS_GATE,
         )
 
-    if stage == 'quality':
+    if stage == 'quality' and res.result_line.startswith('RESULT quality_gate') and ' FAIL ' in res.result_line:
         raise StageFailure(
             f'stage {stage}: D-028 QUALITY GATE FAILED (exit {rc}). The transcript is '
             'unusable, so detection is refused on purpose — scoring garbage segments would '
@@ -527,6 +566,11 @@ def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
             'The gate\'s own guidance is quoted verbatim above.',
             EXIT_QUALITY_GATE,
         )
+    # A non-zero exit from `quality` WITHOUT a genuine quality_gate RESULT/FAIL
+    # verdict line (e.g. an argparse usage error, an unhandled crash before the
+    # gate ever ran) is NOT "the transcript is unusable" — asserting that would
+    # be a false D-028 verdict (golden-review F16b). Falls through to the
+    # generic branch below, with the real stderr tail.
 
     if stage == 'extract' and is_extract_refusal(err_lines):
         raise StageFailure(
@@ -900,6 +944,8 @@ def main() -> int:
                 res.detail = why
                 say(f'[{idx}/{total}] {stage:<11} SKIPPED — {why}')
                 continue
+
+            require_registered(stage, recording_id, video)
 
             say(f'[{idx}/{total}] {stage:<11} RUNNING — {STAGE_BLURB[stage]}')
             cmd = stage_command(stage, video, recording_id)
