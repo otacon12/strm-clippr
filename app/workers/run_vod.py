@@ -467,6 +467,43 @@ def preflight(video: str, want_stages: list[str]) -> list[str]:
             problems.append('OPENROUTER_API_KEY is not set (required by transcript_signal.py)')
             say('  OPENROUTER_API_KEY FAIL  not set')
 
+    # --- obsws-python (only if an OBS-gated stage is actually going to run) -
+    # transcribe.py and audio_energy.py each call
+    # obs_guard.require_obs_idle_or_raise, which imports obsws_python BEFORE
+    # it ever probes the OBS port (read obs_guard.py: the import happens
+    # first, the port check second) -- so a missing module previously
+    # surfaced only once that stage's subprocess was already running, as a
+    # generic stage failure rather than a named missing-dependency refusal
+    # here at preflight. Skipped when CLPR_ALLOW_DURING_STREAM=1, exactly as
+    # obs_guard.py itself skips the import in that case (same override, same
+    # env var, checked first there too).
+    obs_gated_stages = [s for s in ('transcribe', 'energy') if s in want_stages]
+    if obs_gated_stages and os.environ.get('CLPR_ALLOW_DURING_STREAM') != '1':
+        try:
+            import obsws_python  # noqa: F401
+        except ModuleNotFoundError as exc:
+            problems.append(
+                'obsws-python is not installed, required by obs_guard for the D-009 OBS gate '
+                f'ahead of {"/".join(obs_gated_stages)}: {exc}. Install it with: '
+                'python3 -m pip install obsws-python. If this run is intentional, set '
+                'CLPR_ALLOW_DURING_STREAM=1 to override D-009.'
+            )
+            say(f'  obsws_python   FAIL  not installed (needed by {"/".join(obs_gated_stages)})')
+        else:
+            say('  obsws_python   OK    importable')
+
+    # --- bash (only if audio_guard is actually going to run) ----------------
+    # stage_command() invokes extract_audio.sh via ['bash', ...]; a missing
+    # bash on PATH would otherwise surface as a generic stage-launch failure
+    # rather than a named missing-dependency refusal here.
+    if 'audio_guard' in want_stages:
+        found = shutil.which('bash')
+        if found:
+            say(f'  bash           OK    {found}')
+        else:
+            problems.append('bash not found on PATH (required to run extract_audio.sh)')
+            say('  bash           FAIL  not on PATH')
+
     return problems
 
 

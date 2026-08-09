@@ -64,7 +64,17 @@ DEFAULT_GEMINI_KEY_ENV_PATH = '/home/node/.n8n/clpr/.gemini_env'
 GEMINI_KEY_NAME = 'GEMINI_API_KEY'
 USER_AGENT = 'clpr-postkit/1.0'                  # Cloudflare 403s Python-urllib/*; keep a real UA
 POLL_INTERVAL_S = 5.0                            # Google's own cadence in every sample
-POLL_MAX_S = 600.0                               # MEASURED: 5.5s for 17MB. 600 is a loud backstop.
+POLL_MAX_S = 600.0                               # MEASURED: 5.5s for 17MB. This is the loud
+                                                  # backstop for the WHOLE poll loop -- see
+                                                  # wait_active, which now checks it BEFORE each
+                                                  # request rather than after, and bounds each
+                                                  # individual GET to POLL_HTTP_TIMEOUT_S so one
+                                                  # hung request can never outlive it (golden-review
+                                                  # F18 item 2).
+POLL_HTTP_TIMEOUT_S = 30.0                       # A poll is one tiny JSON GET, not the 900s
+                                                  # UPLOAD/GENERATE calls; 30s is generous for that
+                                                  # and keeps a single hung GET from silently eating
+                                                  # the whole POLL_MAX_S backstop.
 UPLOAD_TIMEOUT_S = 900
 GENERATE_TIMEOUT_S = 900
 ERROR_BODY_MAX_CHARS = 800
@@ -72,9 +82,31 @@ ERROR_BODY_MAX_CHARS = 800
 # --- Supplementary constants. NOT part of the brief's measured block above --
 # implementation details this module needs, not themselves Gemini-API facts.
 
-# ffprobe's own runtime, not Gemini's. Same value as the sibling constant
-# generate_post_kit.py:FFPROBE_TIMEOUT_S, for the same tool.
-FFPROBE_TIMEOUT_S = 120
+# measure_motion's full-frame decode (tblend+signalstats) is genuinely
+# expensive -- it decodes and diffs every frame of the clip -- so its timeout
+# must scale with the clip's own duration rather than sit at one fixed
+# number regardless of clip length. MOTION_FFPROBE_MIN_TIMEOUT_S is the
+# floor (protects short clips against per-invocation overhead) and
+# MOTION_FFPROBE_TIMEOUT_PER_S is the per-second-of-clip multiplier; see
+# _motion_timeout_s() and measure_motion() below.
+#
+# NEITHER NUMBER HAS BEEN MEASURED ON THE CONTAINER THIS RUNS IN (shared
+# vCPU, no GPU -- see the module docstring). They are conservative,
+# unmeasured floor/slope choices, not a documented or benchmarked fact. THE
+# FIRST REAL CONTAINER RUN OF measure_motion IS THE MEASUREMENT: if it times
+# out, or runs with little headroom, that run's own timing is the real data
+# point to size these from -- do not treat the numbers below as already
+# validated.
+MOTION_FFPROBE_MIN_TIMEOUT_S = 120.0
+MOTION_FFPROBE_TIMEOUT_PER_S = 4.0
+
+# DURATION_PROBE_TIMEOUT_S guards the CHEAP, metadata-only ffprobe call that
+# measures a clip's duration ahead of the expensive full-frame decode above
+# (format=duration only; no frame decode happens). That read's cost does not
+# scale with clip length, so a fixed ceiling is appropriate for it -- unlike
+# MOTION_FFPROBE_MIN_TIMEOUT_S/_PER_S above, which exist specifically because
+# the decode DOES scale. Also unmeasured on the container; same caveat.
+DURATION_PROBE_TIMEOUT_S = 120.0
 
 # verify_upload's createTime window (charter gate 21: one instant, one clock,
 # or the comparison is a coin flip). Not itself a Google-measured number;
@@ -381,6 +413,16 @@ def wait_active(name: str, api_key: str) -> dict:
     three measured ones rather than silently treating it as still-processing
     (charter: never guess a status vocabulary).
 
+    POLL_MAX_S IS CHECKED BEFORE EACH REQUEST IS ISSUED, NOT AFTER IT
+    RETURNS (golden-review F18 item 2). Checking only after the GET returns
+    means one hung GET can outlive the whole backstop -- previously each poll
+    used GENERATE_TIMEOUT_S=900 while POLL_MAX_S=600 called itself "a loud
+    backstop", so a single slow request could run 300s past the deadline
+    before the check ever ran. Each individual GET is now bounded to
+    POLL_HTTP_TIMEOUT_S=30 (a poll is a tiny JSON GET, not a 900s upload/
+    generate call), so the worst-case overrun past POLL_MAX_S is bounded by
+    one POLL_HTTP_TIMEOUT_S, not by GENERATE_TIMEOUT_S.
+
     MEASURED: PROCESSING -> ACTIVE in 5.5s for a 16.9 MB / 15s clip;
     videoMetadata.videoDuration came back as the string "15s", exact.
     """
@@ -390,7 +432,14 @@ def wait_active(name: str, api_key: str) -> dict:
     start = time.monotonic()
 
     while True:
-        _status, _headers, body = _http_call('GET', url, headers, None, GENERATE_TIMEOUT_S)
+        if time.monotonic() - start > POLL_MAX_S:
+            raise GeminiPollTimeoutError(
+                f'GEMINI_POLL_TIMEOUT: name={name} did not leave PROCESSING within '
+                f'POLL_MAX_S={POLL_MAX_S}s (checked BEFORE issuing the next poll, so a slow or '
+                f'hung GET can never outlive this backstop). States observed: {states!r}'
+            )
+
+        _status, _headers, body = _http_call('GET', url, headers, None, POLL_HTTP_TIMEOUT_S)
         file_obj = json.loads(body.decode('utf-8'))
         state = file_obj.get('state')
         states.append(state)
@@ -417,11 +466,6 @@ def wait_active(name: str, api_key: str) -> dict:
                 f'far: {states!r}. Never guessed at; raised loudly instead.'
             )
 
-        if time.monotonic() - start > POLL_MAX_S:
-            raise GeminiPollTimeoutError(
-                f'GEMINI_POLL_TIMEOUT: name={name} did not leave PROCESSING within '
-                f'POLL_MAX_S={POLL_MAX_S}s. States observed: {states!r}'
-            )
         time.sleep(POLL_INTERVAL_S)
 
 
@@ -722,6 +766,57 @@ def _escape_lavfi_path(path: str) -> str:
     return path.replace("'", "'\\''")
 
 
+def _probe_clip_duration_s(path: str) -> float:
+    """Cheap, metadata-only duration read: format=duration, NO frame decode.
+
+    Feeds measure_motion's duration-proportional timeout below. Deliberately
+    NOT the expensive tblend+signalstats decode measure_motion itself runs --
+    this only reads the container's own duration field, which is why its own
+    timeout (DURATION_PROBE_TIMEOUT_S) is a fixed ceiling rather than a
+    duration-scaled one: a metadata read does not get slower as the clip gets
+    longer. Never returns a guessed/fabricated duration: raises
+    GeminiMotionMeasurementError, the same type measure_motion itself raises,
+    on any ffprobe failure or unparseable output.
+    """
+    cmd = [
+        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+        '-of', 'csv=p=0', str(path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=DURATION_PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise GeminiMotionMeasurementError(
+            f'GEMINI_MOTION_MEASUREMENT_FAILED: the metadata-only duration probe timed out '
+            f'after {DURATION_PROBE_TIMEOUT_S}s on {path}: {exc!r}'
+        ) from exc
+
+    if result.returncode != 0:
+        raise GeminiMotionMeasurementError(
+            f'GEMINI_MOTION_MEASUREMENT_FAILED: the metadata-only duration probe exited '
+            f'{result.returncode} on {path}. stderr (verbatim): {result.stderr!r}'
+        )
+
+    try:
+        return float(result.stdout.strip())
+    except ValueError as exc:
+        raise GeminiMotionMeasurementError(
+            f'GEMINI_MOTION_MEASUREMENT_FAILED: the metadata-only duration probe returned a '
+            f'non-numeric duration for {path}. stdout (verbatim): {result.stdout!r}'
+        ) from exc
+
+
+def _motion_timeout_s(clip_duration_s: float) -> float:
+    """The full-frame-decode timeout for a clip of `clip_duration_s` seconds.
+
+    max(floor, per-second-multiplier * duration). Its own function, separate
+    from measure_motion, so the formula can be exercised directly without a
+    real video file (see the module's test coverage / golden-review F18 item
+    1 verification).
+    """
+    return max(MOTION_FFPROBE_MIN_TIMEOUT_S, MOTION_FFPROBE_TIMEOUT_PER_S * clip_duration_s)
+
+
 def measure_motion(path: str) -> float:
     """Mean inter-frame luma difference over the WHOLE clip, used to pick fps.
 
@@ -731,19 +826,35 @@ def measure_motion(path: str) -> float:
     never returns 0.0, because 0.0 silently means "static" and would pick the
     wrong fps forever.
 
+    THE DECODE'S TIMEOUT IS DURATION-PROPORTIONAL, NOT ONE FIXED NUMBER
+    (golden-review F18 item 1). A fixed timeout sized for a typical clip can
+    genuinely be exceeded by a long clip on this container (shared vCPU, no
+    GPU) -- killing the motion measurement, and with it the whole kit,
+    BEFORE any Gemini spend happens. The real clip duration is read first via
+    a cheap metadata-only probe (_probe_clip_duration_s -- no frame decode,
+    so it does not itself suffer this problem), and the decode's timeout is
+    then max(MOTION_FFPROBE_MIN_TIMEOUT_S, MOTION_FFPROBE_TIMEOUT_PER_S *
+    clip_duration_s) via _motion_timeout_s(). See those constants' own
+    comments for why neither number is a container measurement yet.
+
     MEASURED separation on 1080x1920 clips: coding streams 0.287-1.665, IRL
     concert 10.600.
     """
+    clip_duration_s = _probe_clip_duration_s(path)
+    timeout_s = _motion_timeout_s(clip_duration_s)
+
     filter_arg = f"movie='{_escape_lavfi_path(str(path))}',tblend=all_mode=difference,signalstats"
     cmd = [
         'ffprobe', '-v', 'error', '-f', 'lavfi', '-i', filter_arg,
         '-show_entries', 'frame_tags=lavfi.signalstats.YAVG', '-of', 'csv=p=0',
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_S)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
         raise GeminiMotionMeasurementError(
-            f'GEMINI_MOTION_MEASUREMENT_FAILED: ffprobe timed out after {FFPROBE_TIMEOUT_S}s '
+            f'GEMINI_MOTION_MEASUREMENT_FAILED: ffprobe timed out after {timeout_s:.1f}s '
+            f'(duration-proportional: clip_duration_s={clip_duration_s:.1f}, '
+            f'floor={MOTION_FFPROBE_MIN_TIMEOUT_S}, multiplier={MOTION_FFPROBE_TIMEOUT_PER_S}) '
             f'on {path}: {exc!r}'
         ) from exc
 
