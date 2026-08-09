@@ -213,6 +213,15 @@ KEY_NAME = 'OPENROUTER_API_KEY'
 DEFAULT_FPS = 1.0
 DEFAULT_MEDIA_RESOLUTION = 'MEDIA_RESOLUTION_HIGH'
 
+# A SAFETY/RECITATION/PROHIBITED_CONTENT finishReason or promptFeedback
+# blockReason on a Gemini vision call is a DETERMINISTIC refusal: the same
+# clip will be refused every time, so retrying it spends another full paid
+# video pass (upload + generateContent) to reproduce an error that still
+# cannot say why. Checked against gemini_files.GeminiEmptyCompletionError's
+# TYPED finish_reason/block_reason attributes -- never by matching message
+# text (charter gate 10).
+GEMINI_DETERMINISTIC_REFUSAL_REASONS = frozenset({'SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'})
+
 VISION_TIMEOUT_S = 900
 WRITER_TIMEOUT_S = 180
 PROBE_TIMEOUT_S = 60
@@ -2317,11 +2326,14 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         without an equivalent retry would be weaker than what it replaces.
 
         Retries GeminiEmptyCompletionError (the direct analogue of that
-        empty-completion case) and transient transport faults --
-        GeminiUnreachable unconditionally, and a GeminiHTTPError only on 429
-        or a 5xx, mirroring classify_failure's OpenRouter classification
-        above. Any other 4xx is not retried: a bad request does not fix
-        itself.
+        empty-completion case) UNLESS its typed finish_reason or block_reason
+        is SAFETY/RECITATION/PROHIBITED_CONTENT -- a deterministic
+        content-policy refusal that will not change on retry, so retrying it
+        would only spend another full paid video pass to reproduce the same
+        refusal. Also retries transient transport faults -- GeminiUnreachable
+        unconditionally, and a GeminiHTTPError only on 429 or a 5xx,
+        mirroring classify_failure's OpenRouter classification above. Any
+        other 4xx is not retried: a bad request does not fix itself.
 
         DELIBERATELY RETRIES ONLY THIS CALL, NOT THE UPLOAD. `file_uri` is the
         ALREADY-UPLOADED file's URI, passed in once from the caller; nothing
@@ -2337,7 +2349,20 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
                     fps=fps, media_resolution=DEFAULT_MEDIA_RESOLUTION)
             except Exception as exc:  # noqa: BLE001 - classified immediately below
                 if isinstance(exc, gemini_files.GeminiEmptyCompletionError):
-                    retryable, reason = True, 'empty_completion'
+                    # A SAFETY/RECITATION/PROHIBITED_CONTENT reason on EITHER
+                    # typed field is a deterministic refusal, not a transient
+                    # empty completion: the same clip will be refused again,
+                    # so retrying only spends another full paid video pass.
+                    # Classification is by the exception's TYPED attribute,
+                    # never by matching its message text.
+                    if (exc.finish_reason in GEMINI_DETERMINISTIC_REFUSAL_REASONS
+                            or exc.block_reason in GEMINI_DETERMINISTIC_REFUSAL_REASONS):
+                        retryable, reason = False, (
+                            f'deterministic_refusal_finish_reason={exc.finish_reason!r}_'
+                            f'block_reason={exc.block_reason!r}'
+                        )
+                    else:
+                        retryable, reason = True, 'empty_completion'
                 elif isinstance(exc, gemini_files.GeminiUnreachable):
                     retryable, reason = True, 'transport_or_timeout'
                 elif isinstance(exc, gemini_files.GeminiHTTPError):
@@ -2386,10 +2411,16 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
         witnesses = gemini_files.verify_upload(clip_path, active)
         out = gemini_generate_call(active['uri'])
     finally:
-        # In a finally so the remote file is removed on failure too. A leak
-        # must be loud but must NOT abort a run that already has its answer --
-        # delete_file itself never raises on a leak (see its own docstring),
-        # so this cannot mask a real result or a real failure raised above it.
+        # In a finally so the remote file is removed on failure too.
+        # delete_file NEVER RAISES, full stop (see its own docstring): both
+        # the DELETE and the follow-up verification GET are wrapped in
+        # try/except GeminiError, so a transport fault OR an HTTP status
+        # (429/5xx included) on EITHER call prints GEMINI_FILE_LEAKED and
+        # returns False instead of propagating. That guarantee is what makes
+        # this safe inside a `finally`: it cannot mask a real result produced
+        # above (a blip on cleanup would otherwise destroy an already-paid,
+        # already-successful run), and it cannot replace a real exception
+        # already escaping the `try` block with a cleanup exception instead.
         gemini_files.delete_file(file_obj['name'], gemini_key)
 
     scene = out['text']
