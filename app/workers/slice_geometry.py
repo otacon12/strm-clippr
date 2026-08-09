@@ -24,6 +24,17 @@ D-055 rules (operator-approved):
 - SHIPPED CLIP INVARIANT: rendered output covers the effective window
   +/- PUBLISH_PAD_S — identical to today's shipped behavior for unedited
   candidates.
+- NO PAD ON AN OPERATOR EDIT (live fix, 2026-08-08): PUBLISH_PAD_S exists to
+  give the DETECTOR's guess breathing room. Applied on top of an operator
+  edit it silently un-trims up to 1.5s per side -- live case: original window
+  0->10.02, operator trimmed via the slider to 0.8->9.5, and the padded
+  render came back at 11.08s, bringing the trimmed-away opening back
+  ("the bounced clip didn't use my edited section"). So when EITHER
+  adjusted_start_s or adjusted_end_s is present, the render pad is 0.0 on
+  BOTH sides -- the effective window IS the render window, exactly as the
+  operator set it. See render_pad_s() below, the single source every
+  consumer (all three renderers + build_srt's t=0 derivation) now routes
+  through -- no consumer computes this pad locally anymore.
 """
 
 from __future__ import annotations
@@ -100,3 +111,25 @@ def effective_window(start_s: float, end_s: float,
     eff_start = float(adjusted_start_s) if adjusted_start_s is not None else float(start_s)
     eff_end = float(adjusted_end_s) if adjusted_end_s is not None else float(end_s)
     return (eff_start, eff_end)
+
+
+def render_pad_s(adjusted_start_s: float | None, adjusted_end_s: float | None) -> float:
+    """The publish pad to apply to the effective window for THIS render.
+
+    0.0 the moment EITHER adjusted column is present -- an operator edit is
+    an explicit, deliberate window, and PUBLISH_PAD_S exists only to give the
+    DETECTOR's unedited guess breathing room. Applying it on top of an edit
+    silently un-trims up to PUBLISH_PAD_S per side (live, 2026-08-08: a
+    0.8->9.5 trim of a 0->10.02 original came back at 11.08s because the pad
+    clamped back to the trimmed-away opening). An unadjusted candidate (both
+    columns NULL) is untouched: PUBLISH_PAD_S, identical to today.
+
+    Single source of truth: every consumer (render_from_slice.py,
+    cut_clip.py, deliver_approved.render_adjusted_clip, and build_srt.py's
+    t=0 derivation on both the sidecar and formula bases) calls this instead
+    of reading PUBLISH_PAD_S directly, so the render window and the caption
+    window can never disagree about which pad applied.
+    """
+    if adjusted_start_s is not None or adjusted_end_s is not None:
+        return 0.0
+    return PUBLISH_PAD_S

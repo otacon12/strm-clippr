@@ -17,8 +17,12 @@ imported by generate_post_kit.py and also runs standalone.
 THE ONLY HARD PROBLEM HERE IS REBASING, AND IT IS A D-055 PROBLEM.
 Transcript segments are stored in ABSOLUTE recording seconds. The shipped clip
 starts somewhere else entirely, because the render covers the EFFECTIVE window
-(COALESCE(adjusted, original)) plus PUBLISH_PAD_S on each side. So every
-segment time shifts by the clip's own t=0 in absolute coordinates.
+(COALESCE(adjusted, original)) plus slice_geometry.render_pad_s(...) on each
+side — PUBLISH_PAD_S for an unedited candidate, 0.0 the moment the operator
+adjusted either edge (live fix, 2026-08-08: a pad applied on top of an
+explicit trim silently un-trims the clip, and captions must follow the SAME
+zero pad or they drift off the trimmed video by up to 1.5s). So every segment
+time shifts by the clip's own t=0 in absolute coordinates.
 
 TWO RENDERERS SHIP CLIPS AND THEIR t=0 DIFFERS, so the basis is chosen from
 the WITNESS OF WHICH ONE ACTUALLY RAN — clips.created_by_run — never from
@@ -258,7 +262,13 @@ def resolve_clip_zero(info: dict, candidate_id: int, slices_dir: str | None) -> 
         info['start_s'], info['end_s'],
         info['adjusted_start_s'], info['adjusted_end_s'],
     )
-    pad = slice_geometry.PUBLISH_PAD_S
+    # NO PAD ON AN OPERATOR EDIT (live fix, 2026-08-08): the SAME rule the
+    # renderers apply -- 0.0 the moment either adjusted column is set, else
+    # PUBLISH_PAD_S. Shared by BOTH bases below (sidecar and formula), since
+    # each reimplements its renderer's own offset arithmetic and must derive
+    # the identical t=0 that renderer actually cut, or captions drift off an
+    # edited clip's video by up to 1.5s.
+    pad = slice_geometry.render_pad_s(info['adjusted_start_s'], info['adjusted_end_s'])
     rec_dur = info['recording_duration_s']
 
     if basis == 'sidecar':

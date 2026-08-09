@@ -22,7 +22,11 @@ window and is deliberately untouched — it is the operator-proven D-023 path),
 so rendering dispatches: unedited candidates keep cut_clip.render_clip
 byte-identical behavior; adjusted candidates render via render_adjusted_clip
 below, which mirrors cut_clip exactly but cuts the effective window with
-slice_geometry.PUBLISH_PAD_S breathing room (one truth for the pad).
+slice_geometry.render_pad_s breathing room (one truth for the pad) — which is
+0.0 for every candidate that reaches this function, since it is only ever
+dispatched to when an adjustment exists (render_candidate below); PUBLISH_PAD_S
+only ever applies to the unedited cut_clip.render_clip path from here (live
+fix, 2026-08-08 — an operator trim is never silently un-trimmed back open).
 
 D-063: THIS MACHINE CANNOT BURN CAPTIONS, SO IT REFUSES THE CANDIDATES THAT
 WANT THEM — AT BOTH STAGES. The render stage refuses through
@@ -412,8 +416,10 @@ def render_adjusted_clip(candidate_id: int) -> int:
     it identically), the D-023 operator-proven filter_complex and encode flags
     byte-for-byte (cut_clip.py lines 133-159), the same clips upsert, and
     failure unlinks the partial output (charter gate 9). Only the cut window
-    differs: COALESCE(adjusted, original) +/- slice_geometry.PUBLISH_PAD_S
-    (== cut_clip.PAD_SECONDS, one truth in slice_geometry).
+    differs: COALESCE(adjusted, original) +/- slice_geometry.render_pad_s(...)
+    (one truth in slice_geometry; this function is only ever dispatched to
+    when an adjustment exists, so the pad here is always 0.0 — live fix,
+    2026-08-08).
     """
     require_obs_idle_or_raise('deliver_approved')
 
@@ -469,12 +475,18 @@ def render_adjusted_clip(candidate_id: int) -> int:
             candidate_id, burn_hook, 'deliver_approved.render_adjusted_clip'
         )
 
+        adjusted_start_s_f = float(adjusted_start_s) if adjusted_start_s is not None else None
+        adjusted_end_s_f = float(adjusted_end_s) if adjusted_end_s is not None else None
         eff_start_s, eff_end_s = slice_geometry.effective_window(
             float(start_s), float(end_s),
-            float(adjusted_start_s) if adjusted_start_s is not None else None,
-            float(adjusted_end_s) if adjusted_end_s is not None else None,
+            adjusted_start_s_f, adjusted_end_s_f,
         )
-        pad = slice_geometry.PUBLISH_PAD_S
+        # NO PAD ON AN OPERATOR EDIT (live fix, 2026-08-08): this function is
+        # only reached when an adjustment exists (render_candidate's dispatch
+        # below), so render_pad_s always returns 0.0 here in practice — kept
+        # as a call rather than a literal 0.0 so this stays the same one
+        # truth as cut_clip.py and never drifts if the dispatch rule changes.
+        pad = slice_geometry.render_pad_s(adjusted_start_s_f, adjusted_end_s_f)
 
         cut_start_s = cut_clip.clamp(eff_start_s - pad, 0.0, recording_duration_s)
         cut_end_s = cut_clip.clamp(eff_end_s + pad, 0.0, recording_duration_s)

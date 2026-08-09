@@ -7,7 +7,10 @@ The input is the surgical slice Workflow A staged at $CLPR_SLICES_DIR/c<id>.mp4
 start_s/end_s — slice_geometry, D-055). The render therefore ALWAYS TRIMS:
 a 10s-padded slice rendered whole would ship a ~20s-too-long clip. The cut
 window is the EFFECTIVE window (COALESCE(adjusted_*, original)) +/-
-PUBLISH_PAD_S.
+slice_geometry.render_pad_s(adjusted_start_s, adjusted_end_s) -- PUBLISH_PAD_S
+for an unedited candidate, but 0.0 the moment the operator has adjusted
+either edge, so a trim is never silently un-trimmed back open (live fix,
+2026-08-08).
 
 WITNESSED GEOMETRY (D-055 fixer): the slice's absolute coordinates come from
 the REQUIRED sidecar c<id>.json that slice_candidates writes at staging time
@@ -1036,10 +1039,15 @@ def render_from_slice(candidate_id: int) -> int:
             cand['start_s'], cand['end_s'],
             cand['adjusted_start_s'], cand['adjusted_end_s'],
         )
-        pad = slice_geometry.PUBLISH_PAD_S
+        # NO PAD ON AN OPERATOR EDIT (live fix, 2026-08-08): 0.0 the moment
+        # either adjusted column is set, else PUBLISH_PAD_S — see
+        # slice_geometry.render_pad_s for the full rationale (the pad exists
+        # for the DETECTOR's guess, not to un-trim an explicit operator edit).
+        pad = slice_geometry.render_pad_s(cand['adjusted_start_s'], cand['adjusted_end_s'])
 
-        # Target cut (shipped-clip invariant: effective window +/- PUBLISH_PAD_S)
-        # in ABSOLUTE video coordinates, BEFORE clamping.
+        # Target cut (shipped-clip invariant: effective window +/- pad, where
+        # pad is 0 on an operator edit) in ABSOLUTE video coordinates, BEFORE
+        # clamping.
         target_start_abs_s = eff_start_s - pad
         target_end_abs_s = eff_end_s + pad
 
@@ -1047,13 +1055,16 @@ def render_from_slice(candidate_id: int) -> int:
         # padded cut itself crosses that edge — i.e. the shortfall mirrors the
         # VIDEO's own edge (t=0 floor at staging / staging-time video-end
         # clamp), which is exactly what cut_clip.py does on the full recording.
-        # Geometry note: with SLICE_PAD_S (10) >> PUBLISH_PAD_S (1.5) the
-        # original padded cut can only cross abs_start_s when the staging
+        # Geometry note: with SLICE_PAD_S (10) >> pad (<= PUBLISH_PAD_S = 1.5)
+        # the original padded cut can only cross abs_start_s when the staging
         # formula floored at t=0, and only cross abs_end_s when staging clamped
         # to the video's end — so these conditions ARE the video-edge tests.
         # An operator EDIT that reaches past media the video itself had (e.g.
         # eff_start - pad < 0 with the original also near t=0) clamps the same
-        # way the Mac fallback would, so erroring there would buy nothing.
+        # way the Mac fallback would, so erroring there would buy nothing. This
+        # reuses the SAME `pad` (0 on an edit, matching what cut_clip.py's
+        # fallback would now also apply), so the legality test stays exactly
+        # in step with the actual target cut computed above.
         start_clamp_legal = (cand['start_s'] - pad) < (abs_start_s + CONTAIN_TOL_S)
         end_clamp_legal = (cand['end_s'] + pad) > (abs_end_s - CONTAIN_TOL_S)
 
