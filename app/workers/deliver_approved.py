@@ -535,7 +535,24 @@ def render_adjusted_clip(candidate_id: int) -> int:
                     created_at = EXCLUDED.created_at,
                     captions_requested = 0,
                     captions_burned = 0,
-                    captions_cue_count = NULL
+                    captions_cue_count = NULL,
+                    -- A RE-RENDER INVALIDATES THE DELIVERY WITNESS (2026-08-08).
+                    --
+                    -- drive_synced_at is D-056's proof that the bytes in Drive
+                    -- ARE this clip. A re-render replaces those bytes, so the
+                    -- proof stops being true the moment this row is updated --
+                    -- and leaving it set produced exactly that: after the
+                    -- operator un-ticked captions and this worker re-rendered,
+                    -- the row read captions_burned=0 / delivered, while the
+                    -- file in Drive still had captions burned in. The database
+                    -- and Drive disagreed and nothing could tell.
+                    --
+                    -- Clearing it re-opens the clip for delivery (the pending
+                    -- queue is state='approved' AND drive_synced_at IS NULL),
+                    -- which is what makes an un-tick actually reach Drive
+                    -- instead of being recorded and ignored.
+                    drive_synced_at = NULL,
+                    drive_sync_path = NULL
                 ''',
                 (candidate_id, str(out_path), duration_s, run_id, utc_now_iso()),
             )
