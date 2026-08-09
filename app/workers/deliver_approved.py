@@ -434,7 +434,7 @@ def render_adjusted_clip(candidate_id: int) -> int:
             '''
             SELECT c.recording_id, c.start_s, c.end_s,
                    c.adjusted_start_s, c.adjusted_end_s,
-                   c.state, r.path, r.duration_s, c.burn_captions
+                   c.state, r.path, r.duration_s, c.burn_captions, c.burn_hook
             FROM clip_candidates c
             JOIN recordings r ON r.id = c.recording_id
             WHERE c.id = %s
@@ -445,7 +445,8 @@ def render_adjusted_clip(candidate_id: int) -> int:
         if not row:
             raise RuntimeError(f'candidate_id not found: {candidate_id}')
         (recording_id, start_s, end_s, adjusted_start_s, adjusted_end_s,
-         state, recording_path, recording_duration_s, burn_captions) = row
+         state, recording_path, recording_duration_s, burn_captions,
+         burn_hook) = row
         if recording_duration_s is None:
             raise RuntimeError(f'recording duration_s is NULL for candidate_id={candidate_id}')
         recording_id = int(recording_id)
@@ -459,6 +460,13 @@ def render_adjusted_clip(candidate_id: int) -> int:
         # D-063: same refusal as cut_clip.render_clip, same message, one truth.
         cut_clip.require_no_caption_request(
             candidate_id, burn_captions, 'deliver_approved.render_adjusted_clip'
+        )
+
+        # D-074 gap fix: same refusal, for the sibling column this lane never
+        # checked — a burn_hook=1 candidate rendered here would otherwise ship
+        # silently WITHOUT the burned hook.
+        cut_clip.require_no_hook_request(
+            candidate_id, burn_hook, 'deliver_approved.render_adjusted_clip'
         )
 
         eff_start_s, eff_end_s = slice_geometry.effective_window(
