@@ -816,25 +816,55 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if not row:
                 self._send_json(HTTPStatus.NOT_FOUND, {'error': f'candidate not found: {candidate_id}'})
                 return
-            current_state = str(row['state'])
-            allowed_targets = allowed.get(current_state, set())
+            observed_state = str(row['state'])
+            allowed_targets = allowed.get(observed_state, set())
             if target_state not in allowed_targets:
                 self._send_json(
                     HTTPStatus.CONFLICT,
                     {
                         'error': 'candidate already decided',
                         'id': candidate_id,
-                        'state': current_state,
+                        'state': observed_state,
                         'requested_state': target_state,
                     },
                 )
                 return
 
+            # ATOMIC APPROVE LOCK (B6 fixer, same pattern as _edit_window's
+            # D-055 fixer, "ATOMIC APPROVE LOCK (D-055 fixer)" above): the
+            # guard lives IN the UPDATE, binding the state THIS handler
+            # observed above, not in a preceding SELECT the UPDATE trusts
+            # blindly. Two concurrent approves both pass the allowed-targets
+            # check (both observed 'candidate'), but only the WHERE-matched
+            # UPDATE can ever change a row -- Postgres re-evaluates the WHERE
+            # clause against the newly-committed row for whichever request
+            # arrives second (READ COMMITTED's EvalPlanQual), so a genuine
+            # loser always gets rowcount 0, never a second successful write.
             try:
                 cur.execute(
-                    'UPDATE clip_candidates SET state = %s WHERE id = %s',
-                    (target_state, candidate_id),
+                    'UPDATE clip_candidates SET state = %s WHERE id = %s AND state = %s',
+                    (target_state, candidate_id, observed_state),
                 )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    cur.execute('SELECT state FROM clip_candidates WHERE id = %s', (candidate_id,))
+                    row = cur.fetchone()
+                    if not row:
+                        self._send_json(
+                            HTTPStatus.NOT_FOUND,
+                            {'error': f'candidate not found: {candidate_id}'},
+                        )
+                        return
+                    self._send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            'error': 'candidate already decided',
+                            'id': candidate_id,
+                            'state': str(row['state']),
+                            'requested_state': target_state,
+                        },
+                    )
+                    return
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -844,12 +874,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-        # Webhook fires only AFTER the commit succeeded (the verdict is durable);
-        # its outcome rides along in the response so the UI could surface it.
+        # This point is reached ONLY when the UPDATE above actually matched a
+        # row (rowcount == 1) -- every rowcount == 0 path returns from inside
+        # the try block (via the 404/409 branches) before falling through
+        # here, so the loser of a race never reaches this call. Fires only
+        # AFTER the commit succeeded (the verdict is durable); its outcome
+        # rides along in the response so the UI could surface it.
         webhook_status = fire_verdict_webhook(
             candidate_id,
             int(updated['vod_id']) if updated else -1,
-            current_state,
+            observed_state,
             target_state,
         )
         if updated is not None:
