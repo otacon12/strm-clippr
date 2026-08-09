@@ -197,7 +197,22 @@ class GeminiEmptyCompletionError(GeminiError):
     Its own type, deliberately distinct from GeminiHTTPError/GeminiUnreachable,
     because Brief 2 needs to tell an empty completion (content-shaped, maybe
     worth a retry) apart from a transport failure without parsing a message.
+
+    `finish_reason` (candidates[0].finishReason) and `block_reason`
+    (promptFeedback.blockReason) are carried as TYPED ATTRIBUTES, not just
+    folded into the message string, so a caller can tell a deterministic
+    content-policy refusal (SAFETY / RECITATION / PROHIBITED_CONTENT) apart
+    from a genuinely transient empty completion WITHOUT pattern-matching
+    prose (charter gate 10). Both default to None: a promptFeedback-only
+    block can arrive with no `candidates` key at all, and an ordinary
+    transient empty completion carries neither.
     """
+
+    def __init__(self, message: str, finish_reason: str | None = None,
+                 block_reason: str | None = None):
+        super().__init__(message)
+        self.finish_reason = finish_reason
+        self.block_reason = block_reason
 
 
 class GeminiMotionMeasurementError(GeminiError):
@@ -601,7 +616,12 @@ def generate_content(file_uri: str, mime_type: str, prompt: str, api_key: str,
 
     text_parts: list = []
     candidates = parsed.get('candidates')
+    # GUARD THE INDEX: on a promptFeedback-only block, `candidates` can be
+    # absent entirely (not an empty list -- MISSING), so finish_reason must
+    # never assume candidates[0] exists.
+    finish_reason = None
     if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+        finish_reason = candidates[0].get('finishReason')
         content = candidates[0].get('content')
         parts = content.get('parts') if isinstance(content, dict) else None
         if isinstance(parts, list):
@@ -611,12 +631,22 @@ def generate_content(file_uri: str, mime_type: str, prompt: str, api_key: str,
                 if isinstance(part, dict) and isinstance(part.get('text'), str):
                     text_parts.append(part['text'])
 
+    prompt_feedback = parsed.get('promptFeedback')
+    block_reason = (
+        prompt_feedback.get('blockReason') if isinstance(prompt_feedback, dict) else None
+    )
+
     text = ''.join(text_parts)
     if not text:
         raise GeminiEmptyCompletionError(
             f'GEMINI_EMPTY_COMPLETION: model={model} returned 200 with no text in any '
-            f'candidate part. usageMetadata={parsed.get("usageMetadata")!r}. Distinct from a '
-            'transport failure so this can be retried on its own terms.'
+            f'candidate part. finishReason={finish_reason!r} blockReason={block_reason!r} '
+            f'usageMetadata={parsed.get("usageMetadata")!r}. A SAFETY/RECITATION/'
+            'PROHIBITED_CONTENT reason on either field is a deterministic refusal and will '
+            'not change on retry; anything else is distinct from a transport failure and can '
+            'be retried on its own terms.',
+            finish_reason=finish_reason,
+            block_reason=block_reason,
         )
 
     return {'response': parsed, 'text': text, 'response_id': parsed.get('responseId')}
@@ -631,15 +661,30 @@ def delete_file(name: str, api_key: str) -> bool:
 
     MEASURED: the follow-up GET returns 403 (not 404). Treat 403 OR 404 as
     proof of deletion; anything else (including a 200) means the file
-    survived. A leak must not abort a run that has already produced its
-    answer -- it never raises on a leak -- but it must be loud and greppable:
-    this is the successor to the local-temp cleanup check the old base64 path
-    had, and a file left on Google's store lives 48 hours.
+    survived.
+
+    NEVER RAISES, FULL STOP -- not "never raises on a leak". This is called
+    from a `finally` in generate_post_kit.py, so ANY GeminiError from EITHER
+    the DELETE or the follow-up GET (a transport fault, or an HTTP status
+    including 429/5xx) is caught here and turned into a loud
+    GEMINI_FILE_LEAKED print + `return False`, never a propagated exception.
+    Two failure modes that WOULD happen without this: a blip on cleanup
+    destroying an already-successful, already-paid vision run (the caller's
+    `try` already has its answer; a fault here must not cost a re-upload +
+    re-vision-call), and a cleanup fault REPLACING a real exception already
+    escaping the `try` block (the operator would see this fault instead of
+    the real one). A leaked file costs at most 48h of quota, never money --
+    losing a paid run is always worse, so this function trades a leak for
+    that guarantee whenever the two conflict.
     """
     headers = {'x-goog-api-key': api_key, 'User-Agent': USER_AGENT}
     url = f'{GEMINI_HOST}/v1beta/{name}'
 
-    _http_call('DELETE', url, headers, None, GENERATE_TIMEOUT_S)
+    try:
+        _http_call('DELETE', url, headers, None, GENERATE_TIMEOUT_S)
+    except GeminiError as exc:
+        print(f'GEMINI_FILE_LEAKED name={name} reason={exc!r}')
+        return False
 
     try:
         _http_call('GET', url, headers, None, GENERATE_TIMEOUT_S)
@@ -648,6 +693,12 @@ def delete_file(name: str, api_key: str) -> bool:
             print(f'GEMINI_FILE_DELETED name={name} verified=1')
             return True
         print(f'GEMINI_FILE_LEAKED name={name} http={exc.status}')
+        return False
+    except GeminiError as exc:
+        # Any non-HTTP GeminiError (transport fault/timeout) on the
+        # verification GET -- same "never raises" guarantee as the DELETE
+        # above.
+        print(f'GEMINI_FILE_LEAKED name={name} reason={exc!r}')
         return False
 
     # The follow-up GET succeeded (200): the file is still there.
