@@ -374,9 +374,11 @@
       return 'pending';
     }
 
-    // F6 fixer: a dead server / rejected fetch must render as a visible error,
-    // not silently paint the same "No X candidates" state as a genuinely
-    // empty queue.
+    // F6 fixer: a server error status or an unexpected (non-array) 200 body
+    // must render as a visible error, not silently paint the same
+    // "No X candidates" state as a genuinely empty queue. (A raw fetch()
+    // rejection is a separate path — see the NOTE in loadCandidates below —
+    // and never reaches this function.)
     function showListError(msg) {
       listError = msg;
       candidates = [];
