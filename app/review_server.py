@@ -19,8 +19,11 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import threading
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -134,8 +137,70 @@ CLIP_CACHE_DIR = Path(
                    str(Path.home() / '.cache' / 'clpr' / 'clips')))
 SSH_HOST = os.environ.get('CLPR_SSH_HOST', 'n8nserver')
 
+# B4: one lock per candidate id, so two concurrent requests for the SAME clip
+# serialise instead of both writing `fetch_clip_from_server`'s cache path at
+# once. That race is what punched a NUL hole into a "successfully" cached
+# file under ThreadingHTTPServer -- the second thread's O_TRUNC landed inside
+# the window the first thread's write was still filling. Access only through
+# `_clip_fetch_lock`, never directly: the outer guard is what makes the
+# lazy-create of a per-id Lock itself race-free (two threads racing to be
+# the FIRST fetch of a given candidate must not each build a different Lock
+# object, which would defeat the serialisation entirely).
+_clip_fetch_locks: 'defaultdict[int, threading.Lock]' = defaultdict(threading.Lock)
+_clip_fetch_locks_guard = threading.Lock()
 
-def fetch_clip_from_server(server_path: str | None, candidate_id: int) -> Path | None:
+
+def _clip_fetch_lock(candidate_id: int) -> threading.Lock:
+    with _clip_fetch_locks_guard:
+        return _clip_fetch_locks[candidate_id]
+
+
+def _parse_iso_utc(text: str) -> datetime:
+    """Parse the project's ISO-8601 'Z'-suffixed UTC timestamp format
+    (see utc_now_iso, and render_from_slice.py's identical helper that writes
+    clips.created_at on every render) into an AWARE datetime. Never returns a
+    naive one, so it can only ever be compared against another aware value
+    (charter §11 gate 21: one instant, one format -- a naive/aware mix is
+    exactly the kind of comparison that silently returns a wrong answer
+    instead of raising)."""
+    return datetime.fromisoformat(text.replace('Z', '+00:00'))
+
+
+def _clip_file_is_stale(cached_path: Path, row_created_at: str | None) -> bool:
+    """True when the clips row was (re-)rendered more recently than the file
+    at `cached_path` was written -- i.e. a re-render happened after this
+    file was cached or synced, so serving it would show the operator stale
+    bytes while he believes he is reviewing the current render.
+
+    `clips.created_at` is rewritten on every render, INCLUDING a re-render
+    of an already-rendered clip (render_from_slice.py's `ON CONFLICT ...
+    DO UPDATE SET created_at = EXCLUDED.created_at`), so it is the one
+    signal that actually changes when the underlying bytes change --
+    `deliver_approved.delivered_name()` does not (it is deterministic in
+    session_label/start_s/category/candidate_id), which is exactly why the
+    cache key stays byte-identical across a caption-only re-render and the
+    cache itself cannot self-detect staleness.
+
+    Absent or unparseable created_at is NOT treated as proof of staleness
+    (the charter's conservative default: under-claim rather than assert a
+    guess) -- a row with no readable timestamp does not refuse to play a
+    file that otherwise resolved.
+    """
+    if not row_created_at:
+        return False
+    try:
+        row_dt = _parse_iso_utc(str(row_created_at))
+    except ValueError:
+        return False
+    try:
+        file_dt = datetime.fromtimestamp(cached_path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return True  # the file vanished under us -- treat as a miss, not a crash
+    return row_dt > file_dt
+
+
+def fetch_clip_from_server(server_path: str | None, candidate_id: int,
+                            row_created_at: str | None = None) -> Path | None:
     """Pull a clip off the origin server and cache it locally, or None.
 
     WHY THIS EXISTS RATHER THAN JUST SEARCHING HARDER LOCALLY. Local resolution
@@ -149,6 +214,18 @@ def fetch_clip_from_server(server_path: str | None, candidate_id: int) -> Path |
     byte-range request after that is served from disk, which is also what makes
     seeking in the player work.
 
+    `row_created_at` (clips.created_at) gates the cache-hit: a re-render
+    writes a byte-identical cache KEY (see `_clip_file_is_stale`), so a plain
+    is-file-non-empty check would keep serving pre-rerender bytes forever.
+    When the cached copy is stale this function re-fetches and OVERWRITES it
+    via the same atomic write used for a first-time fetch.
+
+    The fetch-and-write is serialised per candidate id (`_clip_fetch_lock`)
+    and the temp file is created with `tempfile.mkstemp` (unique, exclusive)
+    so two concurrent callers for the same clip cannot interleave writes to
+    one shared `.part` path -- the final rename onto `cached` is always
+    `os.replace`, an atomic single syscall.
+
     Returns None rather than raising: the caller already has a 404 path that the
     UI renders as "not reachable from this machine", and a review surface must
     not 500 because a side channel is unavailable.
@@ -159,31 +236,63 @@ def fetch_clip_from_server(server_path: str | None, candidate_id: int) -> Path |
     if not name:
         return None
     cached = CLIP_CACHE_DIR / f'c{candidate_id}_{name}'
-    if cached.is_file() and cached.stat().st_size > 0:
-        return cached
-    CLIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = cached.with_suffix(cached.suffix + '.part')
-    try:
-        container = subprocess.run(
-            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', SSH_HOST,
-             "docker ps --format '{{.Names}}' | grep '^n8n-'"],
-            capture_output=True, text=True, timeout=30)
-        names = [n for n in container.stdout.split() if n.startswith('n8n-')]
-        if container.returncode != 0 or len(names) != 1:
-            return None
-        with open(tmp, 'wb') as fh:
-            proc = subprocess.run(
+
+    with _clip_fetch_lock(candidate_id):
+        if (cached.is_file() and cached.stat().st_size > 0
+                and not _clip_file_is_stale(cached, row_created_at)):
+            return cached
+        CLIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=CLIP_CACHE_DIR, prefix=f'.c{candidate_id}_', suffix='.part')
+        os.close(tmp_fd)
+        tmp = Path(tmp_name)
+        try:
+            container = subprocess.run(
                 ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', SSH_HOST,
-                 f'docker exec {names[0]} cat {shlex.quote(str(server_path))}'],
-                stdout=fh, stderr=subprocess.DEVNULL, timeout=600)
-        if proc.returncode != 0 or tmp.stat().st_size == 0:
+                 "docker ps --format '{{.Names}}' | grep '^n8n-'"],
+                capture_output=True, text=True, timeout=30)
+            names = [n for n in container.stdout.split() if n.startswith('n8n-')]
+            if container.returncode != 0 or len(names) != 1:
+                tmp.unlink(missing_ok=True)
+                return None
+            with open(tmp, 'wb') as fh:
+                proc = subprocess.run(
+                    ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', SSH_HOST,
+                     f'docker exec {names[0]} cat {shlex.quote(str(server_path))}'],
+                    stdout=fh, stderr=subprocess.DEVNULL, timeout=600)
+            if proc.returncode != 0 or tmp.stat().st_size == 0:
+                tmp.unlink(missing_ok=True)
+                return None
+            os.replace(tmp, cached)
+            return cached
+        except Exception:  # noqa: BLE001 - a side channel must never 500 the review UI
             tmp.unlink(missing_ok=True)
             return None
-        tmp.replace(cached)
-        return cached
-    except Exception:  # noqa: BLE001 - a side channel must never 500 the review UI
-        tmp.unlink(missing_ok=True)
-        return None
+
+
+def invalidate_clip_cache(candidate_id: int) -> int:
+    """Remove every cached copy of this candidate's clip. Returns the count
+    removed, so the caller can PRINT proof the sweep actually ran rather than
+    assume it did (charter §1.5 gate 2: a check that cannot fail loudly is
+    not a check).
+
+    Cache keys are `c<candidate_id>_<basename>` (fetch_clip_from_server); a
+    re-render writes a byte-identical KEY for a caption-only change
+    (deliver_approved.delivered_name() is deterministic in
+    session_label/start_s/category/candidate_id), so without this sweep the
+    review server would keep serving the pre-rerender bytes forever -- the
+    serving-side mtime/created_at check (`_clip_file_is_stale`) is a second,
+    independent line of defense against the same failure, not a substitute
+    for actually clearing the stale copy.
+    """
+    removed = 0
+    for f in CLIP_CACHE_DIR.glob(f'c{candidate_id}_*'):
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def resolve_local_vod(stored_path: str) -> Path | None:
@@ -566,7 +675,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
         formats (a full local Drive-mount path from the Mac deliverer, a bare
         filename from the n8n lane) plus NULLs. So resolve in order, and 404
         with a distinct message when nothing resolves — the UI renders that as
-        "clip file not reachable from this machine", never as a broken player."""
+        "clip file not reachable from this machine", never as a broken player.
+
+        B4: a locally-resolved file (either a stale review-server cache, or a
+        `resolve_local_clip` hit against a not-yet-re-synced Drive copy) is
+        REJECTED as a hit when `clips.created_at` is newer than the file's own
+        mtime -- that ordering can only happen when the clip was re-rendered
+        after this copy was written, i.e. exactly the caption-only-re-render
+        case that produces a byte-identical cache key. A rejected local hit
+        falls through to `fetch_clip_from_server`, which re-pulls (and, for
+        its own cache, overwrites) the current server-side render."""
         try:
             candidate_id = int(candidate_id_text)
         except ValueError:
@@ -577,7 +695,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         try:
             cur = dict_cursor(conn)
             cur.execute(
-                'SELECT file_path, drive_sync_path FROM clips WHERE candidate_id = %s',
+                'SELECT file_path, drive_sync_path, created_at FROM clips '
+                'WHERE candidate_id = %s',
                 (candidate_id,),
             )
             row = cur.fetchone()
@@ -589,6 +708,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
 
         resolved = resolve_local_clip(row['file_path'], row['drive_sync_path'])
+        if resolved is not None and _clip_file_is_stale(resolved, row['created_at']):
+            resolved = None
         if resolved is None:
             # THE DURABLE FALLBACK: fetch it from the origin server.
             #
@@ -596,8 +717,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             # machine-specific: it breaks on a laptop whose Drive mount differs,
             # and on a clip that is rendered but not yet delivered. Pulling from
             # the server removes both dependencies -- the clip is reachable
-            # wherever ssh is, delivered or not.
-            resolved = fetch_clip_from_server(row['file_path'], candidate_id)
+            # wherever ssh is, delivered or not. It also re-fetches when the
+            # local copy above was rejected as stale.
+            resolved = fetch_clip_from_server(row['file_path'], candidate_id, row['created_at'])
         if resolved is not None:
             self._serve_file_range(resolved)
             return
@@ -1391,6 +1513,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 (candidate_id,),
             )
             conn.commit()
+            # B4: the re-render is about to write NEW bytes under the SAME
+            # cache key (deliver_approved.delivered_name() is deterministic
+            # in session_label/start_s/category/candidate_id, so a
+            # caption-only change does not change the filename). Sweep every
+            # cached copy of this candidate now, so nothing in the review
+            # server's own cache -- or a stale `resolve_local_clip` local
+            # copy the mtime check has not yet seen replaced -- can be
+            # served as if it were the fresh render.
+            removed = invalidate_clip_cache(candidate_id)
+            print(f'RERENDER_CACHE_INVALIDATED candidate={candidate_id} removed={removed}')
             recording_id = row['recording_id']
             burn = row['burn_captions']
         finally:
