@@ -174,6 +174,18 @@ def run(recording_id: int) -> int:
         cap_count = round(15.0 * duration_s / 3600.0)
         if cap_count < 0:
             cap_count = 0
+        # ID-04 (golden-review F21): round(15*d/3600) rounds DOWN to 0 for any
+        # recording <= 120s (banker's rounding on round()), so a short test VOD
+        # silently discards every non-beat candidate via the cap with no signal
+        # that the cap itself -- not a detection failure -- produced the empty
+        # output.
+        if cap_count == 0 and duration_s > 0:
+            print(
+                f'NOTE score_fusion recording={recording_id} cap=0 duration_s={duration_s:.1f} '
+                'reason=short_recording_rounds_to_zero_cap (round(15*duration_s/3600) rounds '
+                'down to 0 for any recording <= 120s; every non-beat candidate is discarded by '
+                'the cap, not by detection)'
+            )
 
         beat_rows: list[tuple[CandidateInput, float, float, float, float]] = []
         signal_rows: list[tuple[CandidateInput, float, float, float, float]] = []
@@ -192,11 +204,22 @@ def run(recording_id: int) -> int:
 
         signal_rows_sorted = sorted(signal_rows, key=lambda x: x[4], reverse=True)
         kept_signal = signal_rows_sorted[:cap_count]
+        # ID-04: named for the RESULT line so a capped-out run is distinguishable
+        # from a run that genuinely found nothing.
+        signal_raw = len(signal_rows_sorted)
+        cap = cap_count
+        capped_out = max(0, signal_raw - len(kept_signal))
 
         candidates_written = 0
         beat_written = 0
         signal_written = 0
         poisoned_excluded = 0
+        # ID-08 (golden-review F21): ON CONFLICT ... DO NOTHING means a full
+        # re-run of an already-fused recording reports candidates_written=0,
+        # identical to the found-nothing case. rows_seen/rows_skipped_existing
+        # separate "nothing was found" from "everything already existed".
+        rows_seen = 0
+        rows_skipped_existing = 0
 
         # autocommit is OFF: the statements above already opened the
         # transaction implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
@@ -207,6 +230,7 @@ def run(recording_id: int) -> int:
                     poisoned_excluded += 1
                     continue
 
+                rows_seen += 1
                 cur.execute(
                     '''
                     INSERT INTO clip_candidates(
@@ -235,6 +259,8 @@ def run(recording_id: int) -> int:
                         beat_written += 1
                     else:
                         signal_written += 1
+                else:
+                    rows_skipped_existing += 1
 
         # R6/ID-12: state never left 'transcribed' — advance it here, in the
         # same transaction as the candidate writes above, so a rollback on
@@ -250,7 +276,9 @@ def run(recording_id: int) -> int:
 
     print(
         f'RESULT score_fusion recording={recording_id} candidates_written={candidates_written} '
-        f'beat_sourced={beat_written} signal_only={signal_written} poisoned_excluded={poisoned_excluded}'
+        f'beat_sourced={beat_written} signal_only={signal_written} poisoned_excluded={poisoned_excluded} '
+        f'signal_raw={signal_raw} cap={cap} capped_out={capped_out} '
+        f'rows_seen={rows_seen} rows_skipped_existing={rows_skipped_existing}'
     )
     return 0
 

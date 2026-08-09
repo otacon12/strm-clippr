@@ -549,7 +549,19 @@ class MalformedWriterResponseError(RuntimeError):
     keep their existing behaviour: those describe copy the model DID produce,
     where a retry really would pay twice to be told the same thing. Split by
     TYPE, never by message text, for the same reason as InventedQuoteError.
+
+    `finish_reason` (the writer's own choices[0].finish_reason, when the raise
+    site was handed one) is carried as a TYPED ATTRIBUTE, mirroring
+    GeminiEmptyCompletionError in gemini_files.py: a truncated/length-capped
+    completion is a plausible cause of unparseable or missing-field JSON, and
+    a caller should be able to tell that apart from a genuinely malformed
+    response WITHOUT pattern-matching prose (charter gate 10). Defaults to
+    None: not every raise site is handed one.
     """
+
+    def __init__(self, message: str, finish_reason: str | None = None):
+        super().__init__(message)
+        self.finish_reason = finish_reason
 
 
 def _find_retry_after(node, depth: int = 0) -> float | None:
@@ -1168,21 +1180,36 @@ def _reject_banned_dash(field: str, value: str) -> None:
             )
 
 
-def validate_kit(raw_text: str, transcript_plain: str) -> dict:
-    """Parse and gate the writer's response. Raises on ANY defect."""
+def validate_kit(raw_text: str, transcript_plain: str, finish_reason: str | None = None) -> dict:
+    """Parse and gate the writer's response. Raises on ANY defect.
+
+    `finish_reason` is optional and purely observational: when the caller has
+    the writer's choices[0].finish_reason in hand (it does, both call sites in
+    generate() pass it), every MalformedWriterResponseError raised here
+    carries it, per that error type's own docstring. Never affects control
+    flow: a caller that omits it (or any future caller) sees identical
+    validation behaviour.
+    """
     try:
         data = json.loads(ts.extract_json_payload(raw_text))
     except (ValueError, TypeError) as exc:
         raise MalformedWriterResponseError(
             f'MALFORMED_WRITER_RESPONSE: the writer model did not return parseable JSON '
-            f'({exc}). First 400 chars, verbatim: {raw_text[:400]!r}. Zero rows written.'
+            f'({exc}). First 400 chars, verbatim: {raw_text[:400]!r}. Zero rows written.',
+            finish_reason=finish_reason,
         ) from exc
     if not isinstance(data, dict):
-        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: response is not a JSON object. Zero rows written.')
+        raise MalformedWriterResponseError(
+            'MALFORMED_WRITER_RESPONSE: response is not a JSON object. Zero rows written.',
+            finish_reason=finish_reason,
+        )
 
     hooks_raw = data.get('on_video_text')
     if not isinstance(hooks_raw, dict):
-        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: missing on_video_text object. Zero rows written.')
+        raise MalformedWriterResponseError(
+            'MALFORMED_WRITER_RESPONSE: missing on_video_text object. Zero rows written.',
+            finish_reason=finish_reason,
+        )
 
     hooks: dict = {}
     for key in ('withheld', 'domain', 'payoff'):
@@ -1190,7 +1217,8 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
         if not isinstance(value, str) or not value.strip():
             raise MalformedWriterResponseError(
                 f'MALFORMED_WRITER_RESPONSE: on_video_text.{key} is missing or empty. '
-                'All three concreteness variants are required. Zero rows written.'
+                'All three concreteness variants are required. Zero rows written.',
+                finish_reason=finish_reason,
             )
         value = ' '.join(value.split())
         words = len(value.split())
@@ -1218,7 +1246,10 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
 
     caption = data.get('video_caption')
     if not isinstance(caption, str) or not caption.strip():
-        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: video_caption is missing or empty. Zero rows written.')
+        raise MalformedWriterResponseError(
+            'MALFORMED_WRITER_RESPONSE: video_caption is missing or empty. Zero rows written.',
+            finish_reason=finish_reason,
+        )
     caption = caption.strip()
     if len(caption) > MAX_CAPTION_CHARS:
         raise RuntimeError(
@@ -1235,7 +1266,10 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
         hashtags = []
         for item in hashtags_raw:
             if not isinstance(item, str) or not item.strip():
-                raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: a hashtag is not a non-empty string. Zero rows written.')
+                raise MalformedWriterResponseError(
+                    'MALFORMED_WRITER_RESPONSE: a hashtag is not a non-empty string. Zero rows written.',
+                    finish_reason=finish_reason,
+                )
             tag = item.strip()
             if not tag.startswith('#') or len(tag.split()) != 1 or len(tag) < 2:
                 raise RuntimeError(
@@ -1244,7 +1278,10 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
             _reject_banned_dash('hashtags', tag)
             hashtags.append(tag)
     else:
-        raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: hashtags is not a list. Zero rows written.')
+        raise MalformedWriterResponseError(
+            'MALFORMED_WRITER_RESPONSE: hashtags is not a list. Zero rows written.',
+            finish_reason=finish_reason,
+        )
 
     if len(hashtags) > MAX_HASHTAGS:
         raise RuntimeError(
@@ -1256,7 +1293,10 @@ def validate_kit(raw_text: str, transcript_plain: str) -> dict:
     quoted = data.get('quoted_line')
     if quoted is not None:
         if not isinstance(quoted, str):
-            raise MalformedWriterResponseError('MALFORMED_WRITER_RESPONSE: quoted_line is not a string or null. Zero rows written.')
+            raise MalformedWriterResponseError(
+                'MALFORMED_WRITER_RESPONSE: quoted_line is not a string or null. Zero rows written.',
+                finish_reason=finish_reason,
+            )
         quoted = quoted.strip()
         if not quoted:
             quoted = None
@@ -1317,6 +1357,21 @@ def message_text(response: dict, which: str) -> str:
             f'provider={response.get("provider")!r})'
         )
     return text
+
+
+def writer_call_fields(response: dict) -> tuple[str | None, int | None]:
+    """(finish_reason, completion_tokens) for ONE writer response.
+
+    MK-07/MK-09: usage and finish_reason are already in every OpenRouter
+    response (message_text's own OPENROUTER_EMPTY_CONTENT branch above reads
+    the identical two fields on the failure path); this reads them on the
+    SUCCESS path too, where message_text already proved choices/usage are
+    present in the expected shape. Read-only, never raises: `.get()` chains
+    default to None on any missing key.
+    """
+    choice = (response.get('choices') or [{}])[0] or {}
+    usage = response.get('usage') or {}
+    return choice.get('finish_reason'), usage.get('completion_tokens')
 
 
 # ---------------------------------------------------------------------------
@@ -1580,11 +1635,26 @@ def mark_requests_failed(request_ids: list[int], reason: str) -> None:
             conn.commit()
         finally:
             conn.close()
-        print(
-            f'REQUESTS_FAILED marked={marked} ids={request_ids} (the review UI now shows this '
-            'failure with the reason, instead of a request that waits forever)',
-            file=sys.stderr,
-        )
+        # MK-11 (golden-review F21): the WHERE clause only touches rows still
+        # in state='requested', so marked=0 whenever every id was already
+        # satisfied/failed before this call. The old message claimed "the
+        # review UI now shows this failure" unconditionally, which was FALSE
+        # exactly when marked=0 -- nothing was written, so nothing changed in
+        # the review UI. Branch on what actually happened.
+        if marked:
+            print(
+                f'REQUESTS_FAILED marked={marked} ids={request_ids} (the review UI now shows this '
+                'failure with the reason, instead of a request that waits forever)',
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f'REQUESTS_FAILED marked={marked} ids={request_ids} (none of these were still '
+                "state='requested' -- the review UI does NOT show this failure via "
+                'post_kit_requests, because nothing was updated. Each id had already left '
+                "'requested' before this call.)",
+                file=sys.stderr,
+            )
     except Exception as exc:  # noqa: BLE001 - never mask the real failure
         print(
             f'REQUEST_MARK_FAILED could not record the failure against post_kit_requests '
@@ -2630,9 +2700,18 @@ def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_di
     # and the retry could fail identically. The ban is scoped to its real blast
     # radius: the four platform-bound copy fields, which validate_kit gates.
     vision_generation_id = str(out['response_id'] or '')
+    # MK-07: usage is already in the Gemini response (out['response']
+    # ['usageMetadata'], the same object generate_content's own
+    # GeminiEmptyCompletionError path reads on failure, in gemini_files.py) --
+    # surfaced here on the success path too, and again on the final RESULT
+    # line below, so vision cost is visible without correlating logs.
+    vision_usage = out['response'].get('usageMetadata') or {}
+    vision_prompt_tokens = vision_usage.get('promptTokenCount')
+    vision_completion_tokens = vision_usage.get('candidatesTokenCount')
     print(
         f'VISION_OK chars={len(scene)} generation_id={vision_generation_id} '
-        f'sha256_match={witnesses["sha256_match"]}'
+        f'sha256_match={witnesses["sha256_match"]} vision_prompt_tokens={vision_prompt_tokens} '
+        f'vision_completion_tokens={vision_completion_tokens}'
     )
 
     chat_url = f'{OPENROUTER_BASE}/chat/completions'
@@ -2675,6 +2754,10 @@ def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_di
 
     quote_fallback = 0
     quote_fallback_reason: str | None = None
+    # MK-10: every writer call across BOTH loops below (the primary structural
+    # retry and the no-quote rewrite's own structural retry), so a kit that
+    # only landed on attempt 3 never reads as a clean first-try success.
+    writer_attempts = 0
     for structural_attempt in range(1, structural_max_attempts + 1):
         label = 'writer' if structural_attempt == 1 else 'writer_structural_retry'
         print(
@@ -2684,7 +2767,9 @@ def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_di
         writer_response, writer_text = openrouter_call(
             label, 'POST', chat_url, api_key, writer_payload(False), WRITER_TIMEOUT_S,
             expect_message=True)
+        writer_attempts += 1
         writer_generation_id = str(writer_response.get('id') or '')
+        writer_finish_reason, writer_completion_tokens = writer_call_fields(writer_response)
 
         # THE NO-QUOTE FALLBACK. A fabricated quote costs ONE cheap writer call, not
         # the whole kit. Measured 2026-08-07: candidate 45 failed FOUR separate
@@ -2705,7 +2790,7 @@ def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_di
         # wobble that clears on an identical re-ask, so it moved to the
         # structural retry. See MalformedWriterResponseError's docstring.
         try:
-            kit = validate_kit(writer_text, transcript_plain)
+            kit = validate_kit(writer_text, transcript_plain, finish_reason=writer_finish_reason)
             break
         except InventedQuoteError as first_exc:
             quote_fallback_reason = str(first_exc)
@@ -2755,9 +2840,11 @@ def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_di
                     writer_response, writer_text = openrouter_call(
                         'writer_no_quote', 'POST', chat_url, api_key, writer_payload(True),
                         WRITER_TIMEOUT_S, expect_message=True)
+                    writer_attempts += 1
                     writer_generation_id = str(writer_response.get('id') or '')
+                    writer_finish_reason, writer_completion_tokens = writer_call_fields(writer_response)
                     try:
-                        kit = validate_kit(writer_text, transcript_plain)
+                        kit = validate_kit(writer_text, transcript_plain, finish_reason=writer_finish_reason)
                         break
                     except MalformedWriterResponseError as no_quote_structural_exc:
                         if no_quote_attempt >= structural_max_attempts:
@@ -2797,15 +2884,26 @@ def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_di
             # never swallowed.
             print(
                 f'WRITER_STRUCTURAL_RETRY candidate={candidate_id} '
-                f'attempt={structural_attempt}/{structural_max_attempts} re-asking the SAME '
-                'payload -- candidate 1 (2026-08-08) failed this way and an identical re-run '
-                f'succeeded. Verbatim reason: {structural_exc}'
+                f'attempt={structural_attempt}/{structural_max_attempts} '
+                # MK-09: finish_reason (via the typed attribute, same value the
+                # raise site inside validate_kit was handed) and completion_tokens
+                # (from this attempt's own response, still in scope) -- a
+                # truncated completion (finish_reason='length') is a plausible,
+                # distinguishable cause of the malformed JSON, versus a
+                # structurally-incomplete response that finished normally.
+                f'finish_reason={structural_exc.finish_reason!r} '
+                f'completion_tokens={writer_completion_tokens} '
+                're-asking the SAME payload -- candidate 1 (2026-08-08) failed this way and an '
+                f'identical re-run succeeded. Verbatim reason: {structural_exc}'
             )
             continue
 
+    writer_prompt_tokens = (writer_response.get('usage') or {}).get('prompt_tokens')
     print(
         f'WRITER_OK generation_id={writer_generation_id} hashtags={len(kit["hashtags"])} '
-        f'quoted={"1" if kit["quoted_line"] else "0"} quote_fallback={quote_fallback}'
+        f'quoted={"1" if kit["quoted_line"] else "0"} quote_fallback={quote_fallback} '
+        f'writer_attempts={writer_attempts} writer_prompt_tokens={writer_prompt_tokens} '
+        f'writer_completion_tokens={writer_completion_tokens}'
     )
 
     # D-066: fps and media_resolution are recorded as genuinely SENT (Gemini's
@@ -2977,7 +3075,8 @@ def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_di
         f'hashtags={len(kit["hashtags"])} subject={subject_kind} '
         f'analysis_transport=gemini_files gemini_sha256_match={witnesses["sha256_match"]} '
         f'quote_fallback={quote_fallback} '
-        f'analysis_downscaled=0'
+        f'analysis_downscaled=0 '
+        f'vision_prompt_tokens={vision_prompt_tokens} writer_attempts={writer_attempts}'
         f'{result_file_fields(files)}'
     )
     return 0
