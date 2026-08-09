@@ -356,6 +356,36 @@
               padding: 14px; margin-bottom: 10px; }
     .histrow { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
                border-top: 1px solid var(--hairline); padding: 5px 0; }
+
+    /* ---------------------------------------------------------------- D-074
+       BURNED HOOK + COLOR CHOICES. A caption sample band, positioned to
+       mirror render_from_slice.py's real geometry percentages (MarginV=68 /
+       MarginL,R=30 scaled onto the 1920x1080 frame = 23.6% from the bottom,
+       7.8% inset each side), so the preview reads at roughly the place the
+       real burn lands -- distinct from .hookband above, which is the
+       pre-existing D-061 overlay position and is left untouched here. */
+    .captionband { position: absolute; left: 7.8%; right: 7.8%; bottom: 23.6%; pointer-events: none;
+                   display: flex; justify-content: center; }
+    .captiontext { font-family: var(--font-sans); font-weight: 700; font-size: 12px; line-height: 1.25;
+                   padding: 4px 7px; border-radius: var(--radius-sm); text-align: center; word-break: break-word; }
+
+    /* The style controls: a toggle + two color pickers (swatches + free hex),
+       dirty/save like the trim slider (spec: "matching the window editor's
+       conventions") rather than the instant-save the captions/generate
+       toggles use -- burn_hook and the two colors are saved as ONE unit via
+       "Save style", not per-field on change. */
+    .stylewrap { margin: 4px 0 14px; }
+    .styleblock { margin-bottom: 12px; }
+    .stylelabel { display: block; font-size: 10.5px; font-weight: 600; letter-spacing: .08em;
+                  text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    .swatchrow { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 8px; }
+    .swatch { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--hairline);
+              padding: 0; cursor: pointer; flex: 0 0 auto; }
+    .swatch:hover { border-color: var(--pop); transform: translateY(-1px); }
+    .swatch.on { border-color: var(--pop); box-shadow: 0 0 0 2px var(--pop-tint-strong); }
+    .swatch.none { background: var(--panel); display: flex; align-items: center; justify-content: center;
+                   color: var(--muted); font-size: 14px; font-weight: 700; }
+    .colorhex { max-width: 130px; font-variant-numeric: tabular-nums; text-transform: uppercase; }
   </style>
 </head>
 <body>
@@ -454,6 +484,24 @@
     const subjectPick = {};
     let profileState = null;   // the ACTIVE creator_profile row, or null
     let showGuides = true;
+
+    // D-074: unsaved burn_hook/caption_color/hook_color edits, keyed by
+    // candidate id. Same discipline as `drafts` (the D-055 window edits) and
+    // `kitDrafts` above -- draft in memory, nothing written until Save, per
+    // the brief's "dirty/save flow matching the window editor's conventions"
+    // (a deliberate departure from burnCaps/genKit's own instant-save).
+    const styleDrafts = {};
+
+    // Curated color choices for BOTH pickers (spec: White/Black/Yellow/
+    // Orange/Pink/Green). Free-hex input covers anything else.
+    const STYLE_SWATCHES = [
+      { name: 'White', hex: '#FFFFFF' },
+      { name: 'Black', hex: '#000000' },
+      { name: 'Yellow', hex: '#FFE600' },
+      { name: 'Orange', hex: '#FF5C00' },
+      { name: 'Pink', hex: '#FF3EA5' },
+      { name: 'Green', hex: '#00E676' },
+    ];
 
     function fmt(v, n = 3) {
       if (v === null || v === undefined) return 'null';
@@ -905,6 +953,242 @@
       out.innerHTML = `Hook covers <b>${pct.toFixed(1)}%</b> of the frame. ${esc(verdict)}`;
     }
 
+    // ------------------------------------------------------------------ D-074
+    // BURNED HOOK + OPERATOR COLOR CHOICES. The luminance/backing math below
+    // is a DELIBERATE duplicate of render_from_slice.py's Python
+    // (parse_hex_color / relative_luminance / auto_contrast_backing) for
+    // THIS PREVIEW ONLY -- presentation-only, per the brief: "the renderer's
+    // Python rule is the truth." There is no shared source between a Python
+    // worker and a static HTML page, so keep the two in sync by eye if
+    // either ever changes.
+
+    function styleHexNorm(hex) {
+      if (!hex) return null;
+      const m = /^#?([0-9A-Fa-f]{6})$/.exec(String(hex).trim());
+      return m ? m[1].toUpperCase() : null;
+    }
+
+    function styleLuminance(hex6) {
+      const ch = (cc) => {
+        const v = parseInt(cc, 16) / 255;
+        return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+      };
+      const r = ch(hex6.slice(0, 2)), g = ch(hex6.slice(2, 4)), b = ch(hex6.slice(4, 6));
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+
+    function styleAutoBacking(hex6) {
+      // Mirrors auto_contrast_backing() in render_from_slice.py: light ink
+      // (relative luminance > 0.5) keeps a dark outline/box, dark ink flips
+      // to a light one -- the operator's own rule: "background and
+      // foreground should change based on readability."
+      return styleLuminance(hex6) > 0.5
+        ? { light: false, back: 'rgba(0,0,0,.55)', shadow: '0 1px 3px rgba(0,0,0,.9)' }
+        : { light: true, back: 'rgba(255,255,255,.55)', shadow: '0 1px 3px rgba(255,255,255,.85)' };
+    }
+
+    // The draft's current values: the unsaved draft when one exists, else
+    // the candidate's own saved fields. Same shape as kitValues()/
+    // editorValues() above.
+    function styleSaved(c) {
+      return {
+        burn_hook: c.burn_hook === 1,
+        caption_color: c.caption_color || '',
+        hook_color: c.hook_color || '',
+      };
+    }
+
+    function styleValues(c) {
+      const d = styleDrafts[c.id];
+      if (d) return d;
+      return styleSaved(c);
+    }
+
+    function styleHasUnsaved(c) {
+      const d = styleDrafts[c.id];
+      if (!d) return false;
+      const saved = styleSaved(c);
+      return d.burn_hook !== saved.burn_hook
+        || (d.caption_color || '') !== saved.caption_color
+        || (d.hook_color || '') !== saved.hook_color;
+    }
+
+    function styleDraft(c) {
+      return styleDrafts[c.id] || (styleDrafts[c.id] = Object.assign({}, styleSaved(c)));
+    }
+
+    function styleSwatchesHtml(target, currentHex) {
+      const norm = styleHexNorm(currentHex);
+      return STYLE_SWATCHES.map((s) => {
+        const on = norm && s.hex.slice(1).toUpperCase() === norm;
+        return `<button type="button" class="swatch${on ? ' on' : ''}" data-style-target="${target}"
+          data-style-hex="${s.hex}" style="background:${s.hex};" title="${esc(s.name)}" aria-label="${esc(s.name)}"></button>`;
+      }).join('');
+    }
+
+    function styleControlsHtml(c) {
+      const v = styleValues(c);
+      return `
+        <div class="stylewrap">
+          <div class="styleblock">
+            <span class="stylelabel">Captions color</span>
+            <div class="swatchrow">${styleSwatchesHtml('caption', v.caption_color)}</div>
+            <input type="text" class="colorhex" id="captionColorHex" placeholder="#FFFFFF default"
+                   value="${esc(v.caption_color)}" maxlength="7" />
+          </div>
+          <div class="styleblock">
+            <span class="stylelabel">Hook color</span>
+            <div class="swatchrow">${styleSwatchesHtml('hook', v.hook_color)}</div>
+            <input type="text" class="colorhex" id="hookColorHex" placeholder="#FFFFFF default"
+                   value="${esc(v.hook_color)}" maxlength="7" />
+          </div>
+          <div class="trimactions">
+            <button class="savewin" id="btnSaveStyle" style="display:${styleHasUnsaved(c) ? 'inline-flex' : 'none'};">Save style</button>
+            <span class="unsaved" id="styleUnsaved" style="display:${styleHasUnsaved(c) ? 'inline-flex' : 'none'};">Unsaved edit</span>
+          </div>
+        </div>`;
+    }
+
+    // Repaints the phone mockup's hook band AND the caption-sample band from
+    // the CURRENT draft (or saved) colors, including the auto-contrast flip.
+    // Called from repaintOverlay() so every path that already repaints the
+    // hook text also repaints its color/backing.
+    function repaintStylePreview(c) {
+      const v = styleValues(c);
+
+      const hookSpan = document.getElementById('hookText');
+      if (hookSpan) {
+        if (hookSpan.classList.contains('empty')) {
+          // Let .hooktext.empty's own CSS (the red "nothing here" treatment)
+          // show through untouched rather than fighting it with inline color.
+          hookSpan.style.color = '';
+          hookSpan.style.background = '';
+          hookSpan.style.textShadow = '';
+        } else {
+          const hex = styleHexNorm(v.hook_color) || 'FFFFFF';
+          const backing = styleAutoBacking(hex);
+          hookSpan.style.color = '#' + hex;
+          hookSpan.style.background = backing.back;
+          hookSpan.style.textShadow = backing.shadow;
+        }
+      }
+
+      const capSpan = document.getElementById('captionSample');
+      if (capSpan) {
+        const hex = styleHexNorm(v.caption_color) || 'FFFFFF';
+        const backing = styleAutoBacking(hex);
+        capSpan.style.color = '#' + hex;
+        capSpan.style.background = backing.back;
+        capSpan.style.textShadow = backing.shadow;
+      }
+    }
+
+    // Re-derives the Save/unsaved chip visibility and the swatches' selected
+    // ring from the current draft, then repaints the preview -- called after
+    // every style edit (checkbox, swatch click, hex typing).
+    function refreshStyleDirty(c) {
+      const dirty = styleHasUnsaved(c);
+      const saveBtn = document.getElementById('btnSaveStyle');
+      const flag = document.getElementById('styleUnsaved');
+      if (saveBtn) saveBtn.style.display = dirty ? 'inline-flex' : 'none';
+      if (flag) flag.style.display = dirty ? 'inline-flex' : 'none';
+      const v = styleValues(c);
+      document.querySelectorAll('.swatch[data-style-target]').forEach((btn) => {
+        const target = btn.dataset.styleTarget;
+        const cur = styleHexNorm(target === 'caption' ? v.caption_color : v.hook_color);
+        btn.classList.toggle('on', !!cur && btn.dataset.styleHex.slice(1).toUpperCase() === cur);
+      });
+      repaintStylePreview(c);
+    }
+
+    function wireStyleControls(c) {
+      const hookEl = document.getElementById('burnHook');
+      if (hookEl) {
+        hookEl.onchange = () => {
+          styleDraft(c).burn_hook = hookEl.checked;
+          refreshStyleDirty(c);
+        };
+      }
+
+      document.querySelectorAll('.swatch[data-style-target]').forEach((btn) => {
+        btn.onclick = () => {
+          const target = btn.dataset.styleTarget;
+          const hex = btn.dataset.styleHex;
+          const d = styleDraft(c);
+          if (target === 'caption') {
+            d.caption_color = hex;
+            const el = document.getElementById('captionColorHex');
+            if (el) el.value = hex;
+          } else {
+            d.hook_color = hex;
+            const el = document.getElementById('hookColorHex');
+            if (el) el.value = hex;
+          }
+          refreshStyleDirty(c);
+        };
+      });
+
+      const capHexEl = document.getElementById('captionColorHex');
+      if (capHexEl) {
+        capHexEl.oninput = () => {
+          styleDraft(c).caption_color = capHexEl.value;
+          refreshStyleDirty(c);
+        };
+      }
+      const hookHexEl = document.getElementById('hookColorHex');
+      if (hookHexEl) {
+        hookHexEl.oninput = () => {
+          styleDraft(c).hook_color = hookHexEl.value;
+          refreshStyleDirty(c);
+        };
+      }
+
+      const saveBtn = document.getElementById('btnSaveStyle');
+      if (saveBtn) saveBtn.onclick = () => saveRenderStyle(c);
+    }
+
+    async function saveRenderStyle(c) {
+      const v = styleValues(c);
+      const capNorm = styleHexNorm(v.caption_color);
+      const hookNorm = styleHexNorm(v.hook_color);
+      if (v.caption_color && !capNorm) {
+        notify('Captions color must be a 6 digit hex color, for example #FFE600.', {});
+        return;
+      }
+      if (v.hook_color && !hookNorm) {
+        notify('Hook color must be a 6 digit hex color, for example #00E676.', {});
+        return;
+      }
+      gen += 1;
+      let res;
+      try {
+        res = await fetch(`/api/candidates/${c.id}/render-style`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            burn_hook: !!v.burn_hook,
+            caption_color: capNorm ? ('#' + capNorm) : null,
+            hook_color: hookNorm ? ('#' + hookNorm) : null,
+          }),
+        });
+      } catch (err) {
+        notify('Could not reach the server. Check your connection and try again.', { technical: String(err) });
+        return;
+      }
+      if (!res.ok) {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) {}
+        notify('The server refused to save the render style.', { technical: `${res.status} ${body}` });
+        return;
+      }
+      const row = await res.json();
+      delete styleDrafts[row.id];
+      const j = indexOfRow(row.id);
+      if (j !== -1) { candidates[j] = mergeLocalFlags(candidates[j], row); idx = j; }
+      renderList();
+      renderDetail();
+    }
+
     function repaintOverlay() {
       const c = candidates[idx];
       if (!c) return;
@@ -926,6 +1210,7 @@
         b.classList.toggle('on', b.dataset.hook === key);
       });
       updateCoverage();
+      repaintStylePreview(c);
     }
 
     function captionsPanel(c) {
@@ -1107,6 +1392,10 @@
           change the file already delivered.</label>
         <div class="winline">${captionsFactHtml(c)}</div>
         ${captionsIntentNote(c)}
+        <label class="genrow"><input type="checkbox" id="burnHook" ${c.burn_hook === 1 ? 'checked' : ''} />
+          Burn hook text into this clip. Intent only: it applies to the next render, it cannot change
+          the file already delivered.</label>
+        ${styleControlsHtml(c)}
         ${hasClip ? `
         <div class="editrow" style="margin:0 0 14px;">
           <!-- RS-06: present whenever a rendered clip row exists, independent
@@ -1129,6 +1418,7 @@
               <div class="guide bottom" style="display:${showGuides ? 'block' : 'none'};"></div>
               <div class="guide rail" style="display:${showGuides ? 'block' : 'none'};"></div>
               <div class="hookband"><span class="hooktext" id="hookText">${esc(hookText)}</span></div>
+              <div class="captionband"><span class="captiontext" id="captionSample">Sample caption text</span></div>
             </div>
             <div class="editrow" style="margin-top:8px;">
               <button class="replaywin" id="btnPlayClip">Play</button>
@@ -1140,11 +1430,13 @@
               <div class="cap" id="postCaption">${esc(v.video_caption)}</div>
               <div class="tags" id="postTags">${esc(v.hashtags)}</div>
             </div>
-            <div class="kitmeta">Dashed regions are covered by the platform's own UI. The hook is a CSS
-              overlay on top of the video. It is never burned into the delivered file and never will be
-              (D-061): you type it into the platform's own text tool. Speech captions are the one
-              exception, and only when you tick the box above. They are burned during the render, sit
-              along the bottom clear of these guides, and this mockup does not show them.</div>
+            <div class="kitmeta">Dashed regions are covered by the platform's own UI. By default the hook
+              is a CSS overlay on top of the video only, per D-061: you type it into the platform's own
+              text tool, and nothing here is burned. Tick "Burn hook text into video" above to burn it
+              into the file itself instead, in your chosen color. Speech captions burn the same way, only
+              when you tick the box above, in their own chosen color. Burned captions sit along the
+              bottom; a burned hook sits in the band shown here. The sample caption line below is a color
+              preview only, it does not track real speech.</div>
           </div>
           <div>
             ${copyBlocks}
@@ -1176,6 +1468,8 @@
       if (genEl) genEl.onchange = () => setGenerate(c, genEl.checked);
       const capEl = document.getElementById('burnCaps');
       if (capEl) capEl.onchange = () => setCaptions(c, capEl.checked);
+      // D-074: burn_hook + both colors, dirty/save (see wireStyleControls).
+      wireStyleControls(c);
 
       detailEl.querySelectorAll('.variant .pick').forEach((b) => {
         b.onclick = () => { hookPick[c.id] = b.dataset.hook; repaintOverlay(); };
