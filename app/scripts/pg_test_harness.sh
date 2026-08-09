@@ -19,7 +19,37 @@
 
 set -u
 
-PGBIN=/usr/local/bin
+# PGBIN resolution (D-052 P3 / golden-review F18 item 4): a hardcoded
+# /usr/local/bin is Intel-Homebrew-pinned and silently wrong on Apple
+# Silicon (Homebrew's default prefix there is /opt/homebrew) or any host
+# where postgresql isn't installed via Homebrew at all. Resolve from
+# `command -v initdb` first (honors PATH, including a non-Homebrew install),
+# then fall back through the two known Homebrew prefixes, and refuse by name
+# -- listing everywhere it looked -- when none of them has it, rather than
+# silently trying a wrong path and failing later with a confusing error.
+resolve_pgbin() {
+    local found
+    if found="$(command -v initdb 2>/dev/null)" && [ -n "$found" ]; then
+        dirname "$found"
+        return 0
+    fi
+    local candidate
+    for candidate in /opt/homebrew/bin /usr/local/bin; do
+        if [ -x "$candidate/initdb" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! PGBIN="$(resolve_pgbin)"; then
+    echo "ERROR: could not locate initdb. Looked: (1) PATH via 'command -v initdb', (2)" >&2
+    echo "/opt/homebrew/bin/initdb, (3) /usr/local/bin/initdb. Install PostgreSQL (e.g." >&2
+    echo "'brew install postgresql@16') or add its bin directory to PATH." >&2
+    exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MIGRATIONS_DIR="$SCRIPT_DIR/../migrations_pg"
 DATA="$HOME/Downloads/consolidated_data.sql"
