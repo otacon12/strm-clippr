@@ -5,68 +5,223 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>clpr review surface</title>
   <style>
+    /* =====================================================================
+       D-073 REVIEW UI REDESIGN -- FIFGEN DNA, studio-dark transposition.
+       Token set per docs/review-ui-redesign-spec.md section 1. DARK IS
+       OPERATOR-RATIFIED LAW (2026-08-08: "keep the page dark though, i like
+       the dark vibe.") -- never lighten this ground to match the paper
+       brand site. Same DNA (type, accent, spacing, motion), studio ground.
+       ===================================================================== */
     :root {
-      --bg: #111317;
-      --panel: #1a1f27;
-      --panel2: #232b36;
-      --text: #e6edf3;
-      --muted: #9aa6b2;
-      --ok: #2ea043;
-      --bad: #f85149;
-      --maybe: #d29922;
-      --accent: #58a6ff;
+      --studio: #141210;       /* ground */
+      --panel: #1D1A17;        /* surface */
+      --panel-raised: #221E19; /* nested surface, one step up */
+      --hairline: #2A2620;     /* borders */
+      --paper-text: #F4EFE6;   /* text */
+      --muted: #9A938A;        /* muted text */
+      --pop: #FF5C00;          /* the ONE accent */
+      --pop-deep: #D64C00;
+      --pop-tint: rgba(255,92,0,.12);
+      --pop-tint-strong: rgba(255,92,0,.22);
+
+      /* Verdict semantics stay a SEPARATE system from the one brand accent
+         above -- approve/reject/maybe carry meaning the accent shouldn't
+         dilute. Same hues as before the reskin (state vocabulary is not
+         skin), retuned for contrast on the warm studio ground. */
+      --ok: #3FBE82;
+      --ok-deep: #2E9C68;
+      --bad: #F2564D;
+      --bad-deep: #D93B33;
+      --maybe: #E3A83E;
+      --maybe-deep: #C48A24;
+
+      --font-serif: 'Fraunces', Georgia, 'Times New Roman', serif;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+
+      --radius-xs: 3px;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+      --radius-xl: 16px;
+      --radius-pill: 100px;
+
+      --ease: cubic-bezier(.4,0,.2,1);
+      --dur: .2s;
     }
-    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; }
-    /* D-056 scroll fix: the layout is pinned to the viewport (height + an
-       explicit 100% row so the single grid row cannot grow past it); each
-       pane scrolls independently, so the player pane stays on screen while
-       the list scrolls. The page itself never scrolls. */
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--studio); color: var(--paper-text);
+      font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+    ::selection { background: var(--pop-tint-strong); color: var(--paper-text); }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
+    }
+
+    /* ---- Brand header (spec section 1): wordmark + micro-label, sits in
+       the sticky left-pane head so the D-056 viewport-pinned scroll
+       architecture (grid-template-rows:100%, height:100vh, independent
+       pane scroll) is never touched. ---- */
+    .brandbar { margin: 0 0 10px; }
+    .brand-word { font-family: var(--font-serif); font-style: italic; font-weight: 500;
+      font-size: 20px; color: var(--paper-text); line-height: 1.1; letter-spacing: -.01em; }
+    .brand-sub { margin-top: 3px; font-size: 10.5px; font-weight: 600; letter-spacing: .14em;
+      text-transform: uppercase; color: var(--muted); }
+
+    /* D-056 scroll fix (unchanged): the layout is pinned to the viewport
+       (height + an explicit 100% row so the single grid row cannot grow
+       past it); each pane scrolls independently, so the player pane stays
+       on screen while the list scrolls. The page itself never scrolls. */
     .wrap { display: grid; grid-template-columns: 380px 1fr; grid-template-rows: 100%; height: 100vh; }
-    .left { border-right: 1px solid #2d333b; overflow-y: auto; }
-    .right { padding: 16px; overflow-y: auto; }
-    .head { position: sticky; top: 0; background: var(--panel); z-index: 2; padding: 12px; border-bottom: 1px solid #2d333b; }
-    .title { margin: 0; font-size: 16px; }
-    .kbd { color: var(--muted); font-size: 12px; margin-top: 6px; }
-    .list { padding: 8px; }
-    .item { padding: 10px; border: 1px solid #2d333b; border-radius: 8px; margin-bottom: 8px; background: var(--panel); cursor: pointer; }
-    .item.active { outline: 2px solid var(--accent); background: var(--panel2); }
-    .row { display: flex; justify-content: space-between; gap: 8px; }
-    .score { font-weight: 700; }
-    .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
-    .empty { padding: 12px; color: var(--muted); }
-    .empty.error { color: var(--bad); border: 1px dashed var(--bad); border-radius: 8px; font-weight: 600; }
-    .card { border: 1px solid #2d333b; border-radius: 10px; background: var(--panel); padding: 12px; }
-    .actions { display: flex; gap: 8px; margin: 10px 0 12px; }
-    .tabs { display: flex; gap: 8px; margin-top: 8px; }
-    button { border: 0; padding: 9px 14px; border-radius: 8px; color: white; cursor: pointer;
-             font-weight: 600; font-size: 12.5px; font-family: inherit; line-height: 1.2;
-             transition: filter .12s, box-shadow .12s; }
-    button:hover:not(:disabled) { filter: brightness(1.12); }
-    button:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(88,166,255,.35); }
-    button:disabled { opacity: .45; cursor: not-allowed; }
-    .approve { background: var(--ok); }
-    .reject { background: var(--bad); }
-    .maybe { background: var(--maybe); }
-    .tab { background: #2d333b; color: var(--text); border: 1px solid #3d444d; }
-    .tab.active { background: var(--accent); border-color: var(--accent); color: #061326; }
-    .hint { color: var(--muted); font-size: 12px; }
-    .editpanel { border: 1px solid #2d333b; border-radius: 8px; background: var(--panel2); padding: 10px; margin: 0 0 12px; }
-    .editrow { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+    .left { border-right: 1px solid var(--hairline); overflow-y: auto; background: var(--studio); }
+    .right { padding: 20px; overflow-y: auto; }
+    .head { position: sticky; top: 0; background: var(--panel); z-index: 2; padding: 16px 14px 14px;
+      border-bottom: 1px solid var(--hairline); }
+    .title { margin: 0; font-family: var(--font-serif); font-weight: 500; font-size: 17px; color: var(--paper-text); }
+    .kbd { color: var(--muted); font-size: 11px; line-height: 1.6; margin-top: 10px; }
+    .kbdchip { display: inline-block; font-family: var(--font-sans); font-size: 9.5px; font-weight: 700;
+      letter-spacing: .04em; color: var(--paper-text); background: rgba(255,255,255,.08);
+      border: 1px solid var(--hairline); border-radius: var(--radius-xs); padding: 1px 5px; margin-left: 6px; }
+    .list { padding: 10px; }
+    .item { padding: 12px; border: 1px solid var(--hairline); border-radius: var(--radius-md);
+      margin-bottom: 8px; background: var(--panel); cursor: pointer;
+      transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease), transform var(--dur) var(--ease); }
+    .item:hover { border-color: #3A342C; }
+    .item.active { border-color: var(--pop); background: var(--panel-raised); box-shadow: 0 0 0 1px var(--pop) inset; }
+    .row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .score { font-family: var(--font-serif); font-variant-numeric: tabular-nums; font-weight: 500; font-size: 15px; }
+    .meta { color: var(--muted); font-size: 11.5px; margin-top: 5px; line-height: 1.5; }
+    .empty { padding: 16px 4px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+    .empty.error { color: var(--bad); border: 1px solid var(--bad-deep); background: rgba(242,86,77,.08);
+      border-radius: var(--radius-md); font-weight: 500; padding: 12px 14px; }
+    .empty.error details { margin-top: 8px; }
+    .empty.error summary { cursor: pointer; color: var(--muted); font-size: 11.5px; }
+    .empty.error pre { margin: 6px 0 0; }
+    .card { border: 1px solid var(--hairline); border-radius: var(--radius-lg); background: var(--panel); padding: 18px; }
+    .actions { display: flex; gap: 8px; margin: 14px 0 12px; flex-wrap: wrap; align-items: center; }
+    .tabs { display: flex; gap: 4px; margin-top: 12px; background: var(--studio); border: 1px solid var(--hairline);
+      border-radius: var(--radius-pill); padding: 3px; }
+
+    /* ---- Buttons: pill-shaped primary/secondary vocabulary, the site's
+       .18-.22s ease motion, visible focus rings. ---- */
+    button { border: 0; padding: 9px 16px; border-radius: var(--radius-pill); color: var(--paper-text);
+      cursor: pointer; font-weight: 600; font-size: 12.5px; font-family: var(--font-sans); line-height: 1.2;
+      transition: filter var(--dur) var(--ease), box-shadow var(--dur) var(--ease), transform var(--dur) var(--ease), background var(--dur) var(--ease), border-color var(--dur) var(--ease); }
+    button:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
+    button:active:not(:disabled) { transform: translateY(0); }
+    button:focus-visible, .handle:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible {
+      outline: none; box-shadow: 0 0 0 3px var(--pop-tint-strong); }
+    button:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+    .approve { background: var(--ok); color: #0C1712; }
+    .reject { background: var(--bad); color: #1A0705; }
+    .maybe { background: var(--maybe); color: #1F1404; }
+    .tab { background: transparent; color: var(--muted); border: 0; padding: 7px 14px; border-radius: var(--radius-pill); }
+    .tab.active { background: var(--pop); color: #1A0900; }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    a.linklike, button.linklike { background: transparent; color: var(--pop); padding: 0; font-weight: 600;
+      text-decoration: underline; text-underline-offset: 2px; }
+
+    /* ---- Fine-edit numeric fallback: kept functional, visually secondary
+       to the trim slider above it (spec section 2: "inputs remain as a
+       fine-edit fallback, visually secondary"). ---- */
+    .fineedit { border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--panel-raised);
+      padding: 2px 12px; margin: 12px 0; }
+    .fineedit summary { cursor: pointer; color: var(--muted); font-size: 11px; font-weight: 600;
+      letter-spacing: .04em; text-transform: uppercase; padding: 9px 0; }
+    .fineedit[open] summary { border-bottom: 1px solid var(--hairline); margin-bottom: 10px; }
+    .editpanel { padding: 0 0 10px; }
+    .editrow { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
     .editrow:last-child { margin-bottom: 0; }
-    .editlabel { color: var(--muted); font-size: 12px; width: 40px; }
-    .editval { font-variant-numeric: tabular-nums; font-weight: 700; min-width: 76px; text-align: center; }
-    .nudge { background: #2d333b; border: 1px solid #3d444d; color: var(--text); padding: 6px 10px; font-weight: 600; }
-    .replaywin { background: #2d333b; border: 1px solid #3d444d; color: var(--text); }
-    .savewin { background: var(--accent); color: #061326; }
-    .resetwin { background: #2d333b; border: 1px solid #3d444d; color: var(--text); }
-    .badge { background: var(--maybe); color: #061326; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 6px; vertical-align: middle; }
-    .dbadge { background: var(--ok); color: #061326; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 6px; vertical-align: middle; }
-    .dbadge.warn { background: var(--bad); color: #fff; }
-    .unsaved { color: var(--maybe); font-size: 12px; font-weight: 700; }
-    .winline { font-size: 13px; margin: 0 0 10px; }
+    .editlabel { color: var(--muted); font-size: 11.5px; width: 38px; }
+    .editval { font-variant-numeric: tabular-nums; font-family: var(--font-serif); font-weight: 500;
+      min-width: 70px; text-align: center; font-size: 13px; }
+    .nudge { background: var(--panel); border: 1px solid var(--hairline); color: var(--paper-text);
+      padding: 6px 11px; font-weight: 600; border-radius: var(--radius-pill); font-size: 11.5px; }
+    .nudge:hover:not(:disabled) { border-color: var(--pop); }
+    .replaywin { background: var(--panel); border: 1px solid var(--hairline); color: var(--paper-text); }
+    .replaywin:hover:not(:disabled) { border-color: var(--pop); }
+    .savewin { background: var(--pop); color: #1A0900; }
+    .savewin:hover:not(:disabled) { background: var(--pop-deep); }
+    .resetwin { background: transparent; border: 1px solid var(--hairline); color: var(--muted); }
+
+    /* ---- Chips (spec: pill, radius:100px, 1.5px border) -- the one shared
+       vocabulary for every status/meta pill on the surface. ---- */
+    .chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600;
+      border-radius: var(--radius-pill); padding: 3px 10px; vertical-align: middle; line-height: 1.5;
+      border: 1.5px solid transparent; }
+    .badge { background: var(--pop-tint); color: var(--pop); border-color: rgba(255,92,0,.35); }
+    .dbadge { background: rgba(63,190,130,.12); color: var(--ok); border-color: rgba(63,190,130,.4); }
+    .dbadge.warn { background: rgba(242,86,77,.12); color: var(--bad); border-color: rgba(242,86,77,.4); }
+    .chip-muted { background: rgba(255,255,255,.06); color: var(--muted); border-color: var(--hairline); }
+    .unsaved { color: var(--maybe); font-size: 11.5px; font-weight: 700; display: inline-flex; align-items: center; gap: 5px; }
+    .unsaved::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--maybe); display: inline-block; }
+    .winline { font-size: 13px; margin: 0 0 10px; color: var(--muted); }
     .winline .orig { color: var(--muted); font-size: 12px; }
-    video { width: 100%; max-height: 65vh; background: #000; border-radius: 8px; }
-    pre { white-space: pre-wrap; word-break: break-word; font-size: 12px; color: var(--muted); }
+    video { width: 100%; max-height: 60vh; background: #000; border-radius: var(--radius-lg); display: block; }
+    pre { white-space: pre-wrap; word-break: break-word; font-size: 11.5px; color: var(--muted);
+      font-variant-numeric: tabular-nums; }
+    h2 { font-family: var(--font-serif); font-weight: 500; }
+
+    /* ---- In-page notice bar, replacing alert(). Fixed, dismissible, and
+       carries "Show technical detail" behind a collapse (spec section 4 /
+       charter gate 7 -- raw machine outcomes are kept, one click deeper). ---- */
+    .noticebar { position: fixed; left: 50%; bottom: 22px; transform: translate(-50%, 12px);
+      max-width: min(560px, calc(100vw - 32px)); background: var(--panel-raised); border: 1px solid var(--hairline);
+      border-radius: var(--radius-lg); padding: 14px 16px; box-shadow: 0 10px 30px rgba(0,0,0,.45);
+      opacity: 0; pointer-events: none; transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+      z-index: 50; }
+    .noticebar.show { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+    .noticebar.error { border-color: var(--bad-deep); }
+    .noticebar.info { border-color: rgba(63,190,130,.4); }
+    .notice-msg { font-size: 13px; line-height: 1.5; padding-right: 20px; }
+    .notice-close { position: absolute; top: 10px; right: 10px; background: transparent; padding: 2px 6px;
+      color: var(--muted); font-size: 14px; }
+    .notice-tech { margin-top: 8px; }
+    .notice-tech summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+    .notice-tech pre { margin: 6px 0 0; max-height: 140px; overflow: auto; }
+
+    /* ---- Skeleton shimmer (spec: "loading = skeleton shimmer, never
+       spinners-over-nothing"). No animation loop keeps running once the
+       skeleton is removed -- it exists only in the loading DOM. ---- */
+    @keyframes shimmer { 0% { background-position: -160px 0; } 100% { background-position: 160px 0; } }
+    .skel { border-radius: var(--radius-sm); background: linear-gradient(90deg, var(--panel) 0%, var(--panel-raised) 50%, var(--panel) 100%);
+      background-size: 160px 100%; animation: shimmer 1.1s ease-in-out infinite; }
+    @media (prefers-reduced-motion: reduce) { .skel { animation: none; background: var(--panel); } }
+    .skel-item { height: 64px; border-radius: var(--radius-md); margin-bottom: 8px; }
+    .skel-line { height: 12px; margin-bottom: 8px; }
+    .skel-block { height: 220px; }
+
+    /* ---------------------------------------------------------------- D-073
+       THE TRIM SLIDER. A video-editor trim bar, track = the SLICE (original
+       window +/- SLICE_PAD_S, mirroring workers/slice_geometry.py exactly).
+       Handles write the same adjusted-window draft nudgeWindow() already
+       used; Save/Reset are the existing endpoints, unchanged. */
+    .trimwrap { margin: 14px 0; }
+    .trimhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .trimlabel { font-size: 10.5px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+    .slider { position: relative; height: 56px; border-radius: var(--radius-md); background: var(--panel-raised);
+      border: 1px solid var(--hairline); margin: 0 8px; touch-action: none; }
+    .slider.disabled { opacity: .5; pointer-events: none; }
+    .slider-track { position: absolute; left: 0; right: 0; top: 50%; height: 2px; margin-top: -1px; background: var(--hairline); }
+    .slider-region { position: absolute; top: 8px; bottom: 8px; background: var(--pop-tint); border-top: 2px solid var(--pop);
+      border-bottom: 2px solid var(--pop); cursor: grab; }
+    .slider-region:active { cursor: grabbing; }
+    .slider-playhead { position: absolute; top: 2px; bottom: 2px; width: 1px; background: var(--paper-text);
+      cursor: ew-resize; }
+    .slider-playhead::before { content: ''; position: absolute; top: -4px; left: -4px; width: 9px; height: 9px;
+      border-radius: 50%; background: var(--paper-text); }
+    .tick { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(244,239,230,.22); }
+    .handle { position: absolute; top: 4px; bottom: 4px; width: 14px; margin-left: -7px; background: var(--pop);
+      border-radius: var(--radius-xs); cursor: ew-resize; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+    .handle:hover, .handle:focus-visible { background: var(--pop-deep); }
+    .handle::after { content: ''; position: absolute; left: 50%; top: 50%; width: 2px; height: 16px;
+      margin: -8px 0 0 -1px; background: rgba(0,0,0,.35); }
+    .chip-time { position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+      font-family: var(--font-serif); font-variant-numeric: tabular-nums; white-space: nowrap;
+      background: var(--panel); border-color: var(--hairline); color: var(--paper-text); }
+    .chip-duration { position: absolute; top: calc(100% + 6px); transform: translateX(-50%);
+      font-family: var(--font-serif); font-variant-numeric: tabular-nums; white-space: nowrap;
+      background: var(--panel); border-color: var(--hairline); color: var(--muted); }
+    .trimfoot { display: flex; justify-content: space-between; gap: 10px; margin: 22px 8px 0; flex-wrap: wrap; }
+    .trimactions { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 
     /* ---------------------------------------------------------------- D-061
        THE POST KIT. The system SUGGESTS copy and NEVER burns text into video:
@@ -74,20 +229,20 @@
        so what the operator sees is a MOCKUP of the post he is about to make,
        and the delivered .mp4 in Drive is never touched. Nothing here writes to
        a canvas, draws into the video, or produces a new media file. */
-    .kitgrid { display: grid; grid-template-columns: 320px 1fr; gap: 16px; align-items: start; }
+    .kitgrid { display: grid; grid-template-columns: 320px 1fr; gap: 20px; align-items: start; }
     @media (max-width: 1100px) { .kitgrid { grid-template-columns: 1fr; } }
 
     /* The phone frame: a real 9:16 box, the aspect the platforms actually
        render, so "is this frame majority text?" is judgeable by eye. */
     .phone { position: relative; width: 300px; aspect-ratio: 9 / 16; background: #000;
-             border-radius: 22px; overflow: hidden; border: 2px solid #3d444d; }
+             border-radius: var(--radius-xl); overflow: hidden; border: 2px solid var(--hairline); }
     .phone video { position: absolute; inset: 0; width: 100%; height: 100%;
                    max-height: none; object-fit: cover; border-radius: 0; background: #000; }
     .phone .missing { position: absolute; inset: 0; display: flex; align-items: center;
                       justify-content: center; text-align: center; padding: 16px;
                       color: var(--muted); font-size: 12px; }
     /* Guides for the regions the platform's OWN UI covers. Dashed, subtle, and
-       toggleable — they are a judging aid, not part of the post. */
+       toggleable -- they are a judging aid, not part of the post. */
     .guide { position: absolute; border: 1px dashed rgba(255,255,255,.28); pointer-events: none; }
     .guide.top { left: 0; right: 0; top: 0; height: 12%; }
     .guide.bottom { left: 0; right: 0; bottom: 0; height: 22%; }
@@ -95,109 +250,109 @@
     .guidelabel { position: absolute; font-size: 9px; color: rgba(255,255,255,.5);
                   pointer-events: none; letter-spacing: .04em; }
     /* The overlay band the hook is painted in: inset from the right rail and
-       clear of the top bar, i.e. the platform safe area. */
-    /* Centred horizontally: the right edge is inset to match the left rather
-       than reserving the platform's right-hand action rail, because the hook is
-       typed into the platform's own text tool and the operator centres it there.
-       justify-content centres the band, text-align centres the wrapped lines
-       inside it -- both are needed or a two-line hook centres the box but rags
-       its second line. */
+       clear of the top bar, i.e. the platform safe area. Centred horizontally
+       so a two-line hook centres the box without ragging its second line. */
     .hookband { position: absolute; left: 6%; right: 6%; top: 16%; pointer-events: none;
                 display: flex; justify-content: center; }
-    .hooktext { font-weight: 800; font-size: 17px; line-height: 1.22; color: #fff;
-                background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: 6px;
+    .hooktext { font-family: var(--font-sans); font-weight: 800; font-size: 17px; line-height: 1.22; color: #fff;
+                background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: var(--radius-sm);
                 text-shadow: 0 1px 3px rgba(0,0,0,.9); word-break: break-word;
                 text-align: center; }
-    .hooktext.empty { background: rgba(248,81,73,.25); color: #ffb4b0; font-weight: 600; font-size: 13px; }
-    /* The post as it reads below the video, so the caption is judged in place. */
-    /* The post as it reads under the video. Given the same card treatment as
-       the phone so the left column is two deliberate objects, not a frame with
-       loose text hanging off it. */
-    .postmeta { width: 300px; margin-top: 12px; font-size: 12.5px; color: var(--text);
-                box-sizing: border-box; background: var(--panel2); border: 1px solid #2a3039;
-                border-radius: 10px; padding: 12px 14px; line-height: 1.5; }
-    .postmeta .handle { font-weight: 700; margin-bottom: 6px; letter-spacing: .01em; }
-    .postmeta .cap { color: #c9d1d9; white-space: pre-wrap; word-break: break-word; }
-    .postmeta .tags { color: var(--accent); margin-top: 6px; word-break: break-word; }
+    .hooktext.empty { background: rgba(242,86,77,.25); color: #ffc0ba; font-weight: 600; font-size: 13px; }
+    /* The post as it reads under the video. Same card treatment as the phone
+       so the left column is two deliberate objects, not a frame with loose
+       text hanging off it. */
+    .postmeta { width: 300px; margin-top: 12px; font-size: 12.5px; color: var(--paper-text);
+                background: var(--panel-raised); border: 1px solid var(--hairline);
+                border-radius: var(--radius-md); padding: 14px 16px; line-height: 1.5; }
+    .postmeta .handle { font-family: var(--font-serif); font-weight: 500; margin-bottom: 6px; letter-spacing: .01em; }
+    .postmeta .cap { color: var(--paper-text); white-space: pre-wrap; word-break: break-word; }
+    .postmeta .tags { color: var(--pop); margin-top: 6px; word-break: break-word; }
     .coverage { margin-top: 10px; font-size: 11.5px; color: var(--muted); line-height: 1.5;
                 max-width: 300px; }
-    .coverage b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .coverage b { color: var(--paper-text); font-variant-numeric: tabular-nums; }
     .coverage.warn b { color: var(--maybe); }
     .coverage.bad b { color: var(--bad); }
 
     /* ---- POST KIT SURFACE -------------------------------------------------
        Design intent: the COPY the operator is about to publish is the content;
-       everything explaining it is apparatus. Previously both were 11-13px and
-       the apparatus ran the full column width, so the page read as one grey
-       wall. Three levers fix it, in order of effect:
-         1. MEASURE. Explanatory text is capped at 78ch. Long lines are the
-            single biggest reason dense UI reads as unfinished.
-         2. WEIGHT. Copy fields are 14px on a near-black field; rationale is
-            11.5px at lower contrast. The eye now sorts them without reading.
-         3. RHYTHM. One spacing scale (6/10/14/18) instead of ad-hoc 2/4/6/8px,
-            so blocks look deliberate rather than nudged. */
-    .kitblock { border: 1px solid #2a3039; border-radius: 10px; background: var(--panel2);
-                padding: 16px 18px; margin-bottom: 14px; }
-    .kitblock h3 { margin: 0 0 4px; font-size: 13px; font-weight: 700;
-                   letter-spacing: .01em; color: var(--text); }
-    .kitblock .why { color: #8b949e; font-size: 11.5px; line-height: 1.55;
+       everything explaining it is apparatus. Three levers keep that split:
+         1. MEASURE. Explanatory text capped at 78ch (long lines are the
+            single biggest reason dense UI reads as unfinished).
+         2. WEIGHT. Copy fields at 14px on a near-black field; rationale at
+            11.5px, lower contrast -- the eye sorts them without reading.
+         3. RHYTHM. One spacing scale so blocks read deliberate. */
+    .kitblock { border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--panel-raised);
+                padding: 18px 20px; margin-bottom: 14px; }
+    .kitblock h3 { margin: 0 0 4px; font-family: var(--font-serif); font-weight: 500; font-size: 14.5px;
+                   letter-spacing: .01em; color: var(--paper-text); }
+    .kitblock .why { color: var(--muted); font-size: 11.5px; line-height: 1.55;
                      margin: 0 0 14px; max-width: 78ch; }
 
     /* Variant rows: the label is a fixed-width chip so all three copy lines
-       start at the same x. Ragged left edges were most of why this looked
-       hand-assembled. */
+       start at the same x. */
     .variant { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-    .variant .pick { background: #262d36; border: 1px solid #39414b; color: var(--text);
-                     padding: 8px 10px; font-size: 11.5px; border-radius: 7px;
-                     min-width: 124px; text-align: left; line-height: 1.25;
-                     flex: 0 0 auto; cursor: pointer; transition: background .12s, border-color .12s; }
-    .variant .pick:hover { border-color: #4d5765; background: #2b333d; }
-    .variant .pick.on { background: var(--accent); border-color: var(--accent);
-                        color: #061326; font-weight: 700; }
+    /* .pick is a bare rule (not scoped to .variant) because the subject
+       picker (Me / Someone else) reuses the same toggle-button pattern
+       outside a .variant row -- pre-existing in the prior design (it simply
+       fell back to default button styling there); the reskin gives it the
+       real chip-toggle treatment everywhere the class is used. */
+    .pick { background: var(--panel); border: 1px solid var(--hairline); color: var(--paper-text);
+                     padding: 8px 10px; font-size: 11.5px; border-radius: var(--radius-pill);
+                     min-width: 150px; text-align: left; line-height: 1.25;
+                     flex: 0 0 auto; }
+    .pick:hover { border-color: var(--pop); }
+    .pick.on { background: var(--pop-tint); border-color: var(--pop);
+                        color: var(--pop); font-weight: 700; }
     .variant input[type=text] { flex: 1 1 auto; }
 
-    .copybtn { background: #262d36; border: 1px solid #39414b; color: var(--text);
-               padding: 8px 12px; font-size: 11.5px; border-radius: 7px; cursor: pointer;
-               flex: 0 0 auto; transition: background .12s, border-color .12s; }
-    .copybtn:hover { border-color: #4d5765; background: #2b333d; }
-    .copybtn.done { background: var(--ok); color: #061326; border-color: var(--ok); }
+    .copybtn { background: var(--panel); border: 1px solid var(--hairline); color: var(--paper-text);
+               padding: 8px 12px; font-size: 11.5px; border-radius: var(--radius-pill);
+               flex: 0 0 auto; }
+    .copybtn:hover { border-color: var(--pop); }
+    .copybtn.done { background: rgba(63,190,130,.15); color: var(--ok); border-color: var(--ok); }
 
-    textarea, input[type=text] { width: 100%; box-sizing: border-box; background: #0d1117;
-        color: var(--text); border: 1px solid #39414b; border-radius: 7px; padding: 9px 11px;
+    textarea, input[type=text] { width: 100%; box-sizing: border-box; background: var(--studio);
+        color: var(--paper-text); border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 10px 12px;
         font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical;
-        transition: border-color .12s, box-shadow .12s; }
-    textarea:focus, input[type=text]:focus { outline: none; border-color: var(--accent);
-        box-shadow: 0 0 0 3px rgba(88,166,255,.15); }
-    textarea::placeholder, input[type=text]::placeholder { color: #5b636d; }
+        transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+    textarea:focus, input[type=text]:focus { outline: none; border-color: var(--pop);
+        box-shadow: 0 0 0 3px var(--pop-tint); }
+    textarea::placeholder, input[type=text]::placeholder { color: #5C564C; }
     textarea.srt { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
                    line-height: 1.6; }
 
-    .kitmeta { color: #7d8590; font-size: 11.5px; line-height: 1.55; margin-top: 8px;
+    .kitmeta { color: var(--muted); font-size: 11.5px; line-height: 1.55; margin-top: 8px;
                max-width: 78ch; }
     .kitmeta.warn { color: var(--maybe); }
     .kitmeta.bad { color: var(--bad); }
-    .stamp { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 4px;
-             padding: 1px 6px; }
-    .stamp.machine { background: var(--maybe); color: #061326; }
-    .stamp.operator { background: var(--ok); color: #061326; }
-    .stamp.none { background: #3d444d; color: var(--text); }
-    .stamp.failed { background: var(--bad); color: #fff; }
-    .emptykit { border: 1px dashed var(--bad); border-radius: 8px; padding: 14px;
-                color: var(--muted); font-size: 13px; }
-    .emptykit b { color: var(--text); }
-    .genrow { display: flex; align-items: center; gap: 6px; font-size: 12px;
-              color: var(--muted); margin: 0 0 10px; }
-    .genrow input { width: 14px; height: 14px; }
-    .ctxbox { border: 1px solid #2d333b; border-radius: 8px; background: var(--panel);
-              padding: 10px; margin-bottom: 10px; }
+    .stamp { display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+             text-transform: uppercase; border-radius: var(--radius-pill); border: 1.5px solid transparent;
+             padding: 2px 9px; }
+    .stamp.machine { background: rgba(227,168,62,.14); color: var(--maybe); border-color: rgba(227,168,62,.4); }
+    .stamp.operator { background: rgba(63,190,130,.14); color: var(--ok); border-color: rgba(63,190,130,.4); }
+    .stamp.none { background: rgba(255,255,255,.06); color: var(--muted); border-color: var(--hairline); }
+    .stamp.failed { background: rgba(242,86,77,.16); color: var(--bad); border-color: rgba(242,86,77,.45); }
+    .emptykit { border: 1px solid var(--bad-deep); background: rgba(242,86,77,.06); border-radius: var(--radius-md);
+                padding: 16px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+    .emptykit b { color: var(--paper-text); }
+    .genrow { display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+              color: var(--muted); margin: 0 0 10px; line-height: 1.5; }
+    .genrow input { width: 15px; height: 15px; accent-color: var(--pop); }
+    .ctxbox { border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--panel);
+              padding: 14px; margin-bottom: 10px; }
     .histrow { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
-               border-top: 1px solid #2d333b; padding: 4px 0; }
+               border-top: 1px solid var(--hairline); padding: 5px 0; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <aside class="left">
       <div class="head">
+        <div class="brandbar">
+          <div class="brand-word">Vibes With Olu</div>
+          <div class="brand-sub">The Clipper &middot; Review</div>
+        </div>
         <h1 id="queueTitle" class="title">Pending candidates</h1>
         <div class="tabs">
           <button id="tabPending" class="tab active">Pending</button>
@@ -205,16 +360,27 @@
           <button id="tabRejected" class="tab">Rejected</button>
           <button id="tabDelivered" class="tab">Post kit</button>
         </div>
-        <div class="kbd">Keys: j/k or arrows = move | a = approve | r = reject (not in Rejected) | m = maybe (Pending/Rejected) | x = toggle Rejected queue (keys are inert while typing in a field)</div>
+        <div class="kbd">j/k or arrows move<span class="kbdchip">J K</span> &middot; approve<span class="kbdchip">A</span> &middot; reject, not in Rejected<span class="kbdchip">R</span> &middot; maybe, Pending/Rejected<span class="kbdchip">M</span> &middot; toggle Rejected<span class="kbdchip">X</span> &middot; set in/out at the playhead<span class="kbdchip">I</span><span class="kbdchip">O</span><br />Keys are inert while typing in a field.</div>
       </div>
       <div id="list" class="list"></div>
     </aside>
 
     <main class="right">
       <div id="detail" class="card">
-        <div class="empty">Loading...</div>
+        <div class="skel skel-line" style="width:40%;height:20px;"></div>
+        <div class="skel skel-line" style="width:65%;"></div>
+        <div class="skel skel-block"></div>
       </div>
     </main>
+  </div>
+
+  <div id="noticeBar" class="noticebar" role="status" aria-live="polite">
+    <button type="button" class="notice-close" id="noticeClose" aria-label="Dismiss">&times;</button>
+    <div class="notice-msg" id="noticeMsg"></div>
+    <details class="notice-tech" id="noticeTechWrap">
+      <summary>Show technical detail</summary>
+      <pre id="noticeTech"></pre>
+    </details>
   </div>
 
   <script>
@@ -240,6 +406,17 @@
     // guard that produced the error matters most. Set by loadCandidates,
     // read by renderList/renderDetail; null means no error, render normally.
     let listError = null;
+    // D-073: true for the span of an active slider pointer-drag (handle,
+    // region body, or playhead). pollRefresh's existing kitHasUnsaved(sel)
+    // guard already protects unsaved kit edits from a mid-poll re-render;
+    // this is the same shape for a mid-drag re-render, which would replace
+    // the DOM under a live pointer capture and kill the gesture.
+    let sliderDragActive = false;
+    // D-073: the SOURCE video's duration, once its metadata loads. The
+    // slice-bounds formula clamps its upper edge to this, exactly mirroring
+    // workers/slice_geometry.py's slice_end() duration clamp -- null until
+    // loadedmetadata fires, so sliceBounds() must guard for that.
+    let sliderVideoDuration = null;
 
     const listEl = document.getElementById('list');
     const leftEl = document.querySelector('.left');
@@ -324,19 +501,19 @@
     function deliveryBadge(c) {
       if (c.state !== 'approved') return '';
       if (c.clip_state !== null && c.clip_state !== undefined) {
-        if (c.clip_state === 'rendered') return 'rendered — awaiting upload';
-        return `approved — ${c.clip_state}`;
+        if (c.clip_state === 'rendered') return 'Rendered. Waiting to upload.';
+        return `Approved. Clip is ${c.clip_state}.`;
       }
-      if (c._webhook === 'failed') return 'delivery not started — webhook failed';
-      if (c._webhook === 'unconfigured') return 'delivery not started — webhook unconfigured';
-      return 'approved — awaiting delivery';
+      if (c._webhook === 'failed') return 'Delivery has not started. The webhook failed.';
+      if (c._webhook === 'unconfigured') return 'Delivery has not started. The webhook is not set up.';
+      return 'Approved. Waiting for delivery.';
     }
 
     function deliveryBadgeHtml(c) {
       const text = deliveryBadge(c);
       if (!text) return '';
-      const warn = text.startsWith('delivery not started');
-      return `<span class="dbadge${warn ? ' warn' : ''}">${text}</span>`;
+      const warn = text.startsWith('Delivery has not started');
+      return `<span class="chip dbadge${warn ? ' warn' : ''}">${text}</span>`;
     }
 
     // F6 fixer: webhook outcomes recorded on an APPROVE persist here, keyed by
@@ -386,13 +563,32 @@
     // "No X candidates" state as a genuinely empty queue. (A raw fetch()
     // rejection is a separate path — see the NOTE in loadCandidates below —
     // and never reaches this function.)
-    function showListError(msg) {
-      listError = msg;
+    function showListError(friendly, technical) {
+      listError = { message: friendly, technical: technical || '' };
       candidates = [];
       idx = 0;
       renderTabs();
       renderList();
       renderDetail();
+    }
+
+    // Shared markup for listError, read by both renderList and renderDetail.
+    // The raw machine outcome collapses behind "Show technical detail"
+    // (spec section 4 / charter gate 7 — quoted verbatim, one click deeper).
+    function listErrorHtml() {
+      const tech = listError.technical
+        ? `<details><summary>Show technical detail</summary><pre>${esc(listError.technical)}</pre></details>`
+        : '';
+      return `<div class="empty error">${esc(listError.message)}${tech}</div>`;
+    }
+
+    // Same shape as listErrorHtml, for the raw fetch()-rejection path (the
+    // connection dropped outright, before any response landed) -- a
+    // different failure than the server-responded-with-an-error path above,
+    // but the same client-grade presentation.
+    function rawLoadErrorHtml(err) {
+      const tech = `<details><summary>Show technical detail</summary><pre>${esc(String(err))}</pre></details>`;
+      return `<div class="empty error">Could not load candidates. Check your connection and try again.${tech}</div>`;
     }
 
     async function loadCandidates() {
@@ -401,7 +597,7 @@
       if (view === 'delivered' && profileState === null) await loadProfile();
       // NOTE: a raw connection drop here (fetch() itself rejecting) is left
       // to propagate to the caller — every call site already wraps this in
-      // .catch(...) and paints "Failed to load candidates" (that path is not
+      // .catch(...) and paints "Could not load candidates" (that path is not
       // muffled today; do not add a second mechanism for it). This function
       // only handles the two ways a response that DID land can still lie
       // about being an empty queue: an explicit error status, and a 200 body
@@ -411,11 +607,13 @@
       try { data = await res.json(); } catch (_) { /* non-JSON body — handled below */ }
       if (!res.ok) {
         const msg = (data && typeof data === 'object' && data.error) ? data.error : `HTTP ${res.status}`;
-        showListError(`Failed to load ${labelForView()} candidates: ${msg}`);
+        showListError(`Could not load ${labelForView()} candidates. Check the server and try again.`,
+          `Failed to load ${labelForView()} candidates: ${msg}`);
         return;
       }
       if (!Array.isArray(data)) {
-        showListError(`Failed to load ${labelForView()} candidates: server returned an unexpected (non-list) response.`);
+        showListError(`Could not load ${labelForView()} candidates. Check the server and try again.`,
+          `Failed to load ${labelForView()} candidates: server returned an unexpected (non-list) response.`);
         return;
       }
       listError = null;
@@ -435,14 +633,23 @@
       tabDeliveredEl.classList.toggle('active', view === 'delivered');
     }
 
+    // Orienting empty-queue copy: what this pane is, why it is empty, what
+    // fills it (spec section 4).
+    function emptyQueueMessage() {
+      if (view === 'maybe') return "Nothing sitting in Maybe. Mark a pending clip 'maybe' to hold it here.";
+      if (view === 'rejected') return 'Nothing rejected yet. Rejected clips will collect here.';
+      if (view === 'delivered') return 'No delivered clips yet. Approve and deliver a clip to build its post kit here.';
+      return "No candidates waiting on you right now. New ones appear here as the detector finds them.";
+    }
+
     function renderList() {
       listEl.innerHTML = '';
       if (listError) {
-        listEl.innerHTML = `<div class="empty error">${esc(listError)}</div>`;
+        listEl.innerHTML = listErrorHtml();
         return;
       }
       if (!candidates.length) {
-        listEl.innerHTML = `<div class="empty">No ${labelForView()} candidates.</div>`;
+        listEl.innerHTML = `<div class="empty">${esc(emptyQueueMessage())}</div>`;
         return;
       }
       candidates.forEach((c, i) => {
@@ -451,15 +658,15 @@
         el.onclick = () => { idx = i; renderList(); renderDetail(); };
         el.innerHTML = `
           <div class="row">
-            <div>#${c.id} | vod ${c.vod_id}</div>
+            <div>#${c.id} &middot; vod ${c.vod_id}</div>
             <div class="score">${fmt(c.score)}</div>
           </div>
-          <div class="meta">${c.session_label} | ${fmt(effectiveWindow(c).start,1)}s to ${fmt(effectiveWindow(c).end,1)}s${adjustedDiffers(c) ? ' | edited' : ''}</div>
-          <div class="meta">audio ${fmt(c.signal_audio)} | transcript ${fmt(c.signal_transcript)} | chat ${fmt(c.signal_chat)} | beat ${fmt(c.signal_beat_boost)}</div>
+          <div class="meta">${c.session_label} &middot; ${fmt(effectiveWindow(c).start,1)}s to ${fmt(effectiveWindow(c).end,1)}s${adjustedDiffers(c) ? ' <span class="chip badge">edited</span>' : ''}</div>
+          <div class="meta">audio ${fmt(c.signal_audio)} &middot; transcript ${fmt(c.signal_transcript)} &middot; chat ${fmt(c.signal_chat)} &middot; beat ${fmt(c.signal_beat_boost)}</div>
           ${view === 'delivered'
-            ? `<div class="meta">${kitStampHtml(c)}${kitHasUnsaved(c) ? ' <span class="unsaved">unsaved</span>' : ''}</div>`
+            ? `<div class="meta">${kitStampHtml(c)}${kitHasUnsaved(c) ? ' <span class="unsaved">Unsaved edit</span>' : ''}</div>`
             : (deliveryBadgeHtml(c) ? `<div class="meta">${deliveryBadgeHtml(c)}</div>` : '')}
-          ${view !== 'delivered' && c.post_kit_enabled === 0 ? '<div class="meta">post kit: OFF</div>' : ''}
+          ${view !== 'delivered' && c.post_kit_enabled === 0 ? '<div class="meta"><span class="chip chip-muted">Post kit off</span></div>' : ''}
           ${captionsChipHtml(c)}
         `;
         listEl.appendChild(el);
@@ -473,21 +680,21 @@
     // the only fact a delivered clip has.
     function captionsChipHtml(c) {
       const rendered = !(c.clip_state === null || c.clip_state === undefined);
-      if (rendered && c.captions_burned === 1) return '<div class="meta">captions: BURNED IN</div>';
+      if (rendered && c.captions_burned === 1) return '<div class="meta">Captions burned in.</div>';
       // Asked for, and the window holds no speech. An honest outcome, not a
       // shortfall, and NOT something a later render would change.
       if (rendered && c.captions_requested === 1 && c.captions_cue_count === 0) {
-        return '<div class="meta">captions: none (no speech in this window)</div>';
+        return '<div class="meta">No captions. Nobody speaks in this window.</div>';
       }
       // D-063 fixer: a DELIVERED clip is delivered, full stop (D-056) — there
       // is no next render for it, so promising one on its card was a claim
       // about work that will never happen.
       if (c.drive_synced_at) {
         return c.burn_captions === 1
-          ? '<div class="meta">captions: ON, but this delivered file has none</div>'
+          ? '<div class="meta">Captions are on, but this delivered file has none.</div>'
           : '';
       }
-      if (c.burn_captions === 1) return '<div class="meta">captions: ON (next render)</div>';
+      if (c.burn_captions === 1) return '<div class="meta">Captions on for the next render.</div>';
       return '';
     }
 
@@ -507,6 +714,49 @@
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
     }
+
+    // ---------------------------------------------------------------- D-073
+    // IN-PAGE NOTICE BAR, replacing every alert() on this surface. Every
+    // former alert() call site here is fire-and-continue or return-after --
+    // nothing depends on alert()'s blocking behaviour -- so this is a
+    // drop-in swap. window.confirm() is UNCHANGED and stays native: the
+    // rerender/regenerate confirms are guard rails the brief pins as
+    // "confirm dialog... unchanged", and they are synchronous by design.
+    //
+    // Language rule (spec section 4): the message says what happened plus
+    // the one next action; the raw machine outcome (which may itself carry
+    // an em dash, a status code, a stack string) is never shown directly --
+    // it collapses behind "Show technical detail" (charter gate 7: quoted
+    // verbatim, one click deeper).
+    let noticeTimer = null;
+    function notify(message, opts) {
+      opts = opts || {};
+      const bar = document.getElementById('noticeBar');
+      if (!bar) { return; }
+      bar.className = 'noticebar show ' + (opts.kind === 'info' ? 'info' : 'error');
+      const msgEl = document.getElementById('noticeMsg');
+      const techEl = document.getElementById('noticeTech');
+      const techWrap = document.getElementById('noticeTechWrap');
+      if (msgEl) msgEl.textContent = message;
+      if (opts.technical) {
+        if (techEl) techEl.textContent = String(opts.technical);
+        if (techWrap) techWrap.style.display = '';
+        if (techWrap) techWrap.open = false;
+      } else if (techWrap) {
+        techWrap.style.display = 'none';
+      }
+      clearTimeout(noticeTimer);
+      if (opts.kind === 'info') {
+        noticeTimer = setTimeout(dismissNotice, 6000);
+      }
+    }
+    function dismissNotice() {
+      const bar = document.getElementById('noticeBar');
+      if (bar) bar.classList.remove('show');
+      clearTimeout(noticeTimer);
+    }
+    const noticeCloseEl = document.getElementById('noticeClose');
+    if (noticeCloseEl) noticeCloseEl.onclick = dismissNotice;
 
     // A kit EXISTS only when the server sent a version number. Null kit_version
     // means no ACTIVE post_kits row at all, which the UI must render as
@@ -529,16 +779,16 @@
     function kitStampHtml(c) {
       let parts = [];
       if (!hasKit(c)) {
-        parts.push('<span class="stamp none">no kit yet</span>');
+        parts.push('<span class="stamp none">No kit yet</span>');
       } else if (c.kit_origin === 'operator_edit') {
-        parts.push(`<span class="stamp operator">v${c.kit_version} EDITED BY YOU</span>`);
+        parts.push(`<span class="stamp operator">v${c.kit_version} &middot; edited by you</span>`);
       } else {
-        parts.push(`<span class="stamp machine">v${c.kit_version} MACHINE DRAFT, NOT REVIEWED</span>`);
+        parts.push(`<span class="stamp machine">v${c.kit_version} &middot; machine draft, not reviewed</span>`);
       }
       if (c.request_state === 'failed') {
-        parts.push('<span class="stamp failed">generation FAILED</span>');
+        parts.push('<span class="stamp failed">Generation failed</span>');
       } else if (regenPending(c)) {
-        parts.push('<span class="stamp none">regenerate requested</span>');
+        parts.push('<span class="stamp none">Regenerate requested</span>');
       }
       return parts.join(' ');
     }
@@ -612,7 +862,7 @@
       }
       if (btn) {
         const old = btn.textContent;
-        btn.textContent = ok ? 'copied' : 'copy failed';
+        btn.textContent = ok ? 'Copied' : 'Copy failed';
         btn.classList.toggle('done', ok);
         setTimeout(() => { btn.textContent = old; btn.classList.remove('done'); }, 1200);
       }
@@ -636,10 +886,10 @@
         pct = (sr.width * sr.height) / frameArea * 100;
       }
       out.classList.remove('warn', 'bad');
-      let verdict = 'well under the majority-text line';
-      if (pct >= 50) { out.classList.add('bad'); verdict = 'MAJORITY TEXT — Instagram demotes this'; }
-      else if (pct >= 30) { out.classList.add('warn'); verdict = 'getting text-heavy'; }
-      out.innerHTML = `hook covers <b>${pct.toFixed(1)}%</b> of the frame — ${esc(verdict)}`;
+      let verdict = 'well under the majority-text line.';
+      if (pct >= 50) { out.classList.add('bad'); verdict = 'Majority text. Instagram demotes this.'; }
+      else if (pct >= 30) { out.classList.add('warn'); verdict = 'Getting text-heavy.'; }
+      out.innerHTML = `Hook covers <b>${pct.toFixed(1)}%</b> of the frame. ${esc(verdict)}`;
     }
 
     function repaintOverlay() {
@@ -649,15 +899,15 @@
       if (!span) return;
       const key = selectedHookKey(c);
       const text = hookTextFor(c, key);
-      span.textContent = text || 'no hook in this variant';
+      span.textContent = text || 'No hook in this variant';
       span.classList.toggle('empty', !text);
       const wordCount = text ? text.split(/\s+/).filter(Boolean).length : 0;
       const wc = document.getElementById('hookWords');
       if (wc) {
         wc.className = 'kitmeta' + (wordCount > 20 ? ' bad' : (wordCount > 12 ? ' warn' : ''));
         wc.textContent = text
-          ? `${wordCount} words. TikTok's own guidance is 5-10 words per second of reading, so a hook read in the first 2 seconds is 10-20 words MAXIMUM, and shorter is safer.`
-          : 'this variant is empty.';
+          ? `${wordCount} words. TikTok's own guidance is 5 to 10 words per second of reading, so a hook read in the first 2 seconds is 10 to 20 words maximum, and shorter is safer.`
+          : 'This variant is empty.';
       }
       document.querySelectorAll('.variant .pick').forEach((b) => {
         b.classList.toggle('on', b.dataset.hook === key);
@@ -674,7 +924,7 @@
         ? `rebased from the <b>${esc(c.srt_basis)}</b> witness (clip t=0 at ${fmt(c.srt_clip_t0_abs_s, 1)}s of the recording)`
         : 'basis not recorded';
       return `
-        <div class="kitmeta">${c.srt_segment_count} segments | ${basis}</div>
+        <div class="kitmeta">${c.srt_segment_count} segments &middot; ${basis}</div>
         <textarea class="srt" data-field="srt_text" rows="6" placeholder="captions">${esc(kitValues(c).srt_text)}</textarea>
         <div class="kitmeta">Edit only if whisper misheard something. The timings were computed from the
           renderer that actually shipped this file, not guessed.</div>`;
@@ -699,9 +949,9 @@
           <h3 style="margin:0 0 2px;font-size:13px;">Context that produced this kit</h3>
           <p class="why">The generator sees exactly this. If it is wrong or stale, the copy is wrong.</p>
           <div class="kitmeta${profileStale ? ' warn' : ''}">
-            global profile ${p ? 'v' + esc(p.version) + ', saved ' + esc(p.created_at) : 'NEVER SET'}
-            ${hasKit(c) ? ' | this kit was written against ' + (kitProfileV === null || kitProfileV === undefined ? 'NO profile' : 'v' + esc(kitProfileV)) : ''}
-            ${profileStale ? ' — THE PROFILE CHANGED AFTER THIS KIT WAS GENERATED, so this copy predates it' : ''}
+            Global profile: ${p ? 'v' + esc(p.version) + ', saved ' + esc(p.created_at) : 'not set yet'}.
+            ${hasKit(c) ? ' This kit was written against ' + (kitProfileV === null || kitProfileV === undefined ? 'no profile' : 'v' + esc(kitProfileV)) + '.' : ''}
+            ${profileStale ? ' The profile changed after this kit was generated, so this copy predates it.' : ''}
           </div>
           <input type="text" id="pfChannel" placeholder="channel name" value="${f('channel_name')}" />
           <input type="text" id="pfHandle" placeholder="handle" value="${f('handle')}" />
@@ -710,141 +960,156 @@
           <textarea id="pfDoNots" rows="2" placeholder="hard avoids, stated plainly">${f('do_nots')}</textarea>
           <textarea id="pfExtra" rows="2" placeholder="anything else the writer should know">${f('extra_context')}</textarea>
           <div class="editrow" style="margin-top:6px;">
-            <button class="savewin" id="btnSaveProfile">Save profile (new version)</button>
-            <span class="hint">edit once, applies to every clip</span>
+            <button class="savewin" id="btnSaveProfile">Save profile</button>
+            <span class="hint">Edit once, applies to every clip.</span>
           </div>
 
           <div class="kitmeta${ctxStale ? ' warn' : ''}" style="margin-top:12px;">
-            SUBJECT of recording ${c.vod_id} (${esc(c.session_label)}) — who the clip is about
-            ${c.context_version ? ' | context v' + esc(c.context_version) : ' | NOT SET (the generator treats this as UNKNOWN, never as you)'}
-            ${ctxStale ? ' — CHANGED AFTER THIS KIT WAS GENERATED' : ''}
+            Subject of recording ${c.vod_id} (${esc(c.session_label)}): who the clip is about.
+            ${c.context_version ? ' Context v' + esc(c.context_version) + '.' : ' Not set. The generator treats this as unknown, never as you.'}
+            ${ctxStale ? ' Changed after this kit was generated.' : ''}
           </div>
           <div class="editrow">
-            <button class="pick${subjKind === 'me' ? ' on' : ''}" id="btnSubjMe">me</button>
-            <button class="pick${subjKind === 'other' ? ' on' : ''}" id="btnSubjOther">someone else</button>
+            <button class="pick${subjKind === 'me' ? ' on' : ''}" id="btnSubjMe">Me</button>
+            <button class="pick${subjKind === 'other' ? ' on' : ''}" id="btnSubjOther">Someone else</button>
             <input type="text" id="subjText" placeholder="who is on screen, e.g. a DJ guesting on the IRL stream"
                    value="${esc(c.subject_text || '')}" />
           </div>
           <textarea id="ctxNotes" rows="2" placeholder="what this recording was, in your words">${esc(c.context_notes || '')}</textarea>
           <div class="editrow" style="margin-top:6px;">
-            <button class="savewin" id="btnSaveSubj">Save subject (new version)</button>
+            <button class="savewin" id="btnSaveSubj">Save subject</button>
           </div>
-          <div class="kitmeta"><b>me</b> pulls your full profile in as the speaker. <b>someone else</b>
+          <div class="kitmeta"><b>Me</b> pulls your full profile in as the speaker. <b>Someone else</b>
             requires a description, so your personal profile is never applied to them.</div>
         </div>`;
     }
 
     function renderKitDetail(c) {
+      // D-073 safety reset: this view has no trim slider, so a stuck `true`
+      // from a drag interrupted by a view switch must not wedge pollRefresh's
+      // guard while looking at the post-kit view.
+      sliderDragActive = false;
       const kit = hasKit(c);
+      // RS-06: every candidate in this view has drive_synced_at set, which
+      // means a clips row necessarily exists (and clip_state is populated) --
+      // but this is asserted explicitly, the same guard the main (non-kit)
+      // view uses, rather than assumed from the view's own filter.
+      const hasClip = !(c.clip_state === null || c.clip_state === undefined);
       const v = kitValues(c);
       const key = selectedHookKey(c);
       const hookText = hookTextFor(c, key);
       const tagCount = (v.hashtags || '').split(/\s+/).filter(Boolean).length;
       const variantLabel = {
-        withheld: 'A - withholds',
-        domain: 'B - names the domain',
-        payoff: 'C - names the payoff',
+        withheld: 'A &middot; withholds',
+        domain: 'B &middot; names the domain',
+        payoff: 'C &middot; names the payoff',
       };
 
       const missingPanel = `
         <div class="emptykit">
           ${c.request_state === 'failed'
-            ? `<b>GENERATION FAILED</b>${c.request_requested_at ? ' (requested ' + esc(c.request_requested_at) + ')' : ''}.<br />
-               <span class="kitmeta bad">${esc(c.request_error || 'no reason recorded')}</span><br />
-               Nothing was written: a failed run persists no partial kit. Regenerate to try again.`
-            : `<b>NO KIT YET.</b> This clip is delivered, but the generator has not produced copy for it.
+            ? `<b>Generation failed</b>${c.request_requested_at ? ' (requested ' + esc(c.request_requested_at) + ')' : ''}.<br />
+               <span class="kitmeta bad">${esc(c.request_error || 'No reason recorded.')}</span><br />
+               Nothing was written. A failed run persists no partial kit. Regenerate to try again.`
+            : `<b>No kit yet.</b> This clip is delivered, but the generator has not produced copy for it.
                This is missing, not empty.
-               ${c.post_kit_enabled === 0 ? '<br />Post kit generation is switched <b>OFF</b> for this clip.' : ''}
+               ${c.post_kit_enabled === 0 ? '<br />Post kit generation is switched <b>off</b> for this clip.' : ''}
                ${regenPending(c) ? '<br />A regenerate was requested at ' + esc(c.request_requested_at) + ' and has not been answered yet.' : ''}`}
         </div>`;
 
       const copyBlocks = !kit ? missingPanel : `
         <div class="kitblock">
-          <h3>1. On-video text — the hook you type into the platform's text tool</h3>
+          <h3>1. On-video text: the hook you type into the platform's text tool</h3>
           <p class="why">One short line. Instagram officially demotes reels that are majority text, so the
             mockup on the left is the check: if the frame reads as text, cut words.
             The three variants are deliberately spread along the concreteness axis, not three rewordings
-            of one idea (a meta-analysis of 8,977 headline experiments found 50.9% of headlines got WORSE
+            of one idea (a meta-analysis of 8,977 headline experiments found 50.9% of headlines got worse
             when made more concrete and only 8.7% better, so the right level is not knowable in advance).
-            No controlled evidence exists on question-versus-statement hooks, so neither is preferred here.</p>
+            No controlled evidence exists on question versus statement hooks, so neither is preferred here.</p>
           ${['withheld', 'domain', 'payoff'].map((k) => `
             <div class="variant">
-              <button class="pick${k === key ? ' on' : ''}" data-hook="${k}" title="show this one in the mockup">${esc(variantLabel[k])}</button>
+              <button class="pick${k === key ? ' on' : ''}" data-hook="${k}" title="Show this one in the mockup">${variantLabel[k]}</button>
               <textarea data-field="${HOOK_FIELDS[k]}" rows="2" placeholder="required">${esc(v[HOOK_FIELDS[k]])}</textarea>
-              <button class="copybtn" data-copy="${HOOK_FIELDS[k]}">copy</button>
+              <button class="copybtn" data-copy="${HOOK_FIELDS[k]}">Copy</button>
             </div>`).join('')}
           <div class="kitmeta" id="hookWords"></div>
         </div>
 
         <div class="kitblock">
-          <h3>2. Captions — the real speech, as a subtitle file</h3>
+          <h3>2. Captions: the real speech, as a subtitle file</h3>
           <p class="why">Built from the whisper transcript already stored for this window. Platform
             auto-captions mangle this project's vocabulary (n8n, psycopg2, Coolify) and whisper already
             got it right. Upload the .srt with the clip.</p>
           ${captionsPanel(c)}
           <div class="editrow" style="margin-top:6px;">
-            <button class="copybtn" data-copy="srt_text">copy SRT text</button>
+            <button class="copybtn" data-copy="srt_text">Copy captions</button>
             ${c.srt_text ? `<a class="copybtn" style="text-decoration:none;display:inline-block;"
-               href="/api/candidates/${c.id}/captions.srt" download>download .srt</a>` : ''}
+               href="/api/candidates/${c.id}/captions.srt" download>Download captions (.srt)</a>` : ''}
           </div>
         </div>
 
         <div class="kitblock">
-          <h3>3. Video caption — the post descriptor</h3>
+          <h3>3. Video caption: the post descriptor</h3>
           <p class="why">What accompanies the clip in the post body.</p>
           <textarea data-field="video_caption" rows="4" placeholder="required">${esc(v.video_caption)}</textarea>
           <div class="editrow" style="margin-top:6px;">
-            <button class="copybtn" data-copy="video_caption">copy caption</button>
+            <button class="copybtn" data-copy="video_caption">Copy caption</button>
           </div>
-          <div class="kitmeta" style="margin-top:8px;">hashtags (minimal on purpose, space separated)</div>
+          <div class="kitmeta" style="margin-top:8px;">Hashtags (minimal on purpose, space separated)</div>
           <input type="text" data-field="hashtags" value="${esc(v.hashtags)}" placeholder="none" />
           <div class="kitmeta${tagCount > 3 ? ' warn' : ''}">${tagCount} tag${tagCount === 1 ? '' : 's'}.
             Hashtags are near-dead as reach: Instagram caps at 5, and a study of 24.3M posts found posts
-            WITH hashtags got 31% FEWER views. Two or three, never a wall.</div>
+            with hashtags got 31% fewer views. Two or three, never a wall.</div>
           <div class="editrow" style="margin-top:6px;">
-            <button class="copybtn" data-copy="hashtags">copy hashtags</button>
-            <button class="copybtn" data-copy="caption_tags">copy caption + hashtags</button>
+            <button class="copybtn" data-copy="hashtags">Copy hashtags</button>
+            <button class="copybtn" data-copy="caption_tags">Copy caption + hashtags</button>
           </div>
-          ${c.quoted_line ? `<div class="kitmeta" style="margin-top:8px;">quoted from the transcript, verbatim:
+          ${c.quoted_line ? `<div class="kitmeta" style="margin-top:8px;">Quoted from the transcript, verbatim:
             <b>${esc(c.quoted_line)}</b></div>` : ''}
         </div>
 
         <div class="kitblock">
           <div class="editrow">
-            <button class="savewin" id="btnSaveKit">Save my edits (new version)</button>
-            <button class="nudge" id="btnRegen">Regenerate</button>
-            <!-- Re-render is the VIDEO; Regenerate is the COPY. Labelled
-                 explicitly because the two were confusable enough that
-                 Regenerate got pressed to change a burned-in caption. -->
-            <button class="nudge" id="btnRerender" title="Re-cut the video file with the current caption setting">Re-render video</button>
-            <span class="unsaved" id="kitUnsaved" style="display:${kitHasUnsaved(c) ? 'inline' : 'none'};">unsaved</span>
+            <button class="savewin" id="btnSaveKit">Save kit edits</button>
+            <button class="nudge" id="btnRegen">Regenerate copy</button>
+            <span class="unsaved" id="kitUnsaved" style="display:${kitHasUnsaved(c) ? 'inline-flex' : 'none'};">Unsaved edit</span>
           </div>
-          <div class="kitmeta">Saving never overwrites: it writes v${(c.kit_version || 0) + 1} and keeps
+          <div class="kitmeta">Saving never overwrites. It writes v${(c.kit_version || 0) + 1} and keeps
             every earlier version. Regenerating asks first if the active version is yours, and the server
             refuses it outright without that confirmation.</div>
-          ${c.vision_model || c.writer_model ? `<div class="kitmeta">generated by ${esc(c.vision_model || 'no vision model')}
+          ${c.vision_model || c.writer_model ? `<div class="kitmeta">Generated by ${esc(c.vision_model || 'no vision model')}
             + ${esc(c.writer_model || 'no writer model')}${c.passthrough_degraded === 1
-              ? ' — QUALITY PARAMETERS WERE REFUSED by the provider, so this ran at defaults' : ''}</div>` : ''}
+              ? '. Quality parameters were refused by the provider, so this ran at defaults.' : '.'}</div>` : ''}
           <div class="kitmeta" id="kitHistory"></div>
         </div>`;
 
       detailEl.innerHTML = `
-        <h2 style="margin:0 0 8px;">Candidate #${c.id} — post kit</h2>
-        <div class="hint">session ${esc(c.session_label)} | vod ${c.vod_id} | delivered ${esc(c.drive_synced_at)}</div>
+        <h2 style="margin:0 0 8px;">Candidate #${c.id} &middot; Post kit</h2>
+        <div class="hint">Session ${esc(c.session_label)} &middot; vod ${c.vod_id} &middot; delivered ${esc(c.drive_synced_at)}</div>
         <div class="winline">${kitStampHtml(c)}</div>
         <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
-          generate a post kit for this clip (intent only, the generator reads this)</label>
+          Generate a post kit for this clip. Intent only: the generator reads this.</label>
         <label class="genrow"><input type="checkbox" id="burnCaps" ${c.burn_captions === 1 ? 'checked' : ''} />
-          burn speech captions into this clip (intent only — it applies to the NEXT render,
-          it cannot change the file already delivered)</label>
+          Burn speech captions into this clip. Intent only: it applies to the next render, it cannot
+          change the file already delivered.</label>
         <div class="winline">${captionsFactHtml(c)}</div>
         ${captionsIntentNote(c)}
+        ${hasClip ? `
+        <div class="editrow" style="margin:0 0 14px;">
+          <!-- RS-06: present whenever a rendered clip row exists, independent
+               of whether a post kit has been generated yet -- Re-render is a
+               VIDEO action, Regenerate (inside the kit block below, kit-only)
+               is a COPY action. Same id/handler as before; only its position
+               moved, so it is no longer trapped inside the kit-exists branch. -->
+          <button class="nudge" id="btnRerender" title="Re-cut the video file with the current caption setting">Re-render video</button>
+          <span class="hint">Re-cuts this file with the current caption setting and uploads it again.</span>
+        </div>` : ''}
         <div class="kitgrid">
           <div>
             <div class="phone" id="phoneFrame">
               <video id="kitVid" playsinline preload="metadata" src="/clipmedia/${c.id}"></video>
               <div class="missing" id="clipMissing" style="display:none;">
-                clip file not reachable from this machine.<br />
+                Clip file not reachable from this machine.<br />
                 The mockup still works for the copy, only the video is unavailable here.
               </div>
               <div class="guide top" style="display:${showGuides ? 'block' : 'none'};"></div>
@@ -854,7 +1119,7 @@
             </div>
             <div class="editrow" style="margin-top:8px;">
               <button class="replaywin" id="btnPlayClip">Play</button>
-              <button class="nudge" id="btnGuides">${showGuides ? 'hide' : 'show'} platform guides</button>
+              <button class="nudge" id="btnGuides">${showGuides ? 'Hide' : 'Show'} platform guides</button>
             </div>
             <div class="coverage" id="coverage"></div>
             <div class="postmeta">
@@ -863,9 +1128,9 @@
               <div class="tags" id="postTags">${esc(v.hashtags)}</div>
             </div>
             <div class="kitmeta">Dashed regions are covered by the platform's own UI. The hook is a CSS
-              overlay on top of the video: it is never burned into the delivered file and never will be
-              (D-061) — you type it into the platform's own text tool. Speech captions are the one
-              exception, and only when you tick the box above: they are burned during the render, sit
+              overlay on top of the video. It is never burned into the delivered file and never will be
+              (D-061): you type it into the platform's own text tool. Speech captions are the one
+              exception, and only when you tick the box above. They are burned during the render, sit
               along the bottom clear of these guides, and this mockup does not show them.</div>
           </div>
           <div>
@@ -911,7 +1176,7 @@
           d[el.dataset.field] = el.value;
           kitDrafts[c.id] = d;
           const flag = document.getElementById('kitUnsaved');
-          if (flag) flag.style.display = kitHasUnsaved(c) ? 'inline' : 'none';
+          if (flag) flag.style.display = kitHasUnsaved(c) ? 'inline-flex' : 'none';
           if (el.dataset.field === 'video_caption') {
             const pc = document.getElementById('postCaption');
             if (pc) pc.textContent = el.value;
@@ -964,12 +1229,12 @@
         if (!res.ok) return;
         const data = await res.json();
         const rows = (data.versions || []).map((k) =>
-          `<div class="histrow">v${k.version} ${esc(k.origin)}${k.is_active === 1 ? ' ACTIVE' : ''} ${esc(k.created_at)}</div>`
+          `<div class="histrow">v${k.version} ${esc(k.origin)}${k.is_active === 1 ? ' &middot; active' : ''} &middot; ${esc(k.created_at)}</div>`
         ).join('');
         const reqs = (data.requests || []).map((q) =>
-          `<div class="histrow">request ${esc(q.state)} ${esc(q.requested_at)}${q.force_over_operator_edit === 1 ? ' [confirmed over your edit]' : ''}${q.error ? ' — ' + esc(q.error) : ''}</div>`
+          `<div class="histrow">Request ${esc(q.state)} &middot; ${esc(q.requested_at)}${q.force_over_operator_edit === 1 ? ' (confirmed over your edit)' : ''}${q.error ? ': ' + esc(q.error) : ''}</div>`
         ).join('');
-        out.innerHTML = (rows + reqs) || '<div class="histrow">no versions</div>';
+        out.innerHTML = (rows + reqs) || '<div class="histrow">No versions yet.</div>';
       } catch (_) { /* history is informational, never surface a transient error */ }
     }
 
@@ -987,15 +1252,15 @@
 
     function captionsFactHtml(c) {
       if (c.clip_state === null || c.clip_state === undefined) {
-        return 'captions: <b>no clip rendered yet</b>';
+        return 'Captions: <b>no clip rendered yet</b>.';
       }
       if (c.captions_burned === 1) {
-        return `captions: <b>BURNED IN</b> (${c.captions_cue_count} cue${c.captions_cue_count === 1 ? '' : 's'})`;
+        return `Captions: <b>burned in</b> (${c.captions_cue_count} cue${c.captions_cue_count === 1 ? '' : 's'}).`;
       }
       if (c.captions_requested === 1 && c.captions_cue_count === 0) {
-        return 'captions: <b>none burned</b> — they were requested, but nobody speaks inside this window';
+        return 'Captions: <b>none burned</b>. They were requested, but nobody speaks inside this window.';
       }
-      return 'captions: <b>none burned</b> — this file has no text in it';
+      return 'Captions: <b>none burned</b>. This file has no text in it.';
     }
 
     // The gap between intent and file, stated plainly wherever it exists. This
@@ -1014,21 +1279,21 @@
       if (c.burn_captions === 1 && c.captions_burned !== 1 && !noSpeech) {
         // A delivered clip has no next render (D-056), so do not promise one.
         if (c.drive_synced_at) {
-          return `<div class="genrow" style="color:var(--maybe);">captions are ON but the file that was
+          return `<div class="genrow" style="color:var(--maybe);">Captions are on, but the file that was
             already delivered does not carry them. The toggle cannot change a delivered clip: it only
             applies if this candidate is ever rendered again.</div>`;
         }
-        return `<div class="genrow" style="color:var(--maybe);">captions are ON but the rendered file
+        return `<div class="genrow" style="color:var(--maybe);">Captions are on, but the rendered file
           does not carry them. It has to be re-rendered on the server lane to gain them, and the Mac
           batch deliverer will refuse this clip until then rather than ship it uncaptioned.</div>`;
       }
       if (c.burn_captions === 0 && c.captions_burned === 1) {
         if (c.drive_synced_at) {
-          return `<div class="genrow" style="color:var(--maybe);">captions are OFF but the file that was
+          return `<div class="genrow" style="color:var(--maybe);">Captions are off, but the file that was
             already delivered has them burned in. Unticking the box cannot take them out of a clip that
             has shipped.</div>`;
         }
-        return `<div class="genrow" style="color:var(--maybe);">captions are OFF but the rendered file
+        return `<div class="genrow" style="color:var(--maybe);">Captions are off, but the rendered file
           already has them burned in. Re-tick captions, or re-render, before delivering.</div>`;
       }
       return '';
@@ -1063,7 +1328,7 @@
         if (!res.ok) {
           let body = '';
           try { body = JSON.stringify(await res.json()); } catch (_) {}
-          alert(`Failed: ${res.status} ${body}`);
+          notify('Could not update the captions setting.', { technical: `${res.status} ${body}` });
           await loadCandidates();
           return;
         }
@@ -1073,7 +1338,7 @@
         renderList();
         renderDetail();
       } catch (err) {
-        alert(`Failed: ${String(err)}`);
+        notify('Could not reach the server to update the captions setting.', { technical: String(err) });
       }
       })();
       // Cleared in a finally so a rejected save can never wedge every future
@@ -1097,7 +1362,7 @@
         if (!res.ok) {
           let body = '';
           try { body = JSON.stringify(await res.json()); } catch (_) {}
-          alert(`Failed: ${res.status} ${body}`);
+          notify('Could not update the post kit setting.', { technical: `${res.status} ${body}` });
           await loadCandidates();
           return;
         }
@@ -1107,7 +1372,7 @@
         renderList();
         renderDetail();
       } catch (err) {
-        alert(`Failed: ${String(err)}`);
+        notify('Could not reach the server to update the post kit setting.', { technical: String(err) });
       }
     }
 
@@ -1121,6 +1386,16 @@
       return newRow;
     }
 
+    // Human names for the schema's NOT NULL kit fields, used only in the
+    // client-side pre-check below so the message names what the operator
+    // sees on the card, not the database column.
+    const KIT_REQUIRED_FIELD_NAMES = {
+      hook_withheld: 'Hook A (withholds)',
+      hook_domain: 'Hook B (names the domain)',
+      hook_payoff: 'Hook C (names the payoff)',
+      video_caption: 'Video caption',
+    };
+
     async function saveKit(c) {
       if (!hasKit(c)) return;
       const v = kitValues(c);
@@ -1129,7 +1404,8 @@
       // that is guaranteed to fail.
       for (const f of ['hook_withheld', 'hook_domain', 'hook_payoff', 'video_caption']) {
         if (!(v[f] || '').trim()) {
-          alert(`${f} cannot be empty: the schema requires all three hooks and the caption.`);
+          notify(`${KIT_REQUIRED_FIELD_NAMES[f]} cannot be empty. Fill it in and save again.`,
+            { technical: `${f} cannot be empty: the schema requires all three hooks and the caption.` });
           return;
         }
       }
@@ -1149,11 +1425,14 @@
             srt_text: v.srt_text || null,
           }),
         });
-      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      } catch (err) {
+        notify('Could not reach the server. Check your connection and try again.', { technical: String(err) });
+        return;
+      }
       if (!res.ok) {
         let body = '';
         try { body = JSON.stringify(await res.json()); } catch (_) {}
-        alert(`Save refused: ${res.status} ${body}`);
+        notify('The server refused to save this kit.', { technical: `${res.status} ${body}` });
         return;
       }
       const row = await res.json();
@@ -1170,9 +1449,9 @@
     async function rerenderClip(c, btn) {
       const on = c.burn_captions === 1;
       const msg = 'Re-render this clip?\n\n'
-        + 'It re-cuts the video with captions ' + (on ? 'ON' : 'OFF')
-        + ' and re-uploads it.\n\n'
-        + 'The upload creates a NEW file rather than replacing one, so delete the '
+        + 'It re-cuts the video with captions ' + (on ? 'on' : 'off')
+        + ' and uploads it again.\n\n'
+        + 'The upload creates a new file rather than replacing one, so delete the '
         + 'previous copy from Drive first if it is still there.';
       if (!confirm(msg)) return;
       const label = btn.textContent;
@@ -1185,16 +1464,15 @@
         });
         const j = await res.json().catch(() => ({}));
         if (!res.ok) {
-          alert('Re-render refused:\n\n' + (j.error || res.status));
+          notify('Re-render refused.', { technical: String(j.error || res.status) });
           return;
         }
         // The chain runs on the server; the row will not be updated by the time
         // this returns. Say that rather than implying it is already done.
-        alert('Re-render queued (captions ' + (on ? 'ON' : 'OFF') + ').\n\n'
-              + 'webhook: ' + (j.webhook || '?')
-              + '\n\nIt takes a moment. Refresh to see the new file.');
+        notify(`Re-render queued with captions ${on ? 'on' : 'off'}. It takes a moment. Refresh to see the new file.`,
+          { kind: 'info', technical: 'webhook: ' + (j.webhook || '?') });
       } catch (e) {
-        alert('Re-render failed: ' + e);
+        notify('Re-render failed. Check your connection and try again.', { technical: String(e) });
       } finally {
         btn.disabled = false; btn.textContent = label;
       }
@@ -1202,7 +1480,8 @@
 
     async function requestRegenerate(c) {
       if (kitHasUnsaved(c)) {
-        alert('You have unsaved edits. Save them or reload the card before regenerating.');
+        notify('Save your edits first, then regenerate.',
+          { technical: 'You have unsaved edits. Save them or reload the card before regenerating.' });
         return;
       }
       let confirmFlag = false;
@@ -1210,7 +1489,7 @@
         // The server refuses this without confirm=true regardless of what the
         // browser does. This dialog exists so the refusal is not a dead end.
         if (!window.confirm(
-          `The active version (v${c.kit_version}) is YOUR edit.\n\n`
+          `The active version (v${c.kit_version}) is your edit.\n\n`
           + 'Regenerating asks the generator to write a new machine draft on top of it. Your version is '
           + 'kept forever and stays readable in the history, but the active kit will no longer be your '
           + 'words.\n\nRegenerate anyway?')) {
@@ -1226,11 +1505,14 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ confirm: confirmFlag }),
         });
-      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      } catch (err) {
+        notify('Could not reach the server. Check your connection and try again.', { technical: String(err) });
+        return;
+      }
       if (!res.ok) {
         let body = '';
         try { body = JSON.stringify(await res.json()); } catch (_) {}
-        alert(`Regenerate refused: ${res.status} ${body}`);
+        notify('Regenerate was refused.', { technical: `${res.status} ${body}` });
         return;
       }
       const row = await res.json();
@@ -1239,8 +1521,8 @@
       renderList();
       renderDetail();
       if (row.regenerate_command) {
-        alert('Regenerate requested. It is recorded for the generator lane.\n\n'
-          + 'To run it yourself right now:\n' + row.regenerate_command);
+        notify('Regenerate requested. It is recorded for the generator lane.',
+          { kind: 'info', technical: 'To run it yourself right now:\n' + row.regenerate_command });
       }
     }
 
@@ -1273,11 +1555,14 @@
             extra_context: get('pfExtra'),
           }),
         });
-      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      } catch (err) {
+        notify('Could not reach the server to save your profile.', { technical: String(err) });
+        return;
+      }
       if (!res.ok) {
         let body = '';
         try { body = JSON.stringify(await res.json()); } catch (_) {}
-        alert(`Save refused: ${res.status} ${body}`);
+        notify('The server refused to save your profile.', { technical: `${res.status} ${body}` });
         return;
       }
       const data = await res.json();
@@ -1288,8 +1573,7 @@
     async function saveSubject(c) {
       const kind = subjectPick[c.vod_id] || c.subject_kind;
       if (!kind) {
-        alert('Choose "me" or "someone else" first. There is deliberately no default: a recording with '
-          + 'no subject is treated as UNKNOWN, never as you.');
+        notify('Choose "me" or "someone else" first. A recording with no subject is treated as unknown, never as you.');
         return;
       }
       const textEl = document.getElementById('subjText');
@@ -1305,11 +1589,14 @@
             context_notes: notesEl && notesEl.value.trim() !== '' ? notesEl.value : null,
           }),
         });
-      } catch (err) { alert(`Failed: ${String(err)}`); return; }
+      } catch (err) {
+        notify('Could not reach the server to save the subject.', { technical: String(err) });
+        return;
+      }
       if (!res.ok) {
         let body = '';
         try { body = JSON.stringify(await res.json()); } catch (_) {}
-        alert(`Save refused: ${res.status} ${body}`);
+        notify('The server refused to save the subject.', { technical: `${res.status} ${body}` });
         return;
       }
       const rec = await res.json();
@@ -1327,13 +1614,238 @@
       renderDetail();
     }
 
+    // ---------------------------------------------------------------- D-073
+    // THE TRIM SLIDER. Track = the SLICE (original window +/- SLICE_PAD_S),
+    // mirroring workers/slice_geometry.py's slice_start()/slice_end() EXACTLY
+    // (max(0, original_start - PAD) .. original_end + PAD, duration-clamped
+    // when known). This is presentation only: it bounds where the operator
+    // CAN drag, matching what was actually staged. It does NOT change what
+    // the numeric fine-edit fallback accepts -- an out-of-slice numeric edit
+    // is still legal (D-055: it fails loud at render and falls back to the
+    // Mac deliverer), so only the slider's own drag math clamps.
+    const SLICE_PAD_S = 10.0;
+
+    function sliceBounds(c) {
+      let lo = Math.max(0, c.start_s - SLICE_PAD_S);
+      let hi = c.end_s + SLICE_PAD_S;
+      if (typeof sliderVideoDuration === 'number' && isFinite(sliderVideoDuration)) {
+        hi = Math.min(hi, sliderVideoDuration);
+      }
+      if (hi <= lo) hi = lo + 0.1;
+      return { lo, hi };
+    }
+
+    // Serif timecode chip format, mm:ss.d (spec example: "00:04.2").
+    function tc(seconds) {
+      if (seconds === null || seconds === undefined || !isFinite(seconds)) return '--:--.-';
+      let s = Math.max(0, seconds);
+      let m = Math.floor(s / 60);
+      let rem = s - m * 60;
+      if (rem >= 59.95) { rem = 0; m += 1; } // float-precision guard at the minute boundary
+      return `${String(m).padStart(2, '0')}:${rem.toFixed(1).padStart(4, '0')}`;
+    }
+
+    function pctFor(seconds, lo, hi) {
+      const span = hi - lo;
+      if (span <= 0) return 0;
+      return Math.min(100, Math.max(0, (seconds - lo) / span * 100));
+    }
+
+    function secondsFromClientX(clientX, trackEl, lo, hi) {
+      const rect = trackEl.getBoundingClientRect();
+      const pct = rect.width > 0 ? Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)) : 0;
+      return Math.round((lo + pct * (hi - lo)) * 10) / 10;
+    }
+
+    // Shared clamp: slice bounds + a 0.1s minimum gap between handles, so a
+    // drag/nudge/I-O keypress can never produce start >= end (which the
+    // server's window endpoint would 400 on). edgeMoved is 'start' or 'end'
+    // -- whichever edge the gesture is actively moving, so the OTHER edge is
+    // the one held fixed when the gap has to be enforced.
+    function clampWindowDraft(next, c, edgeMoved) {
+      const { lo, hi } = sliceBounds(c);
+      if (next.start < lo) next.start = lo;
+      if (next.end > hi) next.end = hi;
+      if (next.end - next.start < 0.1) {
+        if (edgeMoved === 'end') next.end = Math.min(hi, next.start + 0.1);
+        else next.start = Math.max(lo, next.end - 0.1);
+      }
+      next.start = Math.round(next.start * 10) / 10;
+      next.end = Math.round(next.end * 10) / 10;
+      return next;
+    }
+
+    // Repaints every slider element from CURRENT state (drafts/saved window),
+    // without touching the video element -- called after every drag move,
+    // nudge, keyboard edit, I/O keypress, and on loadedmetadata (the slice's
+    // upper bound can tighten once the real duration is known). Also repaints
+    // the fine-edit fallback spans and the Save/unsaved chips, since they
+    // reflect the identical draft state.
+    function renderSliderPositions(c) {
+      const sliderEl = document.getElementById('trimSlider');
+      if (!sliderEl) return;
+      const { lo, hi } = sliceBounds(c);
+      const ed = editorValues(c);
+      const startPct = pctFor(ed.start, lo, hi);
+      const endPct = pctFor(ed.end, lo, hi);
+      const widthPct = Math.max(0, endPct - startPct);
+      const midPct = (startPct + endPct) / 2;
+      const dur = Math.max(0, ed.end - ed.start);
+
+      const ticks = sliderEl.querySelectorAll('.tick');
+      if (ticks[0]) ticks[0].style.left = pctFor(c.start_s, lo, hi) + '%';
+      if (ticks[1]) ticks[1].style.left = pctFor(c.end_s, lo, hi) + '%';
+
+      const handleIn = document.getElementById('handleIn');
+      const handleOut = document.getElementById('handleOut');
+      const region = document.getElementById('trimRegion');
+      const durChip = document.getElementById('trimDuration');
+      if (handleIn) {
+        handleIn.style.left = startPct + '%';
+        handleIn.setAttribute('aria-valuenow', String(ed.start));
+        handleIn.setAttribute('aria-valuemin', String(lo));
+        handleIn.setAttribute('aria-valuemax', String(hi));
+        const chip = handleIn.querySelector('.chip-time');
+        if (chip) chip.textContent = tc(ed.start);
+      }
+      if (handleOut) {
+        handleOut.style.left = endPct + '%';
+        handleOut.setAttribute('aria-valuenow', String(ed.end));
+        handleOut.setAttribute('aria-valuemin', String(lo));
+        handleOut.setAttribute('aria-valuemax', String(hi));
+        const chip = handleOut.querySelector('.chip-time');
+        if (chip) chip.textContent = tc(ed.end);
+      }
+      if (region) { region.style.left = startPct + '%'; region.style.width = widthPct + '%'; }
+      if (durChip) { durChip.style.left = midPct + '%'; durChip.textContent = fmt(dur, 1) + 's'; }
+
+      const valStart = document.getElementById('valStart');
+      if (valStart) valStart.textContent = `${fmt(ed.start, 1)}s`;
+      const valEnd = document.getElementById('valEnd');
+      if (valEnd) valEnd.textContent = `${fmt(ed.end, 1)}s`;
+
+      const saveBtn = document.getElementById('btnSaveWin');
+      if (saveBtn) saveBtn.style.display = hasUnsaved(c) ? 'inline-flex' : 'none';
+      const flag = document.getElementById('unsavedFlag');
+      if (flag) flag.style.display = hasUnsaved(c) ? 'inline-flex' : 'none';
+    }
+
+    function renderPlayheadPosition(c, seconds) {
+      const ph = document.getElementById('trimPlayhead');
+      if (!ph) return;
+      const { lo, hi } = sliceBounds(c);
+      ph.style.left = pctFor(seconds, lo, hi) + '%';
+    }
+
+    // Builds the trim-slider block's markup. Always rendered (so the operator
+    // always sees where the window sits); interaction is wired only when
+    // editable (wireSlider below returns early otherwise), and the disabled
+    // CSS state (pointer-events:none, dimmed) makes that visible too.
+    function renderTrimBlock(c, ed, editable) {
+      const { lo, hi } = sliceBounds(c);
+      const origStartPct = pctFor(c.start_s, lo, hi);
+      const origEndPct = pctFor(c.end_s, lo, hi);
+      const startPct = pctFor(ed.start, lo, hi);
+      const endPct = pctFor(ed.end, lo, hi);
+      const widthPct = Math.max(0, endPct - startPct);
+      const midPct = (startPct + endPct) / 2;
+      const dur = Math.max(0, ed.end - ed.start);
+      const nudges = (field) => ['-5', '-1', '+1', '+5'].map((d) =>
+        `<button class="nudge" data-field="${field}" data-delta="${d}">${d}s</button>`
+      );
+
+      const fineEdit = !editable ? '' : `
+        <details class="fineedit">
+          <summary>Fine-edit with numbers</summary>
+          <div class="editpanel">
+            <div class="editrow">
+              <span class="editlabel">Start</span>
+              ${nudges('start')[0]}${nudges('start')[1]}
+              <span class="editval" id="valStart">${fmt(ed.start, 1)}s</span>
+              ${nudges('start')[2]}${nudges('start')[3]}
+            </div>
+            <div class="editrow">
+              <span class="editlabel">End</span>
+              ${nudges('end')[0]}${nudges('end')[1]}
+              <span class="editval" id="valEnd">${fmt(ed.end, 1)}s</span>
+              ${nudges('end')[2]}${nudges('end')[3]}
+            </div>
+          </div>
+        </details>`;
+
+      const lockedChip = !editable
+        ? '<span class="chip chip-muted">Locked, already approved</span>'
+        : '';
+
+      return `
+        <div class="trimwrap">
+          <div class="trimhead">
+            <span class="trimlabel">Clip window</span>
+            ${lockedChip}
+          </div>
+          <div class="slider${editable ? '' : ' disabled'}" id="trimSlider">
+            <div class="slider-track"></div>
+            <div class="tick" style="left:${origStartPct}%" title="Detector's original start"></div>
+            <div class="tick" style="left:${origEndPct}%" title="Detector's original end"></div>
+            <div class="slider-region" id="trimRegion" style="left:${startPct}%;width:${widthPct}%"></div>
+            <span class="chip chip-duration" id="trimDuration" style="left:${midPct}%">${fmt(dur, 1)}s</span>
+            <div class="slider-playhead" id="trimPlayhead" style="left:${startPct}%"></div>
+            <div class="handle handle-in" id="handleIn" tabindex="${editable ? '0' : '-1'}" role="slider"
+                 aria-label="Clip start" aria-valuemin="${lo}" aria-valuemax="${hi}" aria-valuenow="${ed.start}"
+                 style="left:${startPct}%">
+              <span class="chip chip-time">${tc(ed.start)}</span>
+            </div>
+            <div class="handle handle-out" id="handleOut" tabindex="${editable ? '0' : '-1'}" role="slider"
+                 aria-label="Clip end" aria-valuemin="${lo}" aria-valuemax="${hi}" aria-valuenow="${ed.end}"
+                 style="left:${endPct}%">
+              <span class="chip chip-time">${tc(ed.end)}</span>
+            </div>
+          </div>
+          <div class="trimfoot">
+            <span class="hint">${editable
+              ? 'Drag the handles to trim. Focus a handle, then use arrow keys to nudge 0.1s (Shift 1.0s). Press I or O to set in or out at the playhead.'
+              : 'The window is locked because this clip is already approved.'}</span>
+          </div>
+          ${fineEdit}
+          <div class="trimactions">
+            <button class="replaywin" id="btnReplay">Preview clip</button>
+            ${editable ? `<button class="savewin" id="btnSaveWin" style="display:${hasUnsaved(c) ? 'inline-flex' : 'none'};">Save window</button>` : ''}
+            ${editable && hasAdjustment(c) ? '<button class="resetwin" id="btnResetWin">Reset to original</button>' : ''}
+            <span class="unsaved" id="unsavedFlag" style="display:${editable && hasUnsaved(c) ? 'inline-flex' : 'none'};">Unsaved edit</span>
+          </div>
+        </div>`;
+    }
+
+    // RS-06 (ruled in scope via the redesign mandate): Re-render video must
+    // be present for ANY candidate with a rendered clip row, not only in
+    // post-kit states -- same guard rails (confirm dialog, server refusals
+    // unchanged) as the post-kit view's identical control.
+    function renderRerenderBlock(c) {
+      const on = c.burn_captions === 1;
+      return `
+        <div class="trimwrap">
+          <div class="trimhead"><span class="trimlabel">Rendered clip</span></div>
+          <div class="hint">This candidate already has a rendered file. Re-render video re-cuts it with
+            captions ${on ? 'on' : 'off'} (the current setting) and uploads it again.</div>
+          <div class="trimactions">
+            <button class="nudge" id="btnRerenderInline" title="Re-cut the video file with the current caption setting">Re-render video</button>
+          </div>
+        </div>`;
+    }
+
     function renderDetail() {
+      // D-073 safety reset, unconditional: detailEl's innerHTML is about to
+      // be replaced on every path below, which tears down any slider handle
+      // a pointer is still captured on (e.g. a keyboard-triggered card
+      // switch mid-drag). A stuck `true` would wedge pollRefresh's guard
+      // forever, so every render starts from a clean slate.
+      sliderDragActive = false;
       if (listError) {
-        detailEl.innerHTML = `<div class="empty error">${esc(listError)}</div>`;
+        detailEl.innerHTML = listErrorHtml();
         return;
       }
       if (!candidates.length) {
-        detailEl.innerHTML = `<div class="empty">No ${labelForView()} candidates.</div>`;
+        detailEl.innerHTML = `<div class="empty">${esc(emptyQueueMessage())}</div>`;
         return;
       }
       const c = candidates[idx];
@@ -1348,69 +1860,40 @@
       const ed = editorValues(c);
       // D-056: pending now really does carry approved (awaiting-delivery)
       // cards, so this check is live routing, not just a backstop: approved
-      // cards get no edit panel and locked verdict buttons (the server 409s
-      // both anyway). Replay stays available via the replay-only panel below.
+      // cards get a locked slider and locked verdict buttons (the server
+      // 409s both anyway). Preview stays available either way.
       const editable = c.state !== 'approved';
       const videoSrc = `/media/${c.vod_id}#t=${encodeURIComponent(eff.start)},${encodeURIComponent(eff.end)}`;
-      const nudges = (field) => ['-5', '-1', '+1', '+5'].map((d) =>
-        `<button class="nudge" data-field="${field}" data-delta="${d}">${d}s</button>`
-      );
-      const editPanel = !editable ? '' : `
-        <div class="editpanel">
-          <div class="editrow">
-            <span class="editlabel">start</span>
-            ${nudges('start')[0]}${nudges('start')[1]}
-            <span class="editval" id="valStart">${fmt(ed.start, 1)}s</span>
-            ${nudges('start')[2]}${nudges('start')[3]}
-          </div>
-          <div class="editrow">
-            <span class="editlabel">end</span>
-            ${nudges('end')[0]}${nudges('end')[1]}
-            <span class="editval" id="valEnd">${fmt(ed.end, 1)}s</span>
-            ${nudges('end')[2]}${nudges('end')[3]}
-          </div>
-          <div class="editrow">
-            <button class="replaywin" id="btnReplay">Replay</button>
-            <button class="savewin" id="btnSaveWin">Save</button>
-            ${hasAdjustment(c) ? '<button class="resetwin" id="btnResetWin">Reset</button>' : ''}
-            <span class="unsaved" id="unsavedFlag" style="display:${hasUnsaved(c) ? 'inline' : 'none'};">unsaved</span>
-          </div>
-        </div>`;
-      // D-056: approved (awaiting-delivery) cards keep Replay — the one edit
-      // control that stays live — in a reduced panel; nudges/Save/Reset are gone.
-      const replayPanel = editable ? '' : `
-        <div class="editpanel">
-          <div class="editrow">
-            <button class="replaywin" id="btnReplay">Replay</button>
-            <span class="hint">window locked — approved</span>
-          </div>
-        </div>`;
+      // D-073: a fresh video element means a fresh duration to (re)learn.
+      sliderVideoDuration = null;
+      const hasClip = !(c.clip_state === null || c.clip_state === undefined);
       // Action buttons per queue (D-050 upgrade paths):
       // pending: Approve/Reject/Maybe | maybe: Approve/Reject | rejected: Approve/Maybe
       detailEl.innerHTML = `
         <h2 style="margin:0 0 8px;">Candidate #${c.id}</h2>
-        <div class="hint">session ${c.session_label} | vod ${c.vod_id}</div>
+        <div class="hint">Session ${c.session_label} &middot; vod ${c.vod_id}</div>
         <div class="hint">${c.vod_path}</div>
-        <div class="winline">window ${fmt(eff.start, 1)}s to ${fmt(eff.end, 1)}s
-          ${edited ? '<span class="badge">edited</span>' : ''}
+        <div class="winline">Window ${fmt(eff.start, 1)}s to ${fmt(eff.end, 1)}s
+          ${edited ? '<span class="chip badge">Edited</span>' : ''}
           ${edited ? `<span class="orig">(original ${fmt(c.start_s, 1)}s to ${fmt(c.end_s, 1)}s)</span>` : ''}
           ${deliveryBadgeHtml(c)}
         </div>
         <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
-          generate a post kit for this clip (default on, flip it any time — it records intent only,
-          the copy is generated after the clip is delivered)</label>
+          Generate a post kit for this clip (default on). This records intent only: the copy is
+          generated after the clip is delivered.</label>
         <label class="genrow"><input type="checkbox" id="burnCaps" ${c.burn_captions === 1 ? 'checked' : ''} />
-          burn speech captions into this clip (default off, tick it any time before or at approval —
-          the captions go in during the render itself, not afterwards)</label>
+          Burn speech captions into this clip (default off). Captions go in during the render itself,
+          so tick this before or at approval.</label>
         ${captionsIntentNote(c)}
-        <div class="actions">
-          <button class="approve" id="btnApprove">Approve (a)</button>
-          ${view !== 'rejected' ? '<button class="reject" id="btnReject">Reject (r)</button>' : ''}
-          ${view === 'pending' || view === 'rejected' ? '<button class="maybe" id="btnMaybe">Maybe (m)</button>' : ''}
-          <span class="hint" id="verdictLock" style="display:none;">save or reset the window first</span>
-        </div>
-        ${editPanel}${replayPanel}
         <video id="vid" controls preload="metadata" src="${videoSrc}"></video>
+        ${renderTrimBlock(c, ed, editable)}
+        <div class="actions">
+          <button class="approve" id="btnApprove">Approve clip<span class="kbdchip">A</span></button>
+          ${view !== 'rejected' ? '<button class="reject" id="btnReject">Reject clip<span class="kbdchip">R</span></button>' : ''}
+          ${view === 'pending' || view === 'rejected' ? '<button class="maybe" id="btnMaybe">Mark maybe<span class="kbdchip">M</span></button>' : ''}
+          <span class="hint" id="verdictLock" style="display:none;">Save or reset the window first.</span>
+        </div>
+        ${hasClip ? renderRerenderBlock(c) : ''}
         <pre>score=${fmt(c.score)}\naudio=${fmt(c.signal_audio)} transcript=${fmt(c.signal_transcript)} chat=${fmt(c.signal_chat)} beat_boost=${fmt(c.signal_beat_boost)}\ncreated_at=${c.created_at}</pre>
       `;
       document.getElementById('btnApprove').onclick = () => decide('approve');
@@ -1418,8 +1901,8 @@
       if (rejectBtn) rejectBtn.onclick = () => decide('reject');
       const maybeBtn = document.getElementById('btnMaybe');
       if (maybeBtn) maybeBtn.onclick = () => decide('maybe');
-      // Replay exists in BOTH panels (edit panel and the locked replay-only
-      // panel), so it is wired outside the editable branch.
+      // Preview exists whether or not the window is editable, so it is wired
+      // unconditionally (same as the old Replay button in both its panels).
       const replayBtn = document.getElementById('btnReplay');
       if (replayBtn) replayBtn.onclick = () => replayWindow();
       // D-061: the generate toggle. Records intent only — it fires no
@@ -1436,12 +1919,186 @@
         detailEl.querySelectorAll('.nudge').forEach((btn) => {
           btn.onclick = () => nudgeWindow(btn.dataset.field, Number(btn.dataset.delta));
         });
-        document.getElementById('btnSaveWin').onclick = () => saveWindow();
+        const saveWinBtn = document.getElementById('btnSaveWin');
+        if (saveWinBtn) saveWinBtn.onclick = () => saveWindow();
         const resetBtn = document.getElementById('btnResetWin');
         if (resetBtn) resetBtn.onclick = () => resetWindow();
       }
+      const rerenderInlineBtn = document.getElementById('btnRerenderInline');
+      if (rerenderInlineBtn) rerenderInlineBtn.onclick = () => rerenderClip(c, rerenderInlineBtn);
+      wireSlider(c, editable);
       // Drafts persist across card navigation — returning to a card with
       // unsaved edits must re-lock its verdict buttons (D-055 fixer, gate 17).
+      updateVerdictLock(c);
+    }
+
+    // Wires the trim slider's drag/keyboard interaction and the video's
+    // duration-clamp + playhead tracking. Duration clamp and playhead
+    // tracking are wired even when NOT editable (a locked card still shows
+    // a live playhead while previewing) -- only handle/region drag and
+    // keyboard nudging are gated on editable, matching the server's own gate.
+    function wireSlider(c, editable) {
+      const sliderEl = document.getElementById('trimSlider');
+      const vid = document.getElementById('vid');
+      if (!vid) return;
+
+      // Duration clamp: re-derive slice bounds once real metadata is known,
+      // mirroring slice_geometry.slice_end()'s duration clamp (sliceBounds()
+      // above applies it the same way; null-guarded until this fires).
+      vid.addEventListener('loadedmetadata', () => {
+        if (isFinite(vid.duration)) {
+          sliderVideoDuration = vid.duration;
+          renderSliderPositions(c);
+        }
+      }, { once: true });
+
+      let dragTarget = null; // 'start' | 'end' | 'region' | 'playhead'
+
+      vid.addEventListener('timeupdate', () => {
+        if (dragTarget === null) renderPlayheadPosition(c, vid.currentTime);
+      });
+      // D-073 perf gate (charter §19 / spec constraint 3): exactly one rAF
+      // loop while the video is PLAYING, started on 'play' and cancelled on
+      // 'pause'/'ended' -- never a persistent idle loop.
+      let rafId = null;
+      const tick = () => {
+        if (dragTarget === null) renderPlayheadPosition(c, vid.currentTime);
+        rafId = requestAnimationFrame(tick);
+      };
+      vid.addEventListener('play', () => { if (rafId === null) rafId = requestAnimationFrame(tick); });
+      const stopTick = () => { if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } };
+      vid.addEventListener('pause', stopTick);
+      vid.addEventListener('ended', stopTick);
+
+      if (!sliderEl || !editable) return; // disabled visual state only, no drag/keyboard wired
+
+      const handleIn = document.getElementById('handleIn');
+      const handleOut = document.getElementById('handleOut');
+      const region = document.getElementById('trimRegion');
+      const playhead = document.getElementById('trimPlayhead');
+      let regionDragOffset = 0;
+
+      function applyDraft(next, edgeMoved) {
+        const draft = clampWindowDraft(next, c, edgeMoved);
+        drafts[c.id] = draft;
+        if (edgeMoved === 'start') vid.currentTime = draft.start;
+        else if (edgeMoved === 'end') vid.currentTime = draft.end;
+        renderSliderPositions(c);
+        renderPlayheadPosition(c, vid.currentTime);
+        updateVerdictLock(c);
+      }
+
+      function endDrag() {
+        const wasDragging = dragTarget !== null && dragTarget !== 'playhead';
+        dragTarget = null;
+        sliderDragActive = false;
+        // Release -> loop-preview (spec section 2): replayWindow() already
+        // plays editorValues() in->out and pauses at out, exactly this.
+        if (wasDragging) replayWindow();
+      }
+
+      if (handleIn) {
+        handleIn.addEventListener('pointerdown', (e) => {
+          dragTarget = 'start'; sliderDragActive = true;
+          try { handleIn.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+        handleIn.addEventListener('pointermove', (e) => {
+          if (dragTarget !== 'start') return;
+          const { lo, hi } = sliceBounds(c);
+          const secs = secondsFromClientX(e.clientX, sliderEl, lo, hi);
+          const cur = editorValues(c);
+          applyDraft({ start: secs, end: cur.end }, 'start');
+        });
+        handleIn.addEventListener('pointerup', endDrag);
+        handleIn.addEventListener('pointercancel', endDrag);
+        handleIn.addEventListener('keydown', (e) => {
+          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+          e.preventDefault();
+          const step = e.shiftKey ? 1.0 : 0.1;
+          const cur = editorValues(c);
+          const delta = e.key === 'ArrowLeft' ? -step : step;
+          applyDraft({ start: cur.start + delta, end: cur.end }, 'start');
+        });
+      }
+      if (handleOut) {
+        handleOut.addEventListener('pointerdown', (e) => {
+          dragTarget = 'end'; sliderDragActive = true;
+          try { handleOut.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+        handleOut.addEventListener('pointermove', (e) => {
+          if (dragTarget !== 'end') return;
+          const { lo, hi } = sliceBounds(c);
+          const secs = secondsFromClientX(e.clientX, sliderEl, lo, hi);
+          const cur = editorValues(c);
+          applyDraft({ start: cur.start, end: secs }, 'end');
+        });
+        handleOut.addEventListener('pointerup', endDrag);
+        handleOut.addEventListener('pointercancel', endDrag);
+        handleOut.addEventListener('keydown', (e) => {
+          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+          e.preventDefault();
+          const step = e.shiftKey ? 1.0 : 0.1;
+          const cur = editorValues(c);
+          const delta = e.key === 'ArrowLeft' ? -step : step;
+          applyDraft({ start: cur.start, end: cur.end + delta }, 'end');
+        });
+      }
+      if (region) {
+        region.addEventListener('pointerdown', (e) => {
+          dragTarget = 'region'; sliderDragActive = true;
+          const { lo, hi } = sliceBounds(c);
+          const cur = editorValues(c);
+          regionDragOffset = secondsFromClientX(e.clientX, sliderEl, lo, hi) - cur.start;
+          try { region.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+        region.addEventListener('pointermove', (e) => {
+          if (dragTarget !== 'region') return;
+          const { lo, hi } = sliceBounds(c);
+          const cur = editorValues(c);
+          const durSecs = cur.end - cur.start;
+          let newStart = secondsFromClientX(e.clientX, sliderEl, lo, hi) - regionDragOffset;
+          newStart = Math.max(lo, Math.min(hi - durSecs, newStart));
+          newStart = Math.round(newStart * 10) / 10;
+          drafts[c.id] = { start: newStart, end: Math.round((newStart + durSecs) * 10) / 10 };
+          vid.currentTime = newStart;
+          renderSliderPositions(c);
+          renderPlayheadPosition(c, vid.currentTime);
+          updateVerdictLock(c);
+        });
+        region.addEventListener('pointerup', endDrag);
+        region.addEventListener('pointercancel', endDrag);
+      }
+      if (playhead) {
+        playhead.addEventListener('pointerdown', (e) => {
+          dragTarget = 'playhead'; sliderDragActive = true;
+          try { playhead.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+        playhead.addEventListener('pointermove', (e) => {
+          if (dragTarget !== 'playhead') return;
+          const { lo, hi } = sliceBounds(c);
+          const secs = secondsFromClientX(e.clientX, sliderEl, lo, hi);
+          vid.currentTime = secs;
+          renderPlayheadPosition(c, secs);
+        });
+        const endPlayheadDrag = () => { dragTarget = null; sliderDragActive = false; };
+        playhead.addEventListener('pointerup', endPlayheadDrag);
+        playhead.addEventListener('pointercancel', endPlayheadDrag);
+      }
+    }
+
+    // I/O (editor convention): set in/out at the CURRENT playhead position.
+    // Wired from the global keydown map, guarded there to non-kit views,
+    // not-typing-in-a-field, and an editable (non-approved) candidate.
+    function setInOutAtPlayhead(edge) {
+      if (!candidates.length) return;
+      const c = candidates[idx];
+      if (!c || c.state === 'approved') return;
+      const vid = document.getElementById('vid');
+      if (!vid) return;
+      const cur = editorValues(c);
+      const next = edge === 'start' ? { start: vid.currentTime, end: cur.end } : { start: cur.start, end: vid.currentTime };
+      drafts[c.id] = clampWindowDraft(next, c, edge);
+      renderSliderPositions(c);
       updateVerdictLock(c);
     }
 
@@ -1469,6 +2126,11 @@
 
     // D-055: nudges edit LOCAL (unsaved) state only; Save persists. The spans
     // are updated in place so the video element is not reloaded per nudge.
+    // UNCHANGED behaviour: this fallback path is deliberately NOT clamped to
+    // the slice (unlike the slider's own drag math) -- an out-of-slice
+    // numeric edit is legal (D-055: it fails loud at render and falls back
+    // to the Mac deliverer), so "unifying" validation here would remove a
+    // capability rather than reskin one.
     function nudgeWindow(field, delta) {
       if (!candidates.length) return;
       const c = candidates[idx];
@@ -1477,10 +2139,11 @@
       next[field] = Math.round((next[field] + delta) * 1000) / 1000;
       if (field === 'start') next.start = Math.max(0, next.start);
       drafts[c.id] = next;
-      const valEl = document.getElementById(field === 'start' ? 'valStart' : 'valEnd');
-      if (valEl) valEl.textContent = `${fmt(next[field], 1)}s`;
-      const flag = document.getElementById('unsavedFlag');
-      if (flag) flag.style.display = hasUnsaved(c) ? 'inline' : 'none';
+      // D-073: repaints the slider handles/region/duration chip too, since
+      // they read the identical draft state (renderSliderPositions() also
+      // covers the valStart/valEnd spans and the Save/unsaved chips this
+      // function used to update directly).
+      renderSliderPositions(c);
       // Nudges update in place (no re-render, so the video does not reload) —
       // the verdict lock must follow the draft state in place too.
       updateVerdictLock(c);
@@ -1528,13 +2191,13 @@
           body: JSON.stringify({ start_s: startVal, end_s: endVal }),
         });
       } catch (err) {
-        alert(`Failed: ${String(err)}`);
+        notify('Could not reach the server to save the window. Check your connection and try again.', { technical: String(err) });
         return null;
       }
       if (!res.ok) {
         let body = '';
         try { body = JSON.stringify(await res.json()); } catch (_) {}
-        alert(`Failed: ${res.status} ${body}`);
+        notify('The window save was refused.', { technical: `${res.status} ${body}` });
         return null;
       }
       return res.json();
@@ -1619,13 +2282,13 @@
           // F6 fixer: a dead server used to leave this unhandled — the promise
           // rejected, nothing alerted, and pressing approve/reject/maybe did
           // nothing the operator could see.
-          alert(`Failed: ${String(err)}`);
+          notify('Could not reach the server to record your decision.', { technical: String(err) });
           return;
         }
         if (!res.ok) {
           let body = '';
           try { body = JSON.stringify(await res.json()); } catch (_) {}
-          alert(`Failed: ${res.status} ${body}`);
+          notify('The server refused this decision.', { technical: `${res.status} ${body}` });
           return;
         }
         delete drafts[c.id];
@@ -1656,7 +2319,7 @@
             // instead of trusting the object we held before the POST.
             gen += 1;
             await loadCandidates().catch((err) => {
-              detailEl.innerHTML = `<pre>Failed to load candidates: ${String(err)}</pre>`;
+              detailEl.innerHTML = rawLoadErrorHtml(err);
             });
             return;
           }
@@ -1712,7 +2375,7 @@
       view = nextView;
       idx = 0;
       loadCandidates().catch((err) => {
-        detailEl.innerHTML = `<pre>Failed to load candidates: ${String(err)}</pre>`;
+        detailEl.innerHTML = rawLoadErrorHtml(err);
       });
     }
 
@@ -1755,6 +2418,20 @@
       // flag is stale) rather than a second carry-forward that only knew
       // about flags already sitting on THIS view's in-memory rows.
       fresh.forEach(applyWebhookFlag);
+      // D-073: skip the ENTIRE reconciliation while a slider drag is active —
+      // not just the render. The array/idx reassignment below follows the
+      // selected CARD BY ID, but a candidate that has meanwhile disappeared
+      // from the fresh list (approved/rejected/removed from another session)
+      // falls back to `Math.min(idx, ...)`, an ARBITRARY position -- with the
+      // DOM correctly left unrendered (kitHasUnsaved/sliderDragActive already
+      // guarded that), `candidates[idx]` would silently point at a DIFFERENT
+      // candidate than the one on screen. That is not just a wrong preview
+      // seek: saveWindow() reads candidates[idx] too, so ending the drag with
+      // Save could POST the drafted window onto the wrong candidate's id. So
+      // this poll simply does nothing at all while a drag is in flight; the
+      // next tick (15s later, or triggered by whatever ends the drag) catches
+      // up once it is safe to touch `candidates`/`idx` again.
+      if (sliderDragActive) return;
       if (listFingerprint(fresh) === listFingerprint(candidates)) return; // nothing changed
       const selId = candidates.length ? candidates[idx].id : null;
       const selFp = candidates.length ? rowFingerprint(candidates[idx]) : null;
@@ -1823,11 +2500,17 @@
         // x toggles the Rejected queue: into it from anywhere, back to Pending from it.
         e.preventDefault();
         switchView(view === 'rejected' ? 'pending' : 'rejected');
+      } else if ((e.key === 'i' || e.key === 'o') && view !== 'delivered') {
+        // D-073: editor convention, set in/out at the playhead. Guarded to
+        // the non-kit views (the trim slider only exists there) -- editable
+        // and candidate-presence are checked inside setInOutAtPlayhead.
+        e.preventDefault();
+        setInOutAtPlayhead(e.key === 'i' ? 'start' : 'end');
       }
     });
 
     loadCandidates().catch((err) => {
-      detailEl.innerHTML = `<pre>Failed to load candidates: ${String(err)}</pre>`;
+      detailEl.innerHTML = rawLoadErrorHtml(err);
     });
   </script>
 </body>
