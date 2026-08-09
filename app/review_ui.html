@@ -34,6 +34,7 @@
     .score { font-weight: 700; }
     .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
     .empty { padding: 12px; color: var(--muted); }
+    .empty.error { color: var(--bad); border: 1px dashed var(--bad); border-radius: 8px; font-weight: 600; }
     .card { border: 1px solid #2d333b; border-radius: 10px; background: var(--panel); padding: 12px; }
     .actions { display: flex; gap: 8px; margin: 10px 0 12px; }
     .tabs { display: flex; gap: 8px; margin-top: 8px; }
@@ -226,6 +227,12 @@
     // D-055: local (unsaved) window edits, keyed by candidate id: {start, end}.
     // A draft exists only while nudged-but-not-saved; Save/Reset clears it.
     const drafts = {};
+    // F6 fixer: a server error (5xx) or an unexpected (non-array) 200 body
+    // must NOT be coerced into "zero candidates" — that renders as a
+    // permanent, indistinguishable "No X candidates" precisely when the
+    // guard that produced the error matters most. Set by loadCandidates,
+    // read by renderList/renderDetail; null means no error, render normally.
+    let listError = null;
 
     const listEl = document.getElementById('list');
     const leftEl = document.querySelector('.left');
@@ -325,6 +332,27 @@
       return `<span class="dbadge${warn ? ' warn' : ''}">${text}</span>`;
     }
 
+    // F6 fixer: webhook outcomes recorded on an APPROVE persist here, keyed by
+    // candidate id, independent of which VIEW is currently loaded. The old
+    // carry-forward lived only inside pollRefresh and read _webhook off the
+    // CURRENT view's in-memory rows — so approving from maybe/rejected (which
+    // immediately removes the card from that view's list) discarded the
+    // outcome before the card ever reappeared in pending. This is the single
+    // place decide()/loadCandidates()/pollRefresh() all read and write it.
+    const webhookFlags = {};
+
+    // Attach (or clear) the persisted webhook flag on one fresh row. A clips
+    // row (clip_state present) means delivery has started, so it outranks and
+    // clears a stale flag — same precedence deliveryBadge() already applies.
+    function applyWebhookFlag(row) {
+      const rendered = !(row.clip_state === null || row.clip_state === undefined);
+      if (rendered) {
+        delete webhookFlags[row.id];
+        return;
+      }
+      if (webhookFlags[row.id]) row._webhook = webhookFlags[row.id];
+    }
+
     function endpointForView() {
       if (view === 'maybe') return '/api/candidates/maybe';
       if (view === 'rejected') return '/api/candidates/rejected';
@@ -346,13 +374,44 @@
       return 'pending';
     }
 
+    // F6 fixer: a dead server / rejected fetch must render as a visible error,
+    // not silently paint the same "No X candidates" state as a genuinely
+    // empty queue.
+    function showListError(msg) {
+      listError = msg;
+      candidates = [];
+      idx = 0;
+      renderTabs();
+      renderList();
+      renderDetail();
+    }
+
     async function loadCandidates() {
       // The post kit view renders the standing profile next to the copy it
       // produced, so it must be loaded before the first paint.
       if (view === 'delivered' && profileState === null) await loadProfile();
+      // NOTE: a raw connection drop here (fetch() itself rejecting) is left
+      // to propagate to the caller — every call site already wraps this in
+      // .catch(...) and paints "Failed to load candidates" (that path is not
+      // muffled today; do not add a second mechanism for it). This function
+      // only handles the two ways a response that DID land can still lie
+      // about being an empty queue: an explicit error status, and a 200 body
+      // that is not the array shape every caller assumes.
       const res = await fetch(endpointForView(), { cache: 'no-store' });
-      const data = await res.json();
-      candidates = Array.isArray(data) ? data : [];
+      let data = null;
+      try { data = await res.json(); } catch (_) { /* non-JSON body — handled below */ }
+      if (!res.ok) {
+        const msg = (data && typeof data === 'object' && data.error) ? data.error : `HTTP ${res.status}`;
+        showListError(`Failed to load ${labelForView()} candidates: ${msg}`);
+        return;
+      }
+      if (!Array.isArray(data)) {
+        showListError(`Failed to load ${labelForView()} candidates: server returned an unexpected (non-list) response.`);
+        return;
+      }
+      listError = null;
+      candidates = data;
+      candidates.forEach(applyWebhookFlag);
       if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
       renderTabs();
       renderList();
@@ -369,6 +428,10 @@
 
     function renderList() {
       listEl.innerHTML = '';
+      if (listError) {
+        listEl.innerHTML = `<div class="empty error">${esc(listError)}</div>`;
+        return;
+      }
       if (!candidates.length) {
         listEl.innerHTML = `<div class="empty">No ${labelForView()} candidates.</div>`;
         return;
@@ -1256,6 +1319,10 @@
     }
 
     function renderDetail() {
+      if (listError) {
+        detailEl.innerHTML = `<div class="empty error">${esc(listError)}</div>`;
+        return;
+      }
       if (!candidates.length) {
         detailEl.innerHTML = `<div class="empty">No ${labelForView()} candidates.</div>`;
         return;
@@ -1441,11 +1508,17 @@
     }
 
     async function postWindow(c, startVal, endVal) {
-      const res = await fetch(`/api/candidates/${c.id}/window`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ start_s: startVal, end_s: endVal }),
-      });
+      let res;
+      try {
+        res = await fetch(`/api/candidates/${c.id}/window`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ start_s: startVal, end_s: endVal }),
+        });
+      } catch (err) {
+        alert(`Failed: ${String(err)}`);
+        return null;
+      }
       if (!res.ok) {
         let body = '';
         try { body = JSON.stringify(await res.json()); } catch (_) {}
@@ -1514,7 +1587,16 @@
         return;
       }
       gen += 1; // invalidate any in-flight poll result
-      const res = await fetch(`/api/candidates/${c.id}/${action}`, { method: 'POST' });
+      let res;
+      try {
+        res = await fetch(`/api/candidates/${c.id}/${action}`, { method: 'POST' });
+      } catch (err) {
+        // F6 fixer: a dead server used to leave this unhandled — the promise
+        // rejected, nothing alerted, and pressing approve/reject/maybe did
+        // nothing the operator could see.
+        alert(`Failed: ${String(err)}`);
+        return;
+      }
       if (!res.ok) {
         let body = '';
         try { body = JSON.stringify(await res.json()); } catch (_) {}
@@ -1522,11 +1604,22 @@
         return;
       }
       delete drafts[c.id];
-      if (action === 'approve' && view === 'pending') {
-        // D-056: an approved card STAYS in pending until the delivery witness
-        // (clips.drive_synced_at) lands — replace it in place with the
-        // server's updated row. The verdict response's webhook outcome badges
-        // the card immediately when delivery will not start on its own.
+      // Post-await: locate by identity, never by the captured idx. -1 means a
+      // poll already removed the card — nothing left to splice/replace.
+      const spliceOut = () => {
+        const j = indexOfRow(c.id);
+        if (j !== -1) {
+          candidates.splice(j, 1);
+          idx = j;
+          if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
+        }
+      };
+      if (action === 'approve') {
+        // The verdict response carries the delivery-webhook outcome for an
+        // approve (D-053/D-056), regardless of which view triggered it. Parse
+        // it here, unconditionally, so approve-from-maybe/rejected does not
+        // discard the outcome just because this view splices the card out —
+        // webhookFlags carries it forward to wherever the card next renders.
         let row = null;
         try { row = await res.json(); } catch (_) {}
         if (!row || typeof row !== 'object' || row.id === null || row.id === undefined) {
@@ -1544,22 +1637,27 @@
         }
         const wh = row.webhook;
         delete row.webhook;
-        if (wh === 'failed' || wh === 'unconfigured') row._webhook = wh;
-        // Post-await: locate by identity, never by the captured idx.
-        const j = indexOfRow(c.id);
-        if (j !== -1) {
-          candidates[j] = row;
-          idx = j;
+        if (wh === 'failed' || wh === 'unconfigured') webhookFlags[row.id] = wh;
+        else delete webhookFlags[row.id];
+        if (view === 'pending') {
+          // D-056: an approved card STAYS in pending until the delivery
+          // witness (clips.drive_synced_at) lands — replace it in place with
+          // the server's updated row.
+          applyWebhookFlag(row);
+          const j = indexOfRow(c.id);
+          if (j !== -1) {
+            candidates[j] = row;
+            idx = j;
+          }
+        } else {
+          // Approved from maybe/rejected: the card leaves THIS view's list.
+          // The outcome just stashed in webhookFlags above is applied by
+          // loadCandidates/pollRefresh whenever the card next appears in the
+          // pending queue.
+          spliceOut();
         }
       } else {
-        // Post-await: locate by identity, never by the captured idx. -1 means
-        // a poll already removed the card — nothing left to splice.
-        const j = indexOfRow(c.id);
-        if (j !== -1) {
-          candidates.splice(j, 1);
-          idx = j;
-          if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
-        }
+        spliceOut();
       }
       renderList();
       renderDetail();
@@ -1616,17 +1714,11 @@
       // The operator acted (verdict/save/reset/tab) while this poll was in
       // flight: discard the stale snapshot; the next tick re-fetches.
       if (myGen !== gen || myView !== view) return;
-      // Carry the local-only webhook flags onto fresh rows — dropped the
-      // moment a clips row appears (delivery has started, flag is stale).
-      const flags = {};
-      for (const c of candidates) {
-        if (c._webhook) flags[c.id] = c._webhook;
-      }
-      for (const r of fresh) {
-        if (flags[r.id] && (r.clip_state === null || r.clip_state === undefined)) {
-          r._webhook = flags[r.id];
-        }
-      }
+      // F6 fixer: apply the SAME persisted webhookFlags store loadCandidates
+      // uses (dropped the moment a clips row appears — delivery has started,
+      // flag is stale) rather than a second carry-forward that only knew
+      // about flags already sitting on THIS view's in-memory rows.
+      fresh.forEach(applyWebhookFlag);
       if (listFingerprint(fresh) === listFingerprint(candidates)) return; // nothing changed
       const selId = candidates.length ? candidates[idx].id : null;
       const selFp = candidates.length ? rowFingerprint(candidates[idx]) : null;
