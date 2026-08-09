@@ -362,6 +362,12 @@ def render_clip(candidate_id: int) -> int:
                     captions_requested = 0,
                     captions_burned = 0,
                     captions_cue_count = NULL,
+                    -- migration 011: a re-render of the SAME candidate bumps
+                    -- the version counter delivered_name() reads to build a
+                    -- distinct Drive filename. A fresh INSERT never reaches
+                    -- this DO UPDATE branch, so it takes the column's own
+                    -- DEFAULT 1 -- unedited.
+                    render_seq = clips.render_seq + 1,
                     -- A RE-RENDER INVALIDATES THE DELIVERY WITNESS (2026-08-08).
                     --
                     -- drive_synced_at is D-056's proof that the bytes in Drive

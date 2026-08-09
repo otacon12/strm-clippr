@@ -38,7 +38,10 @@ Output: $CLPR_RENDER_OUT (default /home/node/.n8n-files, the n8n file-node
 allow-list dir, D-044) / <session_label>_<offset>_<category>_c<candidate_id>.mp4
 (e.g. 2026-08-04_1910_00h14m32s_funny_c109.mp4) — the ONE delivered-clip
 naming convention, built by deliver_approved.delivered_name() and imported
-here rather than reimplemented (D-068, 2026-08-07).
+here rather than reimplemented (D-068, 2026-08-07). A RE-render of the same
+candidate (clips.render_seq > 1, migration 011) appends _r<render_seq>
+before the extension, e.g. ..._c109_r2.mp4 — see delivered_name()'s
+docstring and the render_seq lookup below.
 
 D-063 BURNED-IN SPEECH CAPTIONS (2026-08-07 ruling: "C" — on demand, a UI
 option while approving). When clip_candidates.burn_captions = 1 this render
@@ -1101,9 +1104,36 @@ def render_from_slice(candidate_id: int) -> int:
                 f'offset_s={offset_s:.3f} end_in_slice_s={end_in_slice_s:.3f}'
             )
 
+        # migration 011 (versioned re-renders): the NEXT render_seq must be
+        # known BEFORE the encode starts, unlike cut_clip.py and
+        # deliver_approved.render_adjusted_clip -- their LOCAL out_path
+        # (clips_out/<recording_id>_<candidate_id>.mp4) never depended on
+        # render_seq at all (D-068: "the local file in clips_out keeps its
+        # existing name"), so they can bump the column via a plain
+        # `clips.render_seq + 1` in their end-of-render upsert and let
+        # deliver_approved.py's LATER, separate sync step read the fresh
+        # value back (refresh_clip_fields, a genuine follow-up SELECT in a
+        # different transaction). Here, out_path itself (this worker's
+        # out_path IS the delivered name, D-068) drives the temp file's
+        # prefix and the ffmpeg output before any DB write happens, so
+        # there is no later point at which a RETURNING/follow-up SELECT
+        # could still change the filename. A plain pre-encode SELECT (not a
+        # bump -- nothing is written yet) is therefore the correct order
+        # here: read the CURRENT value, if any, and add 1; a candidate with
+        # no clips row yet (never rendered) has no row to read, so seq is 1,
+        # matching the column's own DEFAULT that a fresh INSERT would take
+        # below. The literal value computed here is passed explicitly into
+        # the end-of-render upsert's render_seq column (not re-derived via
+        # `clips.render_seq + 1` a second time), so the filename actually
+        # written to disk and the DB's record of it can never disagree.
+        cur.execute('SELECT render_seq FROM clips WHERE candidate_id = %s', (candidate_id,))
+        render_seq_row = cur.fetchone()
+        next_render_seq = int(render_seq_row[0]) + 1 if render_seq_row is not None else 1
+
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / deliver_approved.delivered_name(
-            cand['session_label'], cand['start_s'], cand['category'], candidate_id
+            cand['session_label'], cand['start_s'], cand['category'], candidate_id,
+            next_render_seq,
         )
 
         # `filter_stages` starts as ONLY the D-023 body (no label). Copied
@@ -1273,8 +1303,8 @@ def render_from_slice(candidate_id: int) -> int:
             cur.execute(
                 '''
                 INSERT INTO clips(candidate_id, file_path, duration_s, state, created_by_run, created_at,
-                                  captions_requested, captions_burned, captions_cue_count)
-                VALUES (%s, %s, %s, 'rendered', %s, %s, %s, %s, %s)
+                                  captions_requested, captions_burned, captions_cue_count, render_seq)
+                VALUES (%s, %s, %s, 'rendered', %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (candidate_id) DO UPDATE SET
                     file_path = EXCLUDED.file_path,
                     duration_s = EXCLUDED.duration_s,
@@ -1284,6 +1314,12 @@ def render_from_slice(candidate_id: int) -> int:
                     captions_requested = EXCLUDED.captions_requested,
                     captions_burned = EXCLUDED.captions_burned,
                     captions_cue_count = EXCLUDED.captions_cue_count,
+                    -- migration 011: EXCLUDED.render_seq is the SAME
+                    -- next_render_seq value already baked into out_path
+                    -- above (a literal, not a second `clips.render_seq + 1`
+                    -- computation), so the filename on disk and the DB's
+                    -- record of it can never disagree.
+                    render_seq = EXCLUDED.render_seq,
                     -- A RE-RENDER INVALIDATES THE DELIVERY WITNESS (2026-08-08).
                     --
                     -- drive_synced_at is D-056's proof that the bytes in Drive
@@ -1303,7 +1339,7 @@ def render_from_slice(candidate_id: int) -> int:
                     drive_sync_path = NULL
                 ''',
                 (candidate_id, str(out_path), duration_s, run_id, utc_now_iso(),
-                 captions_requested, captions_burned, captions_cue_count),
+                 captions_requested, captions_burned, captions_cue_count, next_render_seq),
             )
             conn.commit()
 
