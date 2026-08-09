@@ -784,9 +784,6 @@ def render_from_slice(candidate_id: int) -> int:
             cand['session_label'], cand['start_s'], cand['category'], candidate_id
         )
 
-        if out_path.exists():
-            out_path.unlink()
-
         # Copied EXACTLY from cut_clip.py (operator-proven live on Instagram, D-023).
         filter_complex = FILTER_COMPLEX_D023
 
@@ -835,6 +832,21 @@ def render_from_slice(candidate_id: int) -> int:
         # rendering it whole would ship a ~20s-too-long clip. The trim is
         # INPUT options (-ss/-t before -i); filter/encode flags stay
         # byte-identical to cut_clip.py.
+        #
+        # B6 fixer: ffmpeg writes to a unique temp file in the SAME directory
+        # as out_path (mkstemp, dir=out_dir), never to out_path directly. Two
+        # concurrent renders of the same candidate each get their own temp
+        # file and no longer race on one shared path; a render that fails
+        # (capability check, caption build, or the ffmpeg process itself) can
+        # never destroy a previous good render sitting at out_path, because
+        # out_path is never opened for writing until the NEW encode has
+        # already succeeded (see the os.replace below).
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=f'{out_path.name}.', suffix='.part', dir=str(out_dir)
+        )
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
+
         ffmpeg_cmd = [
             'ffmpeg',
             '-y',
@@ -853,12 +865,19 @@ def render_from_slice(candidate_id: int) -> int:
             '-c:a', 'aac',
             '-b:a', '192k',
             '-movflags', '+faststart',
-            str(out_path),
+            str(tmp_path),
         ]
 
         try:
             ffmpeg_proc = run_capture(ffmpeg_cmd)
             print(f'FFMPEG_EXIT_CODE {ffmpeg_proc.returncode}')
+
+            # The encode succeeded (run_capture raises on a nonzero ffmpeg
+            # exit, caught below) -- promote the temp file to out_path. Same
+            # filesystem (both under out_dir), so this is an atomic rename:
+            # out_path is either the complete old file or the complete new
+            # one, never a truncated write-in-progress, at every instant.
+            os.replace(tmp_path, out_path)
 
             duration_s = measure_duration_s(out_path)
 
@@ -913,8 +932,15 @@ def render_from_slice(candidate_id: int) -> int:
             )
             return 0
         except Exception:
-            if out_path.exists():
-                out_path.unlink()
+            # B6 fixer: clean up only the TEMP file, never out_path. Before
+            # the os.replace above, out_path is untouched (the previous good
+            # render, if any, survives); after it, out_path IS the new,
+            # complete, correct render and tmp_path no longer exists (the
+            # rename consumed it), so this is a no-op for a post-replace
+            # failure (duration probe / DB write) -- exactly "on failure,
+            # remove only the temp".
+            if tmp_path.exists():
+                tmp_path.unlink()
             raise
     except Exception:
         conn.rollback()

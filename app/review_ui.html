@@ -224,6 +224,13 @@
     // D-056: mutation generation — bumped by every user-driven mutation so an
     // in-flight background poll can never clobber what the operator just did.
     let gen = 0;
+    // B6 fixer: true for the entire span of one decide() call (set before the
+    // fetch, cleared in its finally). A second decide() invocation while one
+    // is already in flight — a fast double-click, or a held key repeating
+    // faster than the network round trip — returns immediately instead of
+    // firing a second verdict request. updateVerdictLock() folds this into
+    // the same disabled-button computation the unsaved/approved locks use.
+    let decideInFlight = false;
     // D-055: local (unsaved) window edits, keyed by candidate id: {start, end}.
     // A draft exists only while nudged-but-not-saved; Save/Reset clears it.
     const drafts = {};
@@ -1447,8 +1454,11 @@
       // D-056: approved (awaiting-delivery) cards are verdict-locked too —
       // approved is terminal (D-050), the delivery badge explains why. The
       // "save or reset" hint shows only for the unsaved-edit lock.
+      // B6 fixer: decideInFlight locks the same buttons for the span of one
+      // in-flight verdict request — no dedicated hint text (the lock clears
+      // the moment the response lands, too brief to explain).
       const unsaved = hasUnsaved(c);
-      const locked = unsaved || c.state === 'approved';
+      const locked = unsaved || c.state === 'approved' || decideInFlight;
       for (const id of ['btnApprove', 'btnReject', 'btnMaybe']) {
         const b = document.getElementById(id);
         if (b) b.disabled = locked;
@@ -1567,6 +1577,12 @@
 
     async function decide(action) {
       if (!candidates.length) return;
+      // B6 fixer: a decide() already in flight owns the verdict buttons —
+      // a second invocation (fast double-click, or a key held down faster
+      // than the network round trip) returns immediately rather than firing
+      // a second request. Checked before the pendingIntentSave await too, so
+      // a rapid double-invoke can never both reach the fetch below.
+      if (decideInFlight) return;
       // D-063 fixer: let any in-flight captions toggle land first, so the
       // verdict (and the delivery webhook it fires) always sees the flag the
       // operator just set. The rejection is swallowed on purpose: setCaptions
@@ -1589,80 +1605,98 @@
         return;
       }
       gen += 1; // invalidate any in-flight poll result
-      let res;
+      // B6 fixer: set before the fetch, cleared in finally below — the entire
+      // rest of this function (including every early-return branch) runs with
+      // the verdict buttons disabled, and updateVerdictLock() re-evaluates
+      // them (folding decideInFlight back in) the moment it clears.
+      decideInFlight = true;
+      updateVerdictLock(c);
       try {
-        res = await fetch(`/api/candidates/${c.id}/${action}`, { method: 'POST' });
-      } catch (err) {
-        // F6 fixer: a dead server used to leave this unhandled — the promise
-        // rejected, nothing alerted, and pressing approve/reject/maybe did
-        // nothing the operator could see.
-        alert(`Failed: ${String(err)}`);
-        return;
-      }
-      if (!res.ok) {
-        let body = '';
-        try { body = JSON.stringify(await res.json()); } catch (_) {}
-        alert(`Failed: ${res.status} ${body}`);
-        return;
-      }
-      delete drafts[c.id];
-      // Post-await: locate by identity, never by the captured idx. -1 means a
-      // poll already removed the card — nothing left to splice/replace.
-      const spliceOut = () => {
-        const j = indexOfRow(c.id);
-        if (j !== -1) {
-          candidates.splice(j, 1);
-          idx = j;
-          if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
-        }
-      };
-      if (action === 'approve') {
-        // The verdict response carries the delivery-webhook outcome for an
-        // approve (D-053/D-056), regardless of which view triggered it. Parse
-        // it here, unconditionally, so approve-from-maybe/rejected does not
-        // discard the outcome just because this view splices the card out —
-        // webhookFlags carries it forward to wherever the card next renders.
-        let row = null;
-        try { row = await res.json(); } catch (_) {}
-        if (!row || typeof row !== 'object' || row.id === null || row.id === undefined) {
-          // D-056 fixer: the verdict LANDED (res.ok) but its body did not
-          // parse. Falling back to the stale pre-verdict object left the card
-          // rendering as state 'candidate' — editable, verdict buttons live —
-          // until the next poll, i.e. the UI showing a candidate the server
-          // has already approved. Re-fetch the queue for the server's truth
-          // instead of trusting the object we held before the POST.
-          gen += 1;
-          await loadCandidates().catch((err) => {
-            detailEl.innerHTML = `<pre>Failed to load candidates: ${String(err)}</pre>`;
-          });
+        let res;
+        try {
+          res = await fetch(`/api/candidates/${c.id}/${action}`, { method: 'POST' });
+        } catch (err) {
+          // F6 fixer: a dead server used to leave this unhandled — the promise
+          // rejected, nothing alerted, and pressing approve/reject/maybe did
+          // nothing the operator could see.
+          alert(`Failed: ${String(err)}`);
           return;
         }
-        const wh = row.webhook;
-        delete row.webhook;
-        if (wh === 'failed' || wh === 'unconfigured') webhookFlags[row.id] = wh;
-        else delete webhookFlags[row.id];
-        if (view === 'pending') {
-          // D-056: an approved card STAYS in pending until the delivery
-          // witness (clips.drive_synced_at) lands — replace it in place with
-          // the server's updated row.
-          applyWebhookFlag(row);
+        if (!res.ok) {
+          let body = '';
+          try { body = JSON.stringify(await res.json()); } catch (_) {}
+          alert(`Failed: ${res.status} ${body}`);
+          return;
+        }
+        delete drafts[c.id];
+        // Post-await: locate by identity, never by the captured idx. -1 means a
+        // poll already removed the card — nothing left to splice/replace.
+        const spliceOut = () => {
           const j = indexOfRow(c.id);
           if (j !== -1) {
-            candidates[j] = row;
+            candidates.splice(j, 1);
             idx = j;
+            if (idx >= candidates.length) idx = Math.max(0, candidates.length - 1);
+          }
+        };
+        if (action === 'approve') {
+          // The verdict response carries the delivery-webhook outcome for an
+          // approve (D-053/D-056), regardless of which view triggered it. Parse
+          // it here, unconditionally, so approve-from-maybe/rejected does not
+          // discard the outcome just because this view splices the card out —
+          // webhookFlags carries it forward to wherever the card next renders.
+          let row = null;
+          try { row = await res.json(); } catch (_) {}
+          if (!row || typeof row !== 'object' || row.id === null || row.id === undefined) {
+            // D-056 fixer: the verdict LANDED (res.ok) but its body did not
+            // parse. Falling back to the stale pre-verdict object left the card
+            // rendering as state 'candidate' — editable, verdict buttons live —
+            // until the next poll, i.e. the UI showing a candidate the server
+            // has already approved. Re-fetch the queue for the server's truth
+            // instead of trusting the object we held before the POST.
+            gen += 1;
+            await loadCandidates().catch((err) => {
+              detailEl.innerHTML = `<pre>Failed to load candidates: ${String(err)}</pre>`;
+            });
+            return;
+          }
+          const wh = row.webhook;
+          delete row.webhook;
+          if (wh === 'failed' || wh === 'unconfigured') webhookFlags[row.id] = wh;
+          else delete webhookFlags[row.id];
+          if (view === 'pending') {
+            // D-056: an approved card STAYS in pending until the delivery
+            // witness (clips.drive_synced_at) lands — replace it in place with
+            // the server's updated row.
+            applyWebhookFlag(row);
+            const j = indexOfRow(c.id);
+            if (j !== -1) {
+              candidates[j] = row;
+              idx = j;
+            }
+          } else {
+            // Approved from maybe/rejected: the card leaves THIS view's list.
+            // The outcome just stashed in webhookFlags above is applied by
+            // loadCandidates/pollRefresh whenever the card next appears in the
+            // pending queue.
+            spliceOut();
           }
         } else {
-          // Approved from maybe/rejected: the card leaves THIS view's list.
-          // The outcome just stashed in webhookFlags above is applied by
-          // loadCandidates/pollRefresh whenever the card next appears in the
-          // pending queue.
           spliceOut();
         }
-      } else {
-        spliceOut();
+        renderList();
+        renderDetail();
+      } finally {
+        // B6 fixer: cleared here on every exit path — success, an alerted
+        // failure, or the D-056 fixer's early return after a re-fetch. If
+        // renderDetail() ran above it already built fresh buttons (locked,
+        // since decideInFlight was still true at that point); re-apply the
+        // lock for whichever candidate is now selected so it reflects the
+        // flag's TRUE post-decide value.
+        decideInFlight = false;
+        const cur = candidates.length ? candidates[idx] : null;
+        if (cur) updateVerdictLock(cur);
       }
-      renderList();
-      renderDetail();
     }
 
     function move(delta) {
@@ -1762,6 +1796,14 @@
 
     document.addEventListener('keydown', (e) => {
       if (typingInField(e)) return;
+      // B6 fixer: a held key fires a stream of keydown events with e.repeat
+      // true after the first — an operator holding "a" a beat too long used
+      // to queue up repeat approve keystrokes. decideInFlight (above) already
+      // blocks a second in-flight verdict request, but a repeat firing AFTER
+      // the first request has already completed is a second, fully separate
+      // decide() call; reject every repeat here so a held key never acts more
+      // than once, for any shortcut.
+      if (e.repeat) return;
       if (e.key === 'ArrowDown' || e.key === 'j') {
         e.preventDefault();
         move(1);
