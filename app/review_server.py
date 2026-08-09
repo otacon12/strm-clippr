@@ -29,13 +29,22 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import psycopg2
 import psycopg2.extras
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'workers'))
 import db  # noqa: E402  (app/workers/db.py — the shared adapter)
+# GET /api/candidates/<id>/cues (reactive-editor live preview): these are the
+# REAL functions build_srt.py already uses to turn transcript segments into
+# cues, imported rather than reimplemented, so the pending-screen preview and
+# the eventual burn can never disagree about the boundary rule (charter 1.5
+# gate 1 — one truth). See _serve_cues's own docstring for how this differs
+# from _serve_captions's "does not build the SRT" rule just below.
+import build_srt  # noqa: E402  (app/workers/build_srt.py)
+import slice_geometry  # noqa: E402  (app/workers/slice_geometry.py)
+import transcript_signal as ts  # noqa: E402  (app/workers/transcript_signal.py)
 
 # CLPR_BIND overrides the bind address; unset/default behavior (loopback-only)
 # is unchanged. The UI has no auth, so binding anything other than 127.0.0.1
@@ -344,6 +353,10 @@ POST_SUBJECT_RE = re.compile(r'^/api/recordings/(\d+)/subject$')
 GET_KITS_RE = re.compile(r'^/api/candidates/(\d+)/kits$')
 GET_CAPTIONS_RE = re.compile(r'^/api/candidates/(\d+)/captions$')
 GET_CAPTIONS_SRT_RE = re.compile(r'^/api/candidates/(\d+)/captions\.srt$')
+# Reactive editor (2026-08-09 operator ask): live caption cues for the pending
+# screen's overlay preview. Its own route, same reason as every other one
+# here: a typo must 404, never fall through into a verdict.
+GET_CUES_RE = re.compile(r'^/api/candidates/(\d+)/cues$')
 GET_CLIP_MEDIA_RE = re.compile(r'^/clipmedia/(\d+)$')
 
 # One truth for the candidate payload columns (list endpoints AND the window
@@ -1453,6 +1466,146 @@ class ReviewHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _serve_cues(self, candidate_id: int, query: dict) -> None:
+        """GET /api/candidates/<id>/cues -- LIVE preview cues for the pending
+        screen's reactive editor (2026-08-09 operator ask), in ABSOLUTE
+        (recording-relative) seconds -- the same domain as c.start_s/end_s
+        and playerToAbs()/absToPlayer() in review_ui.html, NOT the
+        clip-relative 0-based domain build_srt.py's own SRT output uses.
+
+        THIS DOES NOT CONTRADICT _serve_captions's 'THIS SERVER DOES NOT
+        BUILD THE SRT' rule just above -- that rule is about never RE-DERIVING
+        the stored, versioned kit product build_srt.py already computed for a
+        RENDERED clip (a second implementation would be a second truth).
+        There is no stored product here to disagree with: this candidate has
+        no clips row yet (see the !hasClip gate in review_ui.html's
+        wireSlider -- a candidate with a real rendered clip does not reach
+        this code path from the UI), and the whole point of a reactive
+        preview is to recompute on every unsaved trim edit, before a kit
+        (or even a render) exists. So this calls build_srt's OWN functions
+        (rebase_segments, its MIN_CUE_S/MIN_SEGMENT_OVERLAP_S boundary rule)
+        rather than reimplementing them -- one truth preserved, not broken.
+
+        Geometry: the 'formula' basis every renderer converges to before a
+        renderer-specific witness exists (slice_geometry.effective_window +
+        render_pad_s, clamped to the recording's own duration) -- because a
+        pending candidate never has a clips row, so build_srt's
+        renderer-witness path (basis_for_run/resolve_clip_zero, which
+        requires one) does not apply and is not called here.
+
+        Query params start=/end= (both required together, floats): the UI's
+        UNSAVED draft trim window, so cues react before Save. Passing them is
+        itself the "operator edit" signal slice_geometry.render_pad_s() keys
+        on, so the pad is 0.0 whenever they are present -- identical to the
+        rule an actual saved adjusted_start_s/adjusted_end_s would trigger.
+        """
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            cur.execute(
+                '''
+                SELECT c.recording_id, c.start_s, c.end_s,
+                       c.adjusted_start_s, c.adjusted_end_s,
+                       r.duration_s
+                FROM clip_candidates c
+                JOIN recordings r ON r.id = c.recording_id
+                WHERE c.id = %s
+                ''',
+                (candidate_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND, {'error': f'candidate not found: {candidate_id}'}
+                )
+                return
+            rec_dur = row['duration_s']
+            if rec_dur is None:
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {'error': f'recording_id={row["recording_id"]} has no duration_s yet, '
+                              'so the preview window cannot be clamped'},
+                )
+                return
+            rec_dur = float(rec_dur)
+
+            raw_start = query.get('start', [None])[0]
+            raw_end = query.get('end', [None])[0]
+            if (raw_start is None) != (raw_end is None):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {'error': 'start and end must be given together, or neither'},
+                )
+                return
+
+            if raw_start is not None:
+                try:
+                    draft_start = float(raw_start)
+                    draft_end = float(raw_end)
+                except ValueError:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {'error': 'start and end must be finite numbers'},
+                    )
+                    return
+                if not (math.isfinite(draft_start) and math.isfinite(draft_end)):
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {'error': 'start and end must be finite numbers'},
+                    )
+                    return
+                eff_start = ts.clamp(draft_start, 0.0, rec_dur)
+                eff_end = ts.clamp(draft_end, 0.0, rec_dur)
+                if eff_end <= eff_start:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {'error': 'end must be after start once clamped to the recording',
+                         'start': eff_start, 'end': eff_end},
+                    )
+                    return
+                # An explicit draft window IS the operator-edit signal
+                # render_pad_s() keys on (see the docstring above) -- 0.0 pad,
+                # matching what saving this draft as adjusted_*_s would do.
+                pad = 0.0
+            else:
+                eff_start, eff_end = slice_geometry.effective_window(
+                    row['start_s'], row['end_s'],
+                    row['adjusted_start_s'], row['adjusted_end_s'],
+                )
+                pad = slice_geometry.render_pad_s(row['adjusted_start_s'], row['adjusted_end_s'])
+
+            t0 = ts.clamp(eff_start - pad, 0.0, rec_dur)
+            t1 = ts.clamp(eff_end + pad, 0.0, rec_dur)
+            duration = t1 - t0
+            if duration <= 0:
+                self._send_json(HTTPStatus.OK, [])
+                return
+
+            # transcript_signal.fetch_segments unpacks each row as a plain
+            # (start_s, end_s, text) TUPLE -- the shape every build_srt.py
+            # caller passes it (conn.cursor(), never a RealDictCursor). A
+            # dict_cursor row here would iterate its KEYS on unpack, not its
+            # values (measured: 'could not convert string to float: '
+            # 'start_s'' the one time this used `cur` directly), so this
+            # reuses the real function against the cursor shape it actually
+            # expects rather than adapting the function to a dict row.
+            plain_cur = conn.cursor()
+            segments = ts.fetch_segments(plain_cur, int(row['recording_id']))
+        finally:
+            conn.close()
+
+        window_segments = ts.transcript_slice_for_window(segments, t0, t1)
+        # The REAL build_srt functions -- rebase_segments returns
+        # clip-relative (0-based) cues, clamped/filtered per its own
+        # MIN_SEGMENT_OVERLAP_S/MIN_CUE_S boundary rule; t0 is added back
+        # here ONLY to translate the coordinate origin back to ABSOLUTE
+        # (recording) seconds for the UI's playerToAbs() domain -- the
+        # boundary/clamp logic itself is never reimplemented.
+        rel_cues = build_srt.rebase_segments(window_segments, t0, duration)
+        cues = [{'start': t0 + s, 'end': t0 + e, 'text': text} for s, e, text in rel_cues]
+
+        self._send_json(HTTPStatus.OK, cues)
+
     def _serve_profile(self) -> None:
         conn = db.connect()
         try:
@@ -2373,6 +2526,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
         m = GET_CAPTIONS_RE.match(path)
         if m:
             self._serve_captions(int(m.group(1)), as_file=False)
+            return
+        m = GET_CUES_RE.match(path)
+        if m:
+            self._serve_cues(int(m.group(1)), parse_qs(parsed.query))
             return
         m = GET_CLIP_MEDIA_RE.match(path)
         if m:
