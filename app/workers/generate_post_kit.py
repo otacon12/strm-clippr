@@ -78,6 +78,15 @@ producing kit 32. The writer samples at temperature 0.7, so whether it emits
 every required key is a draw from a distribution, not a property of the clip.
 See MalformedWriterResponseError.
 
+THE TWO RETRIES COMPOUND (fixed 2026-08-08, golden-review F12/MK-04). An
+invented quote on the primary ask followed by a structurally incomplete
+no-quote rewrite is a measured real sequence (candidate 45's invented quotes,
+candidate 1's structural wobble, on the same run). The no-quote rewrite gets
+its OWN bounded structural retry, identical in shape and cap to the primary
+ask's, so a wobble on the rewrite does not burn the whole kit after the vision
+call is already paid. A transport fault or a second invented quote on the
+rewrite still exits immediately, exactly as before this fix.
+
 THE PAYLOAD CEILING, CHECKED BEFORE SENDING (D-064). OpenRouter sits behind
 Cloudflare, whose standard maximum request body is 100 MB, and base64 inflates a
 file by 4/3. Measured 2026-08-07 against the live API: a 4.7 MB clip made a
@@ -2472,8 +2481,11 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
     # writer still fails loudly rather than looping forever. Caught BY TYPE,
     # never by matching message text (charter gate 10), so a reworded
     # MALFORMED_WRITER_RESPONSE message can never silently widen the retry to
-    # cover a real defect. The InventedQuoteError fallback nested below is
-    # UNCHANGED: it still fires on its own type, independently of this loop.
+    # cover a real defect. The InventedQuoteError fallback nested below fires
+    # on its own type, independently of THIS loop -- but the no-quote rewrite
+    # it sends carries its OWN structural retry loop, same cap, same reason
+    # (golden-review F12/MK-04, 2026-08-08): see the comment at the rewrite
+    # call site for why that had to be added separately.
     structural_max_attempts = max(1, int(_env_number(
         'CLPR_WRITER_STRUCTURAL_MAX_ATTEMPTS', WRITER_STRUCTURAL_MAX_ATTEMPTS)))
 
@@ -2515,7 +2527,8 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
             quote_fallback_reason = str(first_exc)
             print(
                 f'QUOTE_FALLBACK candidate={candidate_id} the writer fabricated a quotation, so it '
-                'is being re-asked ONCE for copy with no quoted line. The vision call is NOT '
+                'is being re-asked for copy with no quoted line (bounded structural retry applies '
+                'to this rewrite too, same cap as the primary ask). The vision call is NOT '
                 f'repeated. First failure (verbatim): {first_exc}'
             )
             # THE RETRY CALL IS INSIDE THIS try, NOT ABOVE IT, AND THAT PLACEMENT IS
@@ -2526,12 +2539,54 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
             # learn that a quotation had been fabricated at all. The fabrication is
             # the fact worth keeping. Both failures travel together or the record is
             # a half-truth.
+            # THE REWRITE'S OWN STRUCTURAL LOOP (golden-review F12/MK-04, fixed
+            # 2026-08-08). D-072's structural retry lives OUTSIDE this whole
+            # InventedQuoteError handler (it wraps the PRIMARY ask, above), so
+            # without this inner loop a MalformedWriterResponseError raised by
+            # the no-quote rewrite would be caught by the bare `except Exception
+            # as second_exc` below and re-raised as a plain RuntimeError -- an
+            # exception raised INSIDE an except handler propagates out of the
+            # WHOLE try, so the sibling `except MalformedWriterResponseError`
+            # around the primary ask never sees it and none of the 3 structural
+            # retries fire on the rewrite. Measured: invented quote on attempt 1
+            # + a structurally-incomplete rewrite produced writer calls made=2,
+            # escaped type=RuntimeError, zero structural retries. This loop
+            # gives the rewrite the SAME bounded structural retry the primary
+            # ask already has, for the SAME reason (MalformedWriterResponseError
+            # is a measured sampling wobble, not a defect) -- and this is
+            # exactly the path where the expensive vision call is already paid,
+            # so paying for it twice over a wobble is the worst place to skip
+            # the retry.
+            #
+            # SCOPED NARROWLY: only MalformedWriterResponseError loops here. A
+            # transport fault (anything else openrouter_call can raise) exits
+            # this loop immediately via the outer try below, unchanged from
+            # before. A SECOND InventedQuoteError -- the model quoting again
+            # despite forbid_quotes -- is also NOT caught here, so it too exits
+            # immediately: dropping quotes was already asked once, asking
+            # identically again is the pay-twice case D-072's own reasoning
+            # warns about.
             try:
-                writer_response, writer_text = openrouter_call(
-                    'writer_no_quote', 'POST', chat_url, api_key, writer_payload(True),
-                    WRITER_TIMEOUT_S, expect_message=True)
-                writer_generation_id = str(writer_response.get('id') or '')
-                kit = validate_kit(writer_text, transcript_plain)
+                for no_quote_attempt in range(1, structural_max_attempts + 1):
+                    writer_response, writer_text = openrouter_call(
+                        'writer_no_quote', 'POST', chat_url, api_key, writer_payload(True),
+                        WRITER_TIMEOUT_S, expect_message=True)
+                    writer_generation_id = str(writer_response.get('id') or '')
+                    try:
+                        kit = validate_kit(writer_text, transcript_plain)
+                        break
+                    except MalformedWriterResponseError as no_quote_structural_exc:
+                        if no_quote_attempt >= structural_max_attempts:
+                            raise
+                        print(
+                            f'WRITER_NO_QUOTE_STRUCTURAL_RETRY candidate={candidate_id} '
+                            f'attempt={no_quote_attempt}/{structural_max_attempts} re-asking the '
+                            'SAME no-quote payload -- structural incompleteness was measured to be '
+                            'a sampling wobble on the primary ask (see '
+                            'MalformedWriterResponseError\'s docstring) and the same reasoning '
+                            f'applies to its rewrite. Verbatim reason: {no_quote_structural_exc}'
+                        )
+                        continue
             except Exception as second_exc:
                 # Deliberately NOT "also failed validation": the second failure may
                 # now be a transport fault, and naming it as a validation failure
