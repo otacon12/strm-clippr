@@ -116,6 +116,15 @@
     .tab { background: transparent; color: var(--muted); border: 0; padding: 7px 14px; border-radius: var(--radius-pill); }
     .tab.active { background: var(--pop); color: #1A0900; }
     .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
+
+    /* ---- Find clips: the one global action, header area (visible from
+       every view, every tab). Primary accent -- the single #FF5C00 pop
+       earns its place here (operator ask, 2026-08-09: "the button to find
+       clips should actually live on the reviewer"). Same accent treatment
+       as .savewin, its own class since the semantics differ. ---- */
+    .findclips-row { margin: 12px 0 0; }
+    .findclips { background: var(--pop); color: #1A0900; width: 100%; }
+    .findclips:hover:not(:disabled) { background: var(--pop-deep); }
     a.linklike, button.linklike { background: transparent; color: var(--pop); padding: 0; font-weight: 600;
       text-decoration: underline; text-underline-offset: 2px; }
 
@@ -491,6 +500,9 @@
           <button id="tabRejected" class="tab">Rejected</button>
           <button id="tabDelivered" class="tab">Post kit</button>
         </div>
+        <div class="findclips-row">
+          <button id="findClipsBtn" class="findclips" type="button">Find clips</button>
+        </div>
         <div class="kbd">j/k or arrows move<span class="kbdchip">J K</span> &middot; approve<span class="kbdchip">A</span> &middot; reject, not in Rejected<span class="kbdchip">R</span> &middot; maybe, Pending/Rejected<span class="kbdchip">M</span> &middot; toggle Rejected<span class="kbdchip">X</span> &middot; set in/out at the playhead<span class="kbdchip">I</span><span class="kbdchip">O</span><br />Keys are inert while typing in a field.</div>
       </div>
       <div id="list" class="list"></div>
@@ -557,6 +569,7 @@
     const tabMaybeEl = document.getElementById('tabMaybe');
     const tabRejectedEl = document.getElementById('tabRejected');
     const tabDeliveredEl = document.getElementById('tabDelivered');
+    const findClipsBtnEl = document.getElementById('findClipsBtn');
 
     // D-061 post kit state.
     // kitDrafts: unsaved operator edits, keyed by candidate id. Same discipline
@@ -1900,6 +1913,42 @@
         btn.disabled = false; btn.textContent = label;
       }
     }
+
+    // Find clips: the one global action in the header (operator ask,
+    // 2026-08-09: "the button to find clips should actually live on the
+    // reviewer"). findClipsInFlight guards a fast double-click the same
+    // shape as decide()'s decideInFlight above -- the button is also
+    // disabled for the span of the call, so this is a backstop, not the
+    // only guard. The server holds its own lock too (_find_clips_lock in
+    // review_server.py) and refuses an overlapping run loudly (409); that
+    // is the real backstop against a stacked run, this is just the client
+    // avoiding the round trip on the common case.
+    let findClipsInFlight = false;
+    async function findClips() {
+      if (findClipsInFlight) return;
+      findClipsInFlight = true;
+      const label = findClipsBtnEl.textContent;
+      findClipsBtnEl.disabled = true;
+      findClipsBtnEl.textContent = 'Starting run';
+      try {
+        const res = await fetch('/api/find-clips', { method: 'POST' });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok || !j.started) {
+          notify('Could not start the find-clips run.', { technical: String(j.error || res.status) });
+          return;
+        }
+        notify('Run started. New clips will appear in Pending when the run completes.',
+          { kind: 'info' });
+      } catch (e) {
+        notify('Could not start the find-clips run. Check your connection and try again.',
+          { technical: String(e) });
+      } finally {
+        findClipsInFlight = false;
+        findClipsBtnEl.disabled = false;
+        findClipsBtnEl.textContent = label;
+      }
+    }
+    findClipsBtnEl.onclick = () => findClips();
 
     async function requestRegenerate(c) {
       if (kitHasUnsaved(c)) {
