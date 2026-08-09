@@ -958,9 +958,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
         The row count is asserted against an INDEPENDENT count over the same
         predicate. A LEFT JOIN that fanned out would inflate this query and
         leave the plain count alone, and a silent duplicate would mean the
-        operator edits one copy of a kit while looking at another."""
+        operator edits one copy of a kit while looking at another.
+
+        Both reads are taken in ONE REPEATABLE READ snapshot. Under READ
+        COMMITTED (the default) each statement gets its own snapshot, so a
+        BENIGN concurrent write -- `Mark Delivered` landing between the two
+        SELECTs -- could move the plain count without moving the joined
+        query (or vice versa) and trip this guard on nothing wrong at all.
+        Pinning both reads to one snapshot means a mismatch can only mean
+        the join itself actually fanned out or dropped a row."""
         conn = db.connect()
         try:
+            conn.set_session(isolation_level='REPEATABLE READ', readonly=True)
             cur = dict_cursor(conn)
             cur.execute(
                 f'''
@@ -979,10 +988,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
 
         if len(rows) != expected:
+            # Same guard, opposite failure modes: too MANY rows is the LEFT
+            # JOIN fanning out (more than one kit/context/request row per
+            # candidate); too FEW is the join silently dropping a delivered
+            # clip (a missing join match). Collapsing them into one message
+            # pointed the operator at the wrong bug.
+            kind = 'fanned out' if len(rows) > expected else 'missing join'
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {
-                    'error': 'delivered query fanned out',
+                    'error': f'delivered query {kind}',
                     'rows': len(rows),
                     'delivered_clips': expected,
                 },
@@ -1462,12 +1477,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
         post-kit COPY, never the video) re-render. The operator's decision was
         being stored and ignored, which is worse than refusing it.
 
-        WHAT IT DOES, and what it deliberately does not. It clears the D-056
-        delivery witness and re-fires the verdict webhook, which re-runs the
-        SAME approved chain (render -> upload -> mark delivered) rather than
-        introducing a second rendering path that could drift from it. Clearing
-        the witness first is what re-opens the clip: the pending queue is
-        `state='approved' AND drive_synced_at IS NULL`.
+        WHAT IT DOES, and what it deliberately does not. It re-fires the
+        verdict webhook, which re-runs the SAME approved chain (render ->
+        upload -> mark delivered) rather than introducing a second rendering
+        path that could drift from it, and clears the D-056 delivery witness
+        ONLY once that webhook comes back 'ok'. The witness-clear is what
+        re-opens the clip: the pending queue is `state='approved' AND
+        drive_synced_at IS NULL`. Firing before clearing means a webhook
+        failure leaves the DB untouched -- n8n re-renders from the DB, so
+        firing again on retry is safe -- rather than clearing the witness for
+        a chain that never ran and stranding the clip: badged for an upload
+        nothing will start, while the review UI reports "queued".
 
         It refuses on a candidate that is not approved -- there is nothing to
         re-render -- and it refuses when the webhook is unconfigured rather than
@@ -1507,6 +1527,30 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return
 
             previous_drive_name = row['drive_sync_path']
+            recording_id = row['recording_id']
+            burn = row['burn_captions']
+        finally:
+            conn.close()
+
+        # Fire FIRST. Only on 'ok' do we touch the DB -- clearing the witness
+        # for a webhook that did not run would strand the clip: it drops out
+        # of the pending queue with nothing left to actually re-render it.
+        hook = fire_verdict_webhook(candidate_id, recording_id, 'approved', 'approved')
+        if hook != 'ok':
+            self._send_json(HTTPStatus.BAD_GATEWAY, {
+                'candidate_id': candidate_id,
+                'rerender': 'failed',
+                'webhook': hook,
+                'error': f'The re-render webhook did not succeed (webhook={hook}). Nothing '
+                         'changed: the delivery witness was NOT cleared, the clip is still '
+                         'recorded as delivered, and no re-render was started. Retry once the '
+                         'webhook endpoint is reachable.',
+            })
+            return
+
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
             cur.execute(
                 'UPDATE clips SET drive_synced_at = NULL, drive_sync_path = NULL '
                 'WHERE candidate_id = %s',
@@ -1523,12 +1567,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             # served as if it were the fresh render.
             removed = invalidate_clip_cache(candidate_id)
             print(f'RERENDER_CACHE_INVALIDATED candidate={candidate_id} removed={removed}')
-            recording_id = row['recording_id']
-            burn = row['burn_captions']
         finally:
             conn.close()
 
-        hook = fire_verdict_webhook(candidate_id, recording_id, 'approved', 'approved')
         self._send_json(HTTPStatus.OK, {
             'candidate_id': candidate_id,
             'rerender': 'queued',
