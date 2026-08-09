@@ -2242,6 +2242,40 @@
       return { lo, hi };
     }
 
+    // Pending-plays-slice fix: the detail player streams `/clipmedia/<id>`,
+    // which serves the STAGED SLICE (workers/slice_geometry's exact
+    // slice_start()/slice_end() geometry -- identical to sliceBounds() above)
+    // for any candidate with no `clips` row yet, and the RENDERED CLIP once
+    // one exists (review_server.py's `_serve_clip_media`). The slice's own
+    // timebase is SLICE-RELATIVE: its frame 0 is sliceBounds(c).lo. Every
+    // other piece of window state in this file (c.start_s/end_s,
+    // adjusted_*_s, drafts) stays in ABSOLUTE (VOD-relative) seconds, so
+    // these two helpers translate between that absolute state and the
+    // SLICE's native player time. They are only valid while the SLICE is
+    // what is actually playing (mediaHasClip(c) === false) -- a RENDERED
+    // clip's own t0 is the effective window start minus its OWN render pad
+    // (cut_clip.py/render_from_slice.py), which does not line up with
+    // sliceBounds(c).lo, and is deliberately NOT computed client-side here
+    // (see mediaHasClip's own comment for why).
+    function absToPlayer(t, c) { return t - sliceBounds(c).lo; }
+    function playerToAbs(t, c) { return t + sliceBounds(c).lo; }
+
+    // True once a `clips` row exists for this candidate, i.e. a real render
+    // has happened and `/clipmedia/<id>` now serves that file instead of the
+    // staged slice. Mirrors the identical inline null-check already used
+    // elsewhere in this file (renderDetail, deliveryBadgeHtml, etc.) rather
+    // than refactoring those call sites, which is out of scope for this fix.
+    // INVARIANT relied on below (verified against app/workers/cut_clip.py,
+    // deliver_approved.py and render_from_slice.py, which all INSERT INTO
+    // clips only `WHERE c.state = 'approved'`, and D-050's "approved is
+    // terminal"): mediaHasClip(c) === true implies c.state === 'approved',
+    // which implies the trim slider is locked (editable === false). The
+    // converse does not hold -- an approved-but-not-yet-rendered candidate
+    // is locked AND still plays the slice, so drag/keyboard code stays
+    // gated on `editable`, while playhead/preview code below gates on
+    // mediaHasClip so that not-yet-rendered case still gets correct mapping.
+    function mediaHasClip(c) { return !(c.clip_state === null || c.clip_state === undefined); }
+
     // Serif timecode chip format, mm:ss.d (spec example: "00:04.2").
     function tc(seconds) {
       if (seconds === null || seconds === undefined || !isFinite(seconds)) return '--:--.-';
@@ -2476,10 +2510,19 @@
       // cards get a locked slider and locked verdict buttons (the server
       // 409s both anyway). Preview stays available either way.
       const editable = c.state !== 'approved';
-      const videoSrc = `/media/${c.vod_id}#t=${encodeURIComponent(eff.start)},${encodeURIComponent(eff.end)}`;
+      // Pending-plays-slice fix: hasClip moved up from below so videoSrc can
+      // branch on it. /clipmedia/<id> serves the rendered clip when a clips
+      // row exists, else the staged slice (server-decided; see
+      // review_server.py's _serve_clip_media). The slice's timebase is
+      // slice-relative, so the media-fragment hint is recomputed through
+      // absToPlayer -- see the mediaHasClip/absToPlayer comments above for
+      // why the rendered-clip branch omits it instead of guessing an offset.
+      const hasClip = !(c.clip_state === null || c.clip_state === undefined);
+      const videoSrc = hasClip
+        ? `/clipmedia/${c.id}`
+        : `/clipmedia/${c.id}#t=${encodeURIComponent(absToPlayer(eff.start, c))},${encodeURIComponent(absToPlayer(eff.end, c))}`;
       // D-073: a fresh video element means a fresh duration to (re)learn.
       sliderVideoDuration = null;
-      const hasClip = !(c.clip_state === null || c.clip_state === undefined);
       // Action buttons per queue (D-050 upgrade paths):
       // pending: Approve/Reject/Maybe | maybe: Approve/Reject | rejected: Approve/Maybe
       detailEl.innerHTML = `
@@ -2541,7 +2584,7 @@
       }
       const rerenderInlineBtn = document.getElementById('btnRerenderInline');
       if (rerenderInlineBtn) rerenderInlineBtn.onclick = () => rerenderClip(c, rerenderInlineBtn);
-      wireSlider(c, editable);
+      wireSlider(c, editable, hasClip);
       // Drafts persist across card navigation — returning to a card with
       // unsaved edits must re-lock its verdict buttons (D-055 fixer, gate 17).
       updateVerdictLock(c);
@@ -2552,7 +2595,11 @@
     // tracking are wired even when NOT editable (a locked card still shows
     // a live playhead while previewing) -- only handle/region drag and
     // keyboard nudging are gated on editable, matching the server's own gate.
-    function wireSlider(c, editable) {
+    // hasClip gates the abs<->player timebase mapping (see absToPlayer's
+    // comment): it can be true while editable is false without hasClip
+    // being false (an approved-but-not-yet-rendered card is locked and still
+    // plays the slice), so this is checked separately from editable below.
+    function wireSlider(c, editable, hasClip) {
       const sliderEl = document.getElementById('trimSlider');
       const vid = document.getElementById('vid');
       if (!vid) return;
@@ -2577,7 +2624,10 @@
       // pause-accurate sync that follows -- one code path, one behaviour.
       const syncPlayheadFromVideo = () => {
         if (dragTarget !== null) return;
-        renderPlayheadPosition(c, vid.currentTime);
+        // hasClip: the rendered clip's timebase does not map onto the
+        // slice's absolute window (see absToPlayer's comment) -- plain
+        // playback, no mapping attempted.
+        renderPlayheadPosition(c, hasClip ? vid.currentTime : playerToAbs(vid.currentTime, c));
         updateSnapAffordance(c);
       };
       vid.addEventListener('timeupdate', syncPlayheadFromVideo);
@@ -2614,12 +2664,16 @@
       let regionDragOffset = 0;
 
       function applyDraft(next, edgeMoved) {
+        // Only reached when editable (the early return above), and editable
+        // implies !hasClip (see wireSlider's own comment) -- the slice is
+        // always what's playing here, so absToPlayer/playerToAbs apply
+        // unconditionally.
         const draft = clampWindowDraft(next, c, edgeMoved);
         drafts[c.id] = draft;
-        if (edgeMoved === 'start') vid.currentTime = draft.start;
-        else if (edgeMoved === 'end') vid.currentTime = draft.end;
+        if (edgeMoved === 'start') vid.currentTime = absToPlayer(draft.start, c);
+        else if (edgeMoved === 'end') vid.currentTime = absToPlayer(draft.end, c);
         renderSliderPositions(c);
-        renderPlayheadPosition(c, vid.currentTime);
+        renderPlayheadPosition(c, playerToAbs(vid.currentTime, c));
         updateVerdictLock(c);
       }
 
@@ -2695,9 +2749,9 @@
           newStart = Math.max(lo, Math.min(hi - durSecs, newStart));
           newStart = Math.round(newStart * 10) / 10;
           drafts[c.id] = { start: newStart, end: Math.round((newStart + durSecs) * 10) / 10 };
-          vid.currentTime = newStart;
+          vid.currentTime = absToPlayer(newStart, c);
           renderSliderPositions(c);
-          renderPlayheadPosition(c, vid.currentTime);
+          renderPlayheadPosition(c, playerToAbs(vid.currentTime, c));
           updateVerdictLock(c);
         });
         region.addEventListener('pointerup', endDrag);
@@ -2712,7 +2766,7 @@
           if (dragTarget !== 'playhead') return;
           const { lo, hi } = sliceBounds(c);
           const secs = secondsFromClientX(e.clientX, sliderEl, lo, hi);
-          vid.currentTime = secs;
+          vid.currentTime = absToPlayer(secs, c);
           renderPlayheadPosition(c, secs);
         });
         const endPlayheadDrag = () => { dragTarget = null; sliderDragActive = false; };
@@ -2732,8 +2786,11 @@
       if (!c || c.state === 'approved') return;
       const vid = document.getElementById('vid');
       if (!vid) return;
+      // c.state !== 'approved' here (checked above) implies !mediaHasClip(c)
+      // (see absToPlayer's comment), so the slice is always what's playing.
       const cur = editorValues(c);
-      const next = edge === 'start' ? { start: vid.currentTime, end: cur.end } : { start: cur.start, end: vid.currentTime };
+      const abs = playerToAbs(vid.currentTime, c);
+      const next = edge === 'start' ? { start: abs, end: cur.end } : { start: cur.start, end: abs };
       drafts[c.id] = clampWindowDraft(next, c, edge);
       renderSliderPositions(c);
       updateVerdictLock(c);
@@ -2746,11 +2803,15 @@
     // it never goes stale relative to whichever draft/playhead event fired.
     function updateSnapAffordance(c) {
       const btn = document.getElementById('btnSnapStart');
+      // btnSnapStart only exists in the markup when editable (renderTrimBlock),
+      // and editable implies !mediaHasClip(c) -- the slice is always what's
+      // playing past this guard, so the mapping below is always valid.
       if (!btn) return;
       const vid = document.getElementById('vid');
       if (!vid) { btn.style.display = 'none'; return; }
       const ed = editorValues(c);
-      const show = vid.paused && Math.abs(vid.currentTime - ed.start) > 0.05;
+      const abs = playerToAbs(vid.currentTime, c);
+      const show = vid.paused && Math.abs(abs - ed.start) > 0.05;
       btn.style.display = show ? 'inline-flex' : 'none';
     }
 
@@ -2766,14 +2827,18 @@
     function moveWindowToPlayhead(c) {
       const vid = document.getElementById('vid');
       if (!vid) return;
+      // Only reachable via the snap chip, which the markup renders solely
+      // when editable -- editable implies !mediaHasClip(c), so the slice is
+      // always what's playing here.
       const { lo, hi } = sliceBounds(c);
       const cur = editorValues(c);
       const durSecs = cur.end - cur.start;
-      let newStart = Math.max(lo, Math.min(hi - durSecs, vid.currentTime));
+      const currentAbs = playerToAbs(vid.currentTime, c);
+      let newStart = Math.max(lo, Math.min(hi - durSecs, currentAbs));
       newStart = Math.round(newStart * 10) / 10;
       drafts[c.id] = { start: newStart, end: Math.round((newStart + durSecs) * 10) / 10 };
       renderSliderPositions(c);
-      renderPlayheadPosition(c, vid.currentTime);
+      renderPlayheadPosition(c, currentAbs);
       updateVerdictLock(c);
     }
 
@@ -2827,15 +2892,26 @@
     // Replay plays across the CURRENT effective window — including unsaved
     // nudges, so the operator previews before saving. Our timeupdate handler
     // owns the stop (the #t fragment end is not assumed to do it).
+    // mediaHasClip(c): the served file IS the rendered clip, whose own native
+    // timeline has no fixed relationship to the slice's absolute window math
+    // (its t0 is the effective window start minus its OWN render pad -- see
+    // absToPlayer's comment); "preview the window" there just means play the
+    // file, plainly, from its own start -- no offset mapping is attempted.
     function replayWindow() {
       if (!candidates.length) return;
       const c = candidates[idx];
       const ed = editorValues(c);
       const v = document.getElementById('vid');
       if (!v) return;
-      v.currentTime = ed.start;
+      if (mediaHasClip(c)) {
+        v.ontimeupdate = null;
+        v.currentTime = 0;
+        v.play();
+        return;
+      }
+      v.currentTime = absToPlayer(ed.start, c);
       v.ontimeupdate = () => {
-        if (v.currentTime >= ed.end) {
+        if (playerToAbs(v.currentTime, c) >= ed.end) {
           v.pause();
           v.ontimeupdate = null;
         }
