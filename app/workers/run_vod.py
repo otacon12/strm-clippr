@@ -11,23 +11,26 @@ report, and exit. It NEVER advances to another VOD.
 
 The pipeline, in the order the workers require:
 
-    1 ingest      workers/ingest_vods.py        register the recording
-    2 extract     scripts/extract_audio.sh      audio artifact + silence/track guard
-    3 transcribe  workers/transcribe.py         whisper.cpp            [OBS-gated]
-    4 quality     workers/quality_gate.py       D-028 transcript gate
-    5 zebra       workers/zebra_detect.py       trigger-word beats
-    6 energy      workers/audio_energy.py       ebur128 buckets        [OBS-gated]
-    7 signal      workers/transcript_signal.py  LLM signal candidates  [costs money]
-    8 fusion      workers/score_fusion.py       final clip candidates
+    1 ingest       workers/ingest_vods.py        register the recording
+    2 audio_guard  scripts/extract_audio.sh      silence/no-audio check ONLY — no persisted
+                                                  artifact (D-074 ruling 9 / LO-03, see below)
+    3 transcribe   workers/transcribe.py         whisper.cpp            [OBS-gated]
+    4 quality      workers/quality_gate.py       D-028 transcript gate
+    5 zebra        workers/zebra_detect.py       trigger-word beats
+    6 energy       workers/audio_energy.py       ebur128 buckets        [OBS-gated]
+    7 signal       workers/transcript_signal.py  LLM signal candidates  [costs money]
+    8 fusion       workers/score_fusion.py       final clip candidates
 
 Guarantees this driver provides
 -------------------------------
 * IT STOPS. One VOD per invocation. There is no loop over recordings anywhere
   in this file.
-* RESUMABLE AND IDEMPOTENT. Every stage has a done-check against the database
-  (or, for `extract`, against the artifact on disk). Work already done is
-  SKIPPED and said so out loud. A 4-to-8 hour transcription is never repeated
-  because a later stage failed.
+* RESUMABLE AND IDEMPOTENT, WITH ONE NAMED EXCEPTION. Every stage has a
+  done-check against the database — except `audio_guard`, which by design has
+  no persisted witness to check (its output is discarded every run; see the
+  LO-03 note below) and therefore always re-runs. Every other stage's work
+  already done is SKIPPED and said so out loud. A 4-to-8 hour transcription is
+  never repeated because a later stage failed.
 * NOTHING PARTIAL. This driver writes ZERO rows itself; it only SELECTs. Every
   write happens inside a worker's own transaction, and every worker rolls back
   on failure (verified by reading them). A failed stage stops the run before any
@@ -38,6 +41,64 @@ Guarantees this driver provides
   back when off air" with its own exit code.
 * EVERY STAGE IS TIMED, and transcription is reported as a realtime multiple —
   the number that decides whether the 34-hour plan is feasible on this Mac.
+
+AUDIO_GUARD — WHY IT DISCARDS ITS OWN OUTPUT (D-074 ruling 9 / LO-03)
+----------------------------------------------------------------------
+Before this fix, stage 2 was called `extract` and its .m4a was kept on disk
+as a persisted artifact, checked on the next invocation to decide whether to
+skip. That .m4a is consumed by NOTHING downstream: transcribe.py and
+audio_energy.py both ffmpeg the SOURCE VIDEO directly, never the .m4a. 15
+already-completed VODs each paid a full extract-and-verify pass (including,
+on some codecs, a real aac re-encode) for a file nobody ever reads.
+
+The valuable HALF of that stage is not the file, it is the GUARD: the
+silence/no-audio refusal that catches a vod-6-shaped failure (a whole
+session that recorded with no live audio) before hours are sunk into
+transcribing it. That refusal logic lives inside extract_audio.sh's own
+volumedetect passes, and extract_audio.sh has no check-only flag to run
+that logic without also producing and verifying an output file (adding one
+is out of scope here: this fix touches run_vod.py only). So the honest
+choice, and the one this driver takes: run the script exactly as before
+(same command, same cost), then immediately DELETE the .m4a it produced.
+The refusal path (`is_extract_refusal`, exit code 5 below) is unaffected —
+it is driven off stderr, not off the file — so a genuinely silent or
+audio-less recording is refused exactly as before. Because nothing is left
+on disk to check, `audio_guard` has no done-check and always re-runs (see
+the guarantees section above); this is a deliberate, named exception, not
+an oversight.
+
+SIGNAL STAGE TRANSPORT — LOCAL vs PORTABLE LANE (D-074 ruling 10 / LO-06)
+--------------------------------------------------------------------------
+This driver's `signal` stage runs the LOCAL lane exclusively: it invokes
+workers/transcript_signal.py, which calls OpenRouter directly via a
+blocking `curl` subprocess, one call per chunk/trigger
+(call_claude_structured), decoding each response's JSON body in the same
+Python process immediately before issuing the next call.
+
+A SEPARATE, portable lane exists for the live n8n workflow and is NEVER
+invoked by this driver: workers/transcript_signal_prepare.py emits every
+prompt this VOD needs as one JSON document up front (no API calls, no DB
+writes); n8n's own LLM Chain node performs the actual HTTP calls
+server-side, on its own transport, retry policy, and response-decoding
+path; workers/transcript_signal_ingest.py then validates and lands
+whatever responses it is handed back.
+
+This divergence is confined to TRANSPORT — who calls the LLM API, over
+what protocol, and how the raw text is unwrapped into JSON — and never
+touches CANDIDATE-SELECTION LOGIC: both lanes build prompts from the
+identical iterators (iter_scan_items / iter_zebra_items, defined once in
+transcript_signal.py) and validate/normalize responses with the identical
+functions (normalize_window, the category whitelist, the confidence
+clamp, the cross-chunk dedup — transcript_signal_ingest.py imports these
+from transcript_signal.py rather than reimplementing them). It is
+acceptable because the two lanes never run against the same recording in
+the same invocation: this driver (run_vod.py) only ever drives the local
+lane, on this Mac; the split lane runs only inside the n8n workflow,
+server-side, and this driver never touches it. A transport bug confined to
+one lane (a different default model, a different retry count) could only
+ever produce a discrepancy WITHIN that lane — it cannot silently diverge
+the two lanes' candidate-selection algorithm, because that algorithm is
+one shared module.
 
 Non-interactive by construction: there is no prompt anywhere in this file and
 every child is spawned with stdin=DEVNULL, so it is safe under nohup, in a
@@ -51,10 +112,12 @@ Exit codes
 ----------
     0  pipeline complete (or nothing left to do)
     1  a stage failed, or preflight failed
-    2  usage / bad arguments (argparse)
+    2  usage / bad arguments (argparse) — INCLUDING --force covering `signal`
+       without --force-respend (D-074 ruling 2 / LO-07, see parse_args())
     3  OBS gate refusal — NOT a failure; come back when off air
     4  D-028 quality gate FAILED — the transcript is unusable
-    5  extract_audio REFUSED — no audio, or every audio stream is silent
+    5  audio_guard REFUSED (extract_audio.sh) — no audio, or every audio
+       stream is silent
 """
 
 from __future__ import annotations
@@ -92,7 +155,7 @@ EXIT_EXTRACT_REFUSED = 5
 
 STAGE_ORDER = [
     'ingest',
-    'extract',
+    'audio_guard',
     'transcribe',
     'quality',
     'zebra',
@@ -103,7 +166,7 @@ STAGE_ORDER = [
 
 STAGE_BLURB = {
     'ingest': 'register the recording (ingest_vods.py)',
-    'extract': 'extract audio + silence/track guard (extract_audio.sh)',
+    'audio_guard': 'silence/no-audio check (extract_audio.sh) — output discarded, LO-03',
     'transcribe': 'whisper.cpp transcription (transcribe.py) [OBS-gated, the long one]',
     'quality': 'D-028 transcript quality gate (quality_gate.py)',
     'zebra': 'zebra trigger-word beats (zebra_detect.py)',
@@ -404,38 +467,18 @@ def preflight(video: str, want_stages: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def audio_artifact_path(video: str) -> Path:
+    """The path extract_audio.sh writes its .m4a to — used ONLY to unlink it.
+
+    Before D-074 ruling 9 (LO-03) this path was also the `extract` stage's
+    persisted done-witness (checked for existence/size/duration on the next
+    invocation). That witness is gone by design: `audio_guard` now deletes
+    this file immediately after every run (nothing downstream reads it — see
+    the LO-03 note in the module docstring), so there is nothing here to
+    check on a later invocation. This helper survives only so the post-run
+    unlink in main() and extract_audio.sh's own layout agree on the path.
+    """
     p = Path(video)
     return p.with_suffix('.m4a')
-
-
-def extract_already_done(video: str, duration_s: float) -> tuple[bool, str]:
-    """extract_audio.sh's output is a file on disk, so the done-check is too.
-
-    Checked the same way the script itself verifies its output: the artifact
-    exists, is not suspiciously small, and its duration matches the recording
-    within 2 seconds. A truncated leftover therefore does NOT count as done.
-    """
-    out = audio_artifact_path(video)
-    try:
-        if not out.exists():
-            return False, 'no .m4a artifact next to the video'
-        size = out.stat().st_size
-        if size <= 10240:
-            return False, f'.m4a exists but is only {size} bytes (extract_audio.sh calls that suspiciously small)'
-        proc = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=nw=1:nk=1', str(out)],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL,
-        )
-        raw = (proc.stdout or '').strip()
-        if proc.returncode != 0 or not raw:
-            return False, '.m4a exists but ffprobe could not read its duration'
-        out_dur = float(raw)
-        if duration_s > 0 and abs(out_dur - duration_s) > 2.0:
-            return False, f'.m4a duration {out_dur:.1f}s does not match recording {duration_s:.1f}s'
-        return True, f'{out.name} present, {size / 1048576:.1f} MB, {out_dur:.1f}s'
-    except Exception as exc:
-        return False, f'.m4a check inconclusive ({exc})'
 
 
 def stage_done(stage: str, recording_id: Optional[int], video: str, duration_s: float) -> tuple[bool, str]:
@@ -448,8 +491,15 @@ def stage_done(stage: str, recording_id: Optional[int], video: str, duration_s: 
     if recording_id is None:
         return False, 'recording not registered yet'
 
-    if stage == 'extract':
-        return extract_already_done(video, duration_s)
+    if stage == 'audio_guard':
+        # D-074 ruling 9 / LO-03: this stage's own output (.m4a) is deleted
+        # immediately after every run because nothing downstream reads it, so
+        # there is no persisted witness left to check for a skip.
+        # extract_audio.sh has no check-only flag (adding one is out of scope
+        # for this driver), so the honest choice is to always re-run the full
+        # script and discard its output afterward — never to fake a skip off
+        # a file that no longer exists by design.
+        return False, 'no persisted witness by design (output discarded each run) — always re-run'
 
     if stage == 'transcribe':
         # Gated on recordings.state, NOT on transcript_segments row count: a
@@ -499,7 +549,7 @@ def stage_command(stage: str, video: str, recording_id: Optional[int]) -> list[s
     py = sys.executable or 'python3'
     if stage == 'ingest':
         return [py, str(WORKERS_DIR / 'ingest_vods.py')]
-    if stage == 'extract':
+    if stage == 'audio_guard':
         return ['bash', str(SCRIPTS_DIR / 'extract_audio.sh'), video]
     worker = {
         'transcribe': 'transcribe.py',
@@ -572,7 +622,7 @@ def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
     # be a false D-028 verdict (golden-review F16b). Falls through to the
     # generic branch below, with the real stderr tail.
 
-    if stage == 'extract' and is_extract_refusal(err_lines):
+    if stage == 'audio_guard' and is_extract_refusal(err_lines):
         raise StageFailure(
             f'stage {stage}: extract_audio.sh REFUSED (exit {rc}). This is the vod-6 '
             'signature (D-028): the recording has no audio, or every audio stream is '
@@ -822,6 +872,10 @@ def parse_args() -> argparse.Namespace:
                    help='skip this stage (repeatable)')
     p.add_argument('--force', action='append', default=[],
                    help='re-run a stage even if its work already exists; "all" forces every stage (repeatable)')
+    p.add_argument('--force-respend', action='store_true',
+                   help='required alongside --force (or --force all) to actually re-run `signal`: '
+                        'ON CONFLICT DO NOTHING at temperature 0 means a same-input re-run re-pays the '
+                        'full OpenRouter LLM pass and writes nothing new (D-074 ruling 2 / LO-07)')
     return p.parse_args()
 
 
@@ -842,6 +896,22 @@ def main() -> int:
             print(f'ERROR: --force expects a stage name or "all", got: {f}', file=sys.stderr)
             return 2
     forced = set(STAGE_ORDER) if 'all' in args.force else set(args.force)
+
+    # D-074 ruling 2 / LO-07: `signal` writes via ON CONFLICT DO NOTHING at
+    # temperature 0, so forcing a re-run of an already-populated recording
+    # re-pays the ENTIRE OpenRouter LLM pass and then writes zero new rows —
+    # every candidate collides with what is already there. Refuse outright
+    # unless the operator also passes --force-respend, naming the cost and
+    # the flag so the refusal is actionable, not just a wall.
+    if 'signal' in forced and not args.force_respend:
+        print(
+            'ERROR: --force covers the `signal` stage, which would re-pay the full OpenRouter '
+            'LLM pass and then write NOTHING new (ON CONFLICT DO NOTHING at temperature 0 means '
+            'every candidate collides with what already exists). Refusing. Pass --force-respend '
+            'as well if you really mean to spend that money again.',
+            file=sys.stderr,
+        )
+        return 2
 
     video = os.path.abspath(os.path.expanduser(args.video))
     stages = selected_stages(args)
@@ -966,10 +1036,26 @@ def main() -> int:
                         msg += ' Rows with the same filename but a different path: ' + '; '.join(misses)
                     raise StageFailure(msg, EXIT_FAIL)
                 recording_id, duration_s = found[0], found[1]
-                res.detail = f'recording id={recording_id} duration={hms(duration_s)}'
-                say(f'         registered as recording id={recording_id}, duration {hms(duration_s)}')
+                # D-074 ruling 12 / LO-09: ingest_vods.py scans its whole
+                # directory and can report ok=1 while some OTHER file in that
+                # scan failed (its own RESULT line already carries failed=N).
+                # This run_vod invocation only targets `video`, and the lookup
+                # above already failed loudly if THAT specific file did not
+                # register — but a nonzero failed count here means something
+                # ELSE in the scan is broken, and that must not go unreported
+                # just because it was not the file this run cared about.
+                ingest_kv = parse_kv(res.result_line)
+                ingest_failed = ingest_kv.get('failed', '?')
+                res.detail = f'recording id={recording_id} duration={hms(duration_s)} failed={ingest_failed}'
+                say(f'         registered as recording id={recording_id}, duration {hms(duration_s)}, '
+                    f'failed={ingest_failed}')
+                if ingest_failed not in ('0', '?'):
+                    say('')
+                    say(f'  NOTE: ingest_vods reported failed={ingest_failed} for its directory scan '
+                        '(ok=1 covers the whole scan, not just this file). This video registered fine, '
+                        'but check ingest_vods.py stderr above for which other file(s) failed.')
 
-            if stage == 'extract':
+            if stage == 'audio_guard':
                 for line in res.stdout_lines:
                     s = line.strip()
                     if s.startswith('audio streams :'):
@@ -990,6 +1076,25 @@ def main() -> int:
                     say('    comes back mostly BLANK_AUDIO on a recording whose audio is fine, this is')
                     say('    the first thing to suspect. Reported, not worked around: fixing it means')
                     say('    changing verified workers, which is a design call.')
+
+                # D-074 ruling 9 / LO-03: nothing downstream reads this .m4a
+                # (transcribe.py and audio_energy.py ffmpeg the source video
+                # directly), so it is discarded the moment this stage is done
+                # running — success or not, whatever extract_audio.sh left
+                # behind is removed. extract_audio.sh has no check-only flag
+                # (adding one is out of scope: this fix touches run_vod.py
+                # only), so the full extract-and-verify pass still runs; only
+                # its OUTPUT FILE is not kept. The guard's refusal verdict
+                # (is_extract_refusal, above) is read from stderr, not from
+                # this file, so it is unaffected by the deletion.
+                guard_out = audio_artifact_path(video)
+                if guard_out.exists():
+                    try:
+                        guard_out.unlink()
+                        res.detail += f'; .m4a discarded ({guard_out.name}, LO-03: nothing reads it)'
+                        say(f'         .m4a discarded ({guard_out.name}) — nothing downstream reads it (LO-03)')
+                    except OSError as exc:
+                        say(f'         WARNING: could not remove discarded .m4a artifact {guard_out}: {exc}')
 
     except StageFailure as exc:
         say('')
