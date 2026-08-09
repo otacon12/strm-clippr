@@ -156,6 +156,27 @@ even then the edit row survives as history.
   regenerating over an operator edit would be precisely the silent overwrite
   the versioning exists to prevent. --force is a human's deliberate act.
 
+THE GENERATION LOCK (D-072, operator-approved: "avoid the double running by
+locking when one is running"). Two concurrent invocations for the SAME
+candidate -- a duplicate n8n trigger, two near-simultaneous regenerate clicks
+in the review UI -- used to both pass every skip gate above and both pay in
+full for the vision upload and the writer call. A SESSION-scoped PostgreSQL
+advisory lock (pg_try_advisory_lock, the two-int form keyed on
+hashtext('clpr_post_kit') plus the candidate id) now wraps the ENTIRE
+critical section, acquired before Phase 1's first read and held on its own
+dedicated connection until the run is completely finished. It is the
+NON-BLOCKING try variant on purpose: a losing racer does not queue up to pay
+anyway, it fails fast and cheap (POSTKIT_LOCKED to stderr, D-047's own shape,
+nonzero exit, nothing opened, nothing spent) and whatever re-invokes this
+worker decides whether to retry. A retried invocation that acquires the (now
+free) lock re-runs the SAME skip/regenerate decision this file already makes
+-- no parallel decision path -- so when the run it was racing already
+finished, it finds the active kit, closes any request row the version
+arithmetic left stranded (still 'requested' but answered by a kit newer than
+the one it was opened against), prints POSTKIT_ALREADY_SATISFIED, and returns
+having spent nothing. See try_acquire_post_kit_lock's docstring for the SQL
+and why it is the non-blocking, session-scoped, two-int form specifically.
+
 SECRETS: the OpenRouter key is read from a file whose path comes from
 CLPR_OPENROUTER_ENV (default /home/node/.n8n/clpr/.openrouter_env), mirroring
 the .pg_env pattern already on the volume. Missing file = loud failure naming
@@ -2071,6 +2092,70 @@ def transcode_for_analysis(src: Path, dest: Path, envelope: int, ceiling: int) -
     )
 
 
+# ---------------------------------------------------------------------------
+# THE GENERATION LOCK (D-072). See the module header for the measured problem
+# and the shape of the fix; this is the mechanism.
+# ---------------------------------------------------------------------------
+
+POST_KIT_LOCK_NAMESPACE = 'clpr_post_kit'
+
+
+def try_acquire_post_kit_lock(candidate_id: int) -> tuple[bool, object | None]:
+    """SESSION-scoped, non-blocking advisory lock on candidate_id's post-kit
+    generation critical section.
+
+    ITS OWN DEDICATED CONNECTION, never Phase 1's read connection or Phase 3's
+    write connection (both defined below, in _generate_locked): those are
+    explicitly closed partway through a run (Phase 1 closes right after its
+    read, Phase 3 right after its commit), and a lock that died with either
+    one would stop covering the paid work long before the paid work is
+    actually over.
+
+    THE TWO-INT FORM -- pg_try_advisory_lock(hashtext(<namespace>), candidate
+    id) -- never the single-bigint overload, so this lock class is namespaced
+    against any other advisory lock this project (or a future one sharing the
+    database) might ever take on a bare integer id: a post-kit lock on
+    candidate 7 can never collide with an unrelated lock that also happens to
+    key on the integer 7.
+
+    pg_try_advisory_lock, NEVER pg_advisory_lock: the blocking variant would
+    queue a losing racer up to pay anyway once the winner finishes, which is
+    exactly the outcome this lock exists to prevent (D-072's own framing --
+    the loser fails fast and cheap, it does not wait around to spend). And
+    NEVER the _xact_ (transaction-scoped) variant: that releases on THIS
+    connection's own commit/rollback, which happens mid-run on Phase 1's
+    read-only connection, not at the true end of the run.
+
+    Returns (locked, conn):
+      locked=True  -- conn is OPEN and OWNED by the caller. Hold it for the
+                       entire critical section; conn.close() when done IS the
+                       release (see _generate's docstring for why that is
+                       deliberately not a separate, explicit
+                       pg_advisory_unlock call).
+      locked=False -- conn is None. The connection that ran the probe is
+                       ALREADY CLOSED, so there is nothing left to release,
+                       and the caller must not touch Gemini, open a
+                       self-request row, or write anything.
+    """
+    conn = db.connect()
+    cur = conn.cursor()
+    cur.execute(
+        'SELECT pg_try_advisory_lock(hashtext(%s), %s)',
+        (POST_KIT_LOCK_NAMESPACE, candidate_id),
+    )
+    locked = bool(cur.fetchone()[0])
+    # Nothing written; this just closes the implicit transaction the SELECT
+    # opened (autocommit is OFF -- db.connect()'s own contract). The advisory
+    # lock is SESSION-scoped, not transaction-scoped, so this rollback commits
+    # nothing and releases nothing: it only tidies up the transaction, and the
+    # lock itself is untouched by it either way.
+    conn.rollback()
+    if not locked:
+        conn.close()
+        return False, None
+    return True, conn
+
+
 def generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str | None,
              srt_out: str | None, out_dir: str | None = None) -> int:
     """Wrapper so a failure is RECORDED against the requests it answers.
@@ -2102,6 +2187,49 @@ def generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str |
 
 def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str | None,
               srt_out: str | None, out_dir: str | None, consumed: list[int]) -> int:
+    """THE GENERATION LOCK (D-072). Acquired BEFORE _generate_locked's Phase 1
+    first read, so it covers EVERYTHING this run could pay for -- the
+    regenerate decision, the Gemini vision upload, the writer call -- not
+    just the final write. See try_acquire_post_kit_lock's own docstring for
+    the SQL and the non-blocking-vs-blocking reasoning.
+
+    Losing the lock exits immediately with NOTHING done: no self-request row
+    opened (that only happens deep inside _generate_locked's Phase 1, which
+    this function never reaches when the lock is not acquired), no Gemini
+    call, no write. `consumed` is still empty at this point, so generate()'s
+    BaseException handler above calls mark_requests_failed([]) -- a
+    documented no-op -- and the POSTKIT_LOCKED message below is what reaches
+    the operator via main()'s `ERROR: {exc}` -> stderr convention (D-047),
+    exactly like every other fatal RuntimeError in this file
+    (POST_KIT_DISABLED, CLIP_FILE_MISSING, OPERATOR_EDIT_ACTIVE all raise the
+    same way and rely on the same top-level handler).
+    """
+    locked, lock_conn = try_acquire_post_kit_lock(candidate_id)
+    if not locked:
+        raise RuntimeError(
+            f'POSTKIT_LOCKED candidate={candidate_id} another run holds the generation lock; '
+            'nothing was paid or written'
+        )
+    try:
+        return _generate_locked(
+            candidate_id, regenerate, force, slices_dir, srt_out, out_dir, consumed)
+    finally:
+        # RELEASE IS IMPLICIT: pg_try_advisory_lock is SESSION-scoped, so this
+        # connection closing IS the unlock -- there is deliberately NO
+        # explicit pg_advisory_unlock call on the happy path. Session scope is
+        # the crash-safety guarantee (try_acquire_post_kit_lock's own
+        # docstring): an explicit unlock call would only add a second event
+        # that could itself fail, or be skipped, somewhere between here and
+        # the process actually exiting. Whatever ends this process -- a clean
+        # return, an uncaught exception propagating up through generate()
+        # above, SIGKILL -- ends THIS connection's session, and the session
+        # ending is the one thing PostgreSQL itself uses to know the lock is
+        # free. Nothing here can leave it half-released.
+        lock_conn.close()
+
+
+def _generate_locked(candidate_id: int, regenerate: bool, force: bool, slices_dir: str | None,
+                     srt_out: str | None, out_dir: str | None, consumed: list[int]) -> int:
     run_id = f'generate_post_kit_{dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
 
     # ---- Phase 1: read-only. Cheapest gates first, so a disabled or already
@@ -2177,7 +2305,61 @@ def _generate(candidate_id: int, regenerate: bool, force: bool, slices_dir: str 
             # and the file nodes downstream died on nothing to read.
             full = fetch_active_kit_full(cur, candidate_id)
             clip_names = fetch_clip_names(cur, candidate_id)
+
+            # D-072's satisfied-recheck, reusing this EXACT existing decision
+            # -- no parallel decision path. Reaching this branch already
+            # means fetch_outstanding_requests found nothing genuinely
+            # outstanding for this candidate above (it would have forced
+            # regenerate=True), so any row STILL sitting in state='requested'
+            # here is one the version arithmetic (004's own contract:
+            # active_version_at_request >= MAX(version) means outstanding)
+            # left STRANDED: answered by a kit newer than the one it was
+            # opened against, but never explicitly closed, because whichever
+            # run produced that newer kit only closes what its OWN consumed
+            # list named. THE LOCK is what makes this reachable in practice:
+            # it is exactly what a retried invocation finds when the run it
+            # was racing already finished and committed. The explicit
+            # `< existing['version']` filter (never "any 'requested' row for
+            # this candidate") matters because the review UI is NOT excluded
+            # by this lock -- the operator can insert a brand new, genuinely
+            # outstanding request at any instant, including right now, and
+            # such a row's active_version_at_request equals the CURRENT
+            # version rather than falling below it, so it is never swept up
+            # here.
+            cur.execute(
+                "SELECT id FROM post_kit_requests WHERE candidate_id = %s AND state = "
+                "'requested' AND active_version_at_request < %s",
+                (candidate_id, existing['version']),
+            )
+            stranded = [int(r[0]) for r in cur.fetchall()]
+
             conn.rollback()
+
+            if stranded:
+                # OWN CONNECTION, COMMITTED IMMEDIATELY -- the same shape as
+                # open_self_request/mark_requests_failed above: conn was just
+                # rolled back (a read-only phase), so the close is real work
+                # and belongs on a connection whose fate is not tied to any
+                # later rollback in this function.
+                satisfy_conn = db.connect()
+                try:
+                    satisfy_cur = satisfy_conn.cursor()
+                    satisfied = mark_requests_satisfied(satisfy_cur, stranded, existing['version'])
+                    satisfy_conn.commit()
+                finally:
+                    satisfy_conn.close()
+                print(
+                    f'REQUESTS_SATISFIED marked={satisfied} ids={stranded} '
+                    f'version={existing["version"]} (D-072 satisfied-recheck: these were left '
+                    'version-orphaned by a kit newer than the one they were opened against)'
+                )
+
+            print(
+                f'POSTKIT_ALREADY_SATISFIED candidate={candidate_id} '
+                f'kit_version={existing["version"]} (the concurrent run finished the job; '
+                'zero spend)'
+            )
+
             files = write_kit_files(
                 out_dir, full, candidate_id, full['version'], full['origin'], clip_names)
             print(
