@@ -664,13 +664,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_text(self, status: int, text: str, content_type: str = 'text/plain; charset=utf-8') -> None:
+    def _send_text(self, status: int, text: str, content_type: str = 'text/plain; charset=utf-8',
+                    head_only: bool = False) -> None:
         body = text.encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if not head_only:
+            self.wfile.write(body)
 
     def _serve_ui(self) -> None:
         if not UI_PATH.exists():
@@ -750,7 +752,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         self._serve_file_range(file_path)
 
-    def _serve_clip_media(self, candidate_id_text: str) -> None:
+    def _serve_clip_media(self, candidate_id_text: str, head_only: bool = False) -> None:
         """D-061: byte-range media for the RENDERED CLIP (not the source VOD),
         which is what the post-kit mockup plays.
 
@@ -770,11 +772,41 @@ class ReviewHandler(BaseHTTPRequestHandler):
         after this copy was written, i.e. exactly the caption-only-re-render
         case that produces a byte-identical cache key. A rejected local hit
         falls through to `fetch_clip_from_server`, which re-pulls (and, for
-        its own cache, overwrites) the current server-side render."""
+        its own cache, overwrites) the current server-side render.
+
+        PRE-APPROVAL FALLBACK (probed live 2026-08-09): a candidate with no
+        `clips` row yet -- nothing has been rendered/approved -- still has a
+        staged SLICE on the server at
+        `/home/node/.n8n/clpr/media/slices/c<candidate_id>.mp4`, written by
+        the scorer for every scored candidate. When the clips SELECT finds no
+        row, and ONLY then, fall through to that slice via the same
+        `fetch_clip_from_server` machinery (ssh + docker cat + atomic local
+        cache, already per-candidate locked) instead of 404ing outright. The
+        rendered-clip path above is untouched when a clips row DOES exist --
+        even if it fails to resolve, this fallback does not fire, so an
+        already-rendered clip that is merely unreachable still reports that
+        distinctly rather than silently showing a stale pre-render slice.
+
+        The unknown-candidate 404 stays distinct from "no clip yet": before
+        falling back to the slice we check clip_candidates for the id, so a
+        candidate id that never existed still 404s as "no candidate", not as
+        a (nonexistent) slice-fetch failure.
+
+        Cache key for the slice fetch: `fetch_clip_from_server` derives its
+        cache filename as `c<candidate_id>_<basename(server_path)>`; the
+        slice's basename is already `c<candidate_id>.mp4`, so the actual key
+        on disk is `c<candidate_id>_c<candidate_id>.mp4` (e.g. `c1_c1.mp4`
+        for candidate 1) -- NOT a separately-invented prefix. That key still
+        falls inside `invalidate_clip_cache`'s `c<candidate_id>_*` glob, so a
+        real render (which calls that sweep) still evicts a cached slice
+        preview along with everything else cached for this candidate; the
+        wipe procedure's cache-dir clear covers it too. A stale slice can
+        therefore only be served in the narrow window between a re-render and
+        its own cache invalidation, same as every other cached copy here."""
         try:
             candidate_id = int(candidate_id_text)
         except ValueError:
-            self._send_text(HTTPStatus.BAD_REQUEST, 'Invalid candidate id')
+            self._send_text(HTTPStatus.BAD_REQUEST, 'Invalid candidate id', head_only=head_only)
             return
 
         conn = db.connect()
@@ -786,11 +818,28 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 (candidate_id,),
             )
             row = cur.fetchone()
+            candidate_exists = None
+            if not row:
+                cur.execute('SELECT id FROM clip_candidates WHERE id = %s', (candidate_id,))
+                candidate_exists = cur.fetchone()
         finally:
             conn.close()
 
         if not row:
-            self._send_text(HTTPStatus.NOT_FOUND, f'no clip row for candidate {candidate_id}')
+            if not candidate_exists:
+                self._send_text(
+                    HTTPStatus.NOT_FOUND, f'no candidate {candidate_id}', head_only=head_only)
+                return
+            slice_path = f'/home/node/.n8n/clpr/media/slices/c{candidate_id}.mp4'
+            resolved = fetch_clip_from_server(slice_path, candidate_id, None)
+            if resolved is not None:
+                self._serve_file_range(resolved, head_only=head_only)
+                return
+            self._send_text(
+                HTTPStatus.NOT_FOUND,
+                f'clip slice not reachable from this machine: candidate {candidate_id}',
+                head_only=head_only,
+            )
             return
 
         resolved = resolve_local_clip(row['file_path'], row['drive_sync_path'])
@@ -807,19 +856,25 @@ class ReviewHandler(BaseHTTPRequestHandler):
             # local copy above was rejected as stale.
             resolved = fetch_clip_from_server(row['file_path'], candidate_id, row['created_at'])
         if resolved is not None:
-            self._serve_file_range(resolved)
+            self._serve_file_range(resolved, head_only=head_only)
             return
 
         self._send_text(
             HTTPStatus.NOT_FOUND,
             f'clip file not reachable from this machine: candidate {candidate_id}',
+            head_only=head_only,
         )
 
-    def _serve_file_range(self, file_path: Path, content_type: str = 'video/mp4') -> None:
+    def _serve_file_range(self, file_path: Path, content_type: str = 'video/mp4',
+                           head_only: bool = False) -> None:
         """HTTP byte-range serving. Extracted VERBATIM from _serve_media so the
         VOD route and the clip route have ONE implementation (charter §1.5
         gate 1) — the behaviour below is unchanged from the shipped, live
-        version and is exercised by both callers."""
+        version and is exercised by both callers.
+
+        `head_only` (default False, additive — every existing caller is
+        unaffected): send the identical status/headers a GET would send for
+        this same Range, but skip writing the body, for a do_HEAD caller."""
         file_size = file_path.stat().st_size
         range_header = self.headers.get('Range', '').strip()
         start = 0
@@ -873,6 +928,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if partial:
             self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
         self.end_headers()
+
+        if head_only:
+            return
 
         with file_path.open('rb') as f:
             f.seek(start)
@@ -2104,6 +2162,24 @@ class ReviewHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
         self._send_json(HTTPStatus.OK, dict(row) if row else None)
+
+    def do_HEAD(self) -> None:
+        """HEAD support, scoped to /clipmedia/<id> only (the probe that found
+        the pre-approval-preview defect also found HEAD 501ing there; iOS
+        sometimes preflights a video URL with HEAD before requesting bytes).
+        BaseHTTPRequestHandler has no do_HEAD by default, and every route
+        besides this one 501s exactly as it did before this fix -- giving
+        every route HEAD parity means threading head_only through
+        _send_json/_serve_ui/_serve_media and every other handler too, which
+        is out of scope here. The message below matches BaseHTTPRequestHandler's
+        own default 501 body verbatim, so the behaviour for any other path is
+        byte-identical to before this method existed."""
+        parsed = urlparse(self.path)
+        m = GET_CLIP_MEDIA_RE.match(parsed.path)
+        if m:
+            self._serve_clip_media(m.group(1), head_only=True)
+            return
+        self.send_error(HTTPStatus.NOT_IMPLEMENTED, 'Unsupported method (%r)' % self.command)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
