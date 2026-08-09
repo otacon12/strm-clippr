@@ -407,6 +407,54 @@
     .captiontext { font-family: var(--font-sans); font-weight: 700; font-size: 12px; line-height: 1.25;
                    padding: 4px 7px; border-radius: var(--radius-sm); text-align: center; word-break: break-word; }
 
+    /* -------------------------------------------------------------- D-XXX
+       REACTIVE EDITOR (2026-08-09 operator ask): the pending screen's LIVE
+       caption/hook overlay over the real #vid player, so a trim/toggle/color
+       edit is visible before Save/Approve. .hookband/.captiontext ABOVE are
+       REUSED VERBATIM for position (same percentages the kit mockup already
+       uses) -- only .liveoverlaywrap (the positioning ancestor) and the two
+       font-size rules below are new, because #vid is not boxed to a fixed
+       9:16 frame the way .phone is, so font-size cannot be a hardcoded px
+       value tuned to one box size. repaintLiveOverlaySize() in the script
+       sets an inline font-size on .liveHookText/.liveCaptionText from
+       #vid's OWN measured pixel height, in the ratios documented below (a
+       plain CSS percentage font-size cannot express "% of box height" --
+       it resolves against the PARENT's font-size, not the box -- so this
+       has to be computed in JS, not CSS). Until that first measurement
+       lands, .hooktext/.captiontext's own base font-size (17px/12px,
+       above) is the fallback -- no separate rule needed here.
+
+       CSS <-> ASS SOURCE CONSTANT MAPPING (read workers/render_from_slice.py
+       directly, 2026-08-09 -- charter gate 11: never describe code from
+       memory):
+         Captions (CAPTION_FORCE_STYLE, ~line 224): FontSize=9 on the ASS
+           auto-canvas (PlayRes 288 tall) scales 9 * (1920/288) = 60px em on
+           the real 1920-tall output frame = 3.125% of frame height.
+           MarginL=MarginR=30 * (1080/384) = 84px each side = 7.8% of frame
+           width (.captionband's existing left/right:7.8%, unchanged).
+           MarginV=68 * (1920/288) = 453px clearance = 23.6% of frame height
+           (.captionband's existing bottom:23.6%, unchanged). Outline=1.6/
+           Shadow=0.8 on BorderStyle=1 (a stroke, never a box) -> mirrored by
+           styleAutoBacking()'s text-shadow branches (D-074, reused as-is).
+         Hook (HOOK_FONT_SIZE etc., ~line 634-641 -- its OWN PlayRes
+           1080x1920, so these are already real pixel values, no canvas
+           scaling): HOOK_FONT_SIZE=90 / 1920 = 4.6875% of frame height.
+           HOOK_MARGIN_LR=65 / 1080 = 6.02% ~= .hookband's existing
+           left/right:6%. HOOK_MARGIN_V=307 / 1920 = 16.0% = .hookband's
+           existing top:16% (both already matched the mockup pre-D-XXX, per
+           render_from_slice.py's own "matching the review UI mockup's
+           .hookband CSS" comment).
+
+       #vid plays the RAW source (or staged slice) at ITS OWN aspect ratio,
+       never the final 1080x1920 vertical fit-with-blur render -- same
+       caveat class as D-074's kit mockup ("presentation-only... the
+       renderer's Python rule is the truth"): this is an approximation, not
+       a pixel simulation of the true vertical crop. It gives the operator
+       the same readability signal (overlap, near-edge text, majority-text
+       framing) the kit mockup already gives, just before a render exists. */
+    .liveoverlaywrap { position: relative; }
+    .liveoverlaynote { margin: 6px 0 10px; font-size: 11px; color: var(--muted); }
+
     /* The style controls: a toggle + two color pickers (swatches + free hex),
        dirty/save like the trim slider (spec: "matching the window editor's
        conventions") rather than the instant-save the captions/generate
@@ -1221,6 +1269,58 @@
         capSpan.style.color = '#' + hex;
         capSpan.style.background = backing.back;
         capSpan.style.textShadow = backing.shadow;
+      }
+
+      // D-XXX reactive editor: the SAME draft-aware repaint, extended to the
+      // pending screen's live overlay (see its own definition just below —
+      // null-guarded exactly like #hookText/#captionSample above, so this
+      // no-ops on the kit view and on a hasClip=true pending card, where
+      // #liveHookBand/#liveCaptionBand do not exist in the markup).
+      repaintLiveOverlayStyle(c);
+    }
+
+    // Pending-screen live overlay: mount state (show/hide the hook/caption
+    // bands) + color/backing, from the SAME draft-aware styleValues(c) the
+    // kit mockup above already uses. Called from repaintStylePreview (every
+    // style edit: checkbox, swatch click, hex typing) AND once at initial
+    // paint from wireSlider, so it is current the instant a candidate opens.
+    function repaintLiveOverlayStyle(c) {
+      const v = styleValues(c);
+
+      const hookBand = document.getElementById('liveHookBand');
+      const hookSpan = document.getElementById('liveHookText');
+      if (hookBand && hookSpan) {
+        hookBand.style.display = v.burn_hook ? 'flex' : 'none';
+        // ALWAYS the placeholder: no post kit exists yet at this stage of
+        // review (kits are generated after delivery — D-061), so there is
+        // no real hook text to show, ever, on this screen. Never invented
+        // text. Same .hooktext.empty treatment (and the same "skip color,
+        // let the empty CSS show through" rule) as the kit mockup's own
+        // empty-variant case just above.
+        hookSpan.textContent = 'Hook text appears after the post kit generates';
+        hookSpan.classList.add('empty');
+        hookSpan.style.color = '';
+        hookSpan.style.background = '';
+        hookSpan.style.textShadow = '';
+      }
+
+      const capBand = document.getElementById('liveCaptionBand');
+      const capSpan = document.getElementById('liveCaptionText');
+      if (capBand && capSpan) {
+        const on = c.burn_captions === 1;
+        capBand.style.display = on ? 'flex' : 'none';
+        if (on) {
+          const hex = styleHexNorm(v.caption_color) || 'FFFFFF';
+          const backing = styleAutoBacking(hex);
+          capSpan.style.color = '#' + hex;
+          capSpan.style.background = backing.back;
+          capSpan.style.textShadow = backing.shadow;
+        }
+      }
+
+      const noteEl = document.getElementById('liveOverlayNote');
+      if (noteEl) {
+        noteEl.style.display = (!!v.burn_hook || c.burn_captions === 1) ? 'block' : 'none';
       }
     }
 
@@ -2276,6 +2376,133 @@
     // mediaHasClip so that not-yet-rendered case still gets correct mapping.
     function mediaHasClip(c) { return !(c.clip_state === null || c.clip_state === undefined); }
 
+    // ------------------------------------------------------------------ D-XXX
+    // REACTIVE EDITOR: live caption cues from GET /api/candidates/<id>/cues,
+    // in ABSOLUTE (recording) seconds -- the same domain as playerToAbs()
+    // above, so a cue's [start,end) is compared directly against
+    // playerToAbs(vid.currentTime, c) with no extra conversion.
+    //
+    // Gated on !mediaHasClip(c) EVERYWHERE this is wired (wireSlider,
+    // scheduleCueRefresh): playerToAbs/absToPlayer are only valid while the
+    // staged SLICE is what is actually playing (see absToPlayer's own
+    // comment above) -- once a real clip has rendered (D-056's
+    // approved-awaiting-delivery case), vid.currentTime is already
+    // clip-relative in a timebase this feature does not attempt to map, and
+    // the candidate's window is no longer being trimmed anyway.
+    //
+    // liveCues caches by candidate id, keyed by the exact window queried, so
+    // an unrelated re-render (toggling genKit, say) does not re-fetch. A
+    // single global monotonic token discards any response that is no longer
+    // the latest in-flight request -- candidate switches and rapid trim
+    // edits both bump it, so a slow response for a stale window/candidate
+    // can never paint over what the operator is looking at now.
+    const liveCues = {};
+    let cueFetchSeq = 0;
+    let cueDebounceTimer = null;
+
+    function cueFetchKey(c) {
+      const d = drafts[c.id];
+      return d ? `${d.start.toFixed(3)},${d.end.toFixed(3)}` : 'saved';
+    }
+
+    async function refreshLiveCues(c) {
+      const key = cueFetchKey(c);
+      const cached = liveCues[c.id];
+      if (cached && cached.key === key) return; // already have this exact window
+
+      const seq = ++cueFetchSeq;
+      const candidateId = c.id;
+      const d = drafts[c.id];
+      let url = `/api/candidates/${candidateId}/cues`;
+      if (d) url += `?start=${encodeURIComponent(d.start)}&end=${encodeURIComponent(d.end)}`;
+
+      let res, data;
+      try {
+        res = await fetch(url);
+      } catch (err) {
+        if (seq !== cueFetchSeq) return; // superseded — never paint a stale result
+        liveCues[candidateId] = { key, cues: null, error: 'could not reach the server' };
+        return;
+      }
+      if (seq !== cueFetchSeq) return;
+      if (!res.ok) {
+        let body = '';
+        try { body = JSON.stringify(await res.json()); } catch (_) {}
+        liveCues[candidateId] = { key, cues: null, error: `${res.status} ${body}` };
+        return;
+      }
+      try {
+        data = await res.json();
+      } catch (err) {
+        if (seq !== cueFetchSeq) return;
+        liveCues[candidateId] = { key, cues: null, error: 'malformed response' };
+        return;
+      }
+      if (seq !== cueFetchSeq) return;
+      liveCues[candidateId] = { key, cues: Array.isArray(data) ? data : [], error: null };
+    }
+
+    // timeupdate-driven, ONE cue lookup per event (no rAF loop) — the honest
+    // "live preview" the render burns exactly, or an honest failure message
+    // in the same spot: the preview must never go silently blank on a fetch
+    // error (charter gate 9 — a failed fetch reports loudly, it does not
+    // look identical to "nobody is speaking right now").
+    function paintLiveCaptionFromVideo(c) {
+      const capSpan = document.getElementById('liveCaptionText');
+      if (!capSpan || c.burn_captions !== 1) return;
+      const entry = liveCues[c.id];
+      if (!entry) return; // first fetch still in flight
+      if (entry.error) {
+        capSpan.textContent = `Live captions failed to load: ${entry.error}`;
+        return;
+      }
+      const vid = document.getElementById('vid');
+      if (!vid) return;
+      const abs = playerToAbs(vid.currentTime, c);
+      const hit = (entry.cues || []).find((q) => abs >= q.start && abs < q.end);
+      capSpan.textContent = hit ? hit.text : '';
+    }
+
+    // Debounced (~300ms) re-fetch on every trim-draft change — called from
+    // renderSliderPositions, the single choke point every draft mutation
+    // (drag, nudge, keyboard, I/O, snap, loadedmetadata's bounds tightening)
+    // already repaints through, so no individual mutation site needs its own
+    // wiring. Re-checks the candidate is still the one on screen both before
+    // scheduling the fetch and after it resolves, so a card switch mid-debounce
+    // or mid-fetch never paints the wrong candidate's cues.
+    function scheduleCueRefresh(c) {
+      if (mediaHasClip(c)) return;
+      if (cueDebounceTimer !== null) clearTimeout(cueDebounceTimer);
+      const candidateId = c.id;
+      cueDebounceTimer = setTimeout(() => {
+        cueDebounceTimer = null;
+        const cur = candidates[idx];
+        if (!cur || cur.id !== candidateId) return;
+        refreshLiveCues(cur).then(() => {
+          const stillCurrent = candidates[idx];
+          if (stillCurrent && stillCurrent.id === candidateId) paintLiveCaptionFromVideo(stillCurrent);
+        });
+      }, 300);
+    }
+
+    // #vid is not boxed to a fixed frame the way the kit mockup's .phone is
+    // (see the CSS block's own comment), so the caption/hook font-size is
+    // computed here from #vid's OWN measured pixel height, in the exact
+    // ratios read from render_from_slice.py (see the CSS comment above for
+    // the full CSS<->ASS mapping table). Called on loadedmetadata (per
+    // candidate) and once globally on window resize — never on a timer/rAF,
+    // since the box only changes on those two events.
+    function repaintLiveOverlaySize() {
+      const vid = document.getElementById('vid');
+      if (!vid) return;
+      const h = vid.clientHeight;
+      if (!h) return;
+      const hookSpan = document.getElementById('liveHookText');
+      if (hookSpan) hookSpan.style.fontSize = (h * 0.046875) + 'px';
+      const capSpan = document.getElementById('liveCaptionText');
+      if (capSpan) capSpan.style.fontSize = (h * 0.03125) + 'px';
+    }
+
     // Serif timecode chip format, mm:ss.d (spec example: "00:04.2").
     function tc(seconds) {
       if (seconds === null || seconds === undefined || !isFinite(seconds)) return '--:--.-';
@@ -2374,6 +2601,13 @@
       // the playhead, so the snap chip is re-evaluated from here too, not
       // only from the video's own pause/seek events below.
       updateSnapAffordance(c);
+      // D-XXX reactive editor: this is the single choke point every
+      // trim-draft mutation already repaints through (see this function's
+      // own comment above), so the debounced cue re-fetch is wired here
+      // rather than at each of the five individual drag/nudge/keyboard/snap
+      // call sites. scheduleCueRefresh no-ops when hasClip (mediaHasClip(c))
+      // — see its own definition.
+      scheduleCueRefresh(c);
     }
 
     function renderPlayheadPosition(c, seconds) {
@@ -2537,12 +2771,31 @@
         <label class="genrow"><input type="checkbox" id="genKit" ${c.post_kit_enabled === 0 ? '' : 'checked'} />
           Generate a post kit for this clip (default on). This records intent only: the copy is
           generated after the clip is delivered.</label>
-        <label class="genrow"><input type="checkbox" id="burnCaps" ${c.burn_captions === 1 ? 'checked' : ''} />
-          Burn speech captions into this clip (default off). Captions go in during the render itself,
-          so tick this before or at approval.</label>
-        ${captionsIntentNote(c)}
+        <div class="kitblock">
+          <h3>Render options</h3>
+          <p class="why">Intent only -- these apply to the next render, and preview live on the
+            player below while the slice (not yet a real render) is what's playing.</p>
+          <label class="genrow"><input type="checkbox" id="burnCaps" ${c.burn_captions === 1 ? 'checked' : ''} />
+            Burn speech captions into this clip (default off). Captions go in during the render itself,
+            so tick this before or at approval.</label>
+          ${captionsIntentNote(c)}
+          <label class="genrow"><input type="checkbox" id="burnHook" ${c.burn_hook === 1 ? 'checked' : ''} />
+            Burn hook text into this clip. Intent only: it applies to the next render.</label>
+          ${styleControlsHtml(c)}
+        </div>
         <div class="stickytop">
-          <video id="vid" controls playsinline preload="metadata" src="${videoSrc}"></video>
+          <div class="liveoverlaywrap">
+            <video id="vid" controls playsinline preload="metadata" src="${videoSrc}"></video>
+            ${hasClip ? '' : `
+            <div class="hookband" id="liveHookBand" style="display:none;">
+              <span class="hooktext liveHookText" id="liveHookText"></span>
+            </div>
+            <div class="captionband" id="liveCaptionBand" style="display:none;">
+              <span class="captiontext liveCaptionText" id="liveCaptionText"></span>
+            </div>`}
+          </div>
+          ${hasClip ? '' : `<div class="liveoverlaynote" id="liveOverlayNote" style="display:none;">
+            Live preview. The render burns these exactly.</div>`}
           ${renderTrimBlock(c, ed, editable)}
         </div>
         <div class="actions">
@@ -2573,6 +2826,14 @@
       // the same reasons — intent only, fires no render, live in every state.
       const capEl = document.getElementById('burnCaps');
       if (capEl) capEl.onchange = () => setCaptions(c, capEl.checked);
+      // D-XXX reactive editor: burnHook + both colors, dirty/save, reusing
+      // the kit view's own wiring verbatim (wireStyleControls is generic —
+      // see its own definition above renderKitDetail). refreshStyleDirty's
+      // repaintStylePreview call (inside wireStyleControls's handlers) is
+      // extended with a null-guarded block for #liveHookBand/#liveCaptionBand
+      // (repaintLiveOverlayStyle), so every style edit here updates the live
+      // overlay exactly like it already updates the kit mockup.
+      wireStyleControls(c);
       if (editable) {
         detailEl.querySelectorAll('.nudge').forEach((btn) => {
           btn.onclick = () => nudgeWindow(btn.dataset.field, Number(btn.dataset.delta));
@@ -2654,6 +2915,23 @@
       vid.addEventListener('pause', () => { syncPlayheadFromVideo(); stopTick(); });
       vid.addEventListener('seeked', syncPlayheadFromVideo);
       vid.addEventListener('ended', stopTick);
+
+      // D-XXX reactive editor wiring — unconditional on `editable` (an
+      // approved-but-not-yet-rendered candidate is locked but still plays
+      // the slice and still benefits from the live preview), but gated on
+      // !hasClip: playerToAbs is only valid there (see this function's own
+      // hasClip comment above), and #liveHookBand/#liveCaptionBand only
+      // exist in the markup when !hasClip (renderDetail's template).
+      if (!hasClip) {
+        repaintLiveOverlaySize();
+        repaintLiveOverlayStyle(c);
+        refreshLiveCues(c).then(() => {
+          const stillCurrent = candidates[idx];
+          if (stillCurrent && stillCurrent.id === c.id) paintLiveCaptionFromVideo(stillCurrent);
+        });
+        vid.addEventListener('timeupdate', () => paintLiveCaptionFromVideo(c));
+        vid.addEventListener('loadedmetadata', () => repaintLiveOverlaySize(), { once: true });
+      }
 
       if (!sliderEl || !editable) return; // disabled visual state only, no drag/keyboard wired
 
@@ -3209,6 +3487,16 @@
     }
 
     setInterval(() => { pollRefresh(); }, POLL_MS);
+
+    // D-XXX reactive editor: registered exactly ONCE, globally (never inside
+    // a per-render function — renderDetail() runs on every candidate switch
+    // and every toggle, and a listener added there would leak one per
+    // render). repaintLiveOverlaySize() itself re-fetches #vid/the overlay
+    // spans fresh on every call and no-ops if any are absent, so one
+    // listener safely covers every candidate's overlay for the life of the
+    // page, including the kit view (where #liveHookText/#liveCaptionText do
+    // not exist and it is a pure no-op).
+    window.addEventListener('resize', () => repaintLiveOverlaySize());
 
     // D-061: the post kit view introduced the first EDITABLE FIELDS on this
     // surface, and the shortcut map predates them. Without this guard, typing
