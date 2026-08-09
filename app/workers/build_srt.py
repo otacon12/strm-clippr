@@ -80,8 +80,28 @@ RUN_PREFIX_BASIS: tuple[tuple[str, str], ...] = (
 )
 
 # The shortest cue this writes. A zero-length cue is invalid SRT and some
-# players drop every cue after one.
+# players drop every cue after one. NOTE: this no longer does the
+# boundary-filter job (see MIN_SEGMENT_OVERLAP_S below, which is 500x
+# larger and is checked first); it is kept only as a defensive floor
+# against a degenerate zero-length cue, which the overlap check already
+# makes unreachable in practice.
 MIN_CUE_S = 0.001
+
+# Operator ruling, 2026-08-08 (golden-review F8/MK-01, proven by execution):
+# a boundary segment counts as IN THE CLIP only when at least this many
+# seconds of its OWN span fall inside the clip window. Below this floor the
+# segment is dropped entirely -- from the cues, transcript_plain (the
+# anti-invention quote gate's haystack) and transcript_lines -- rather than
+# kept and clamped. Before this existed, rebase_segments clamped a boundary
+# segment's TIMES to the clip but kept its FULL TEXT at any nonzero overlap
+# (the old MIN_CUE_S = 0.001 floor): measured, a clip at 100.0-110.0s with a
+# segment at 91.0-100.05s produced a cue (0.0, 0.05) carrying the whole
+# 9-second sentence, which then (a) let the quote gate accept a quotation of
+# speech the viewer never hears, (b) told Gemini's vision prompt a 9s
+# sentence happened in 50ms, and (c) shipped in the .srt as a sentence
+# flashed for 0.05s. 0.5s is the operator's chosen floor; do not adjust it
+# without a fresh ruling.
+MIN_SEGMENT_OVERLAP_S = 0.5
 
 
 def basis_for_run(created_by_run: str) -> str:
@@ -114,9 +134,16 @@ def srt_timestamp(t_s: float) -> str:
 def rebase_segments(segments: list, clip_t0_abs_s: float, clip_duration_s: float) -> list[tuple[float, float, str]]:
     """Absolute transcript segments -> clip-relative cues, clamped to the clip.
 
-    A segment that only partially overlaps the clip is kept and clamped (the
-    operator's pad routinely cuts into the first and last sentence). A segment
-    with no overlap, or with no text, is dropped.
+    A segment is IN THE CLIP only when at least MIN_SEGMENT_OVERLAP_S of its
+    own span falls inside the clip window (operator ruling 2026-08-08,
+    golden-review F8/MK-01). A segment that clears that bar is kept and its
+    TIMES are clamped to the clip (the operator's pad routinely cuts into
+    the first and last sentence, so a clamped-time cue for a segment that is
+    substantially inside the clip is expected and correct); a segment that
+    only grazes the boundary, has no overlap at all, or has no text, is
+    dropped entirely -- and since transcript_plain and transcript_lines are
+    both derived from this function's return value, a dropped segment never
+    reaches the quote gate's haystack either.
     """
     cues: list[tuple[float, float, str]] = []
     for seg in segments:
@@ -127,6 +154,15 @@ def rebase_segments(segments: list, clip_t0_abs_s: float, clip_duration_s: float
         end = float(seg.end_s) - clip_t0_abs_s
         start = max(0.0, min(start, clip_duration_s))
         end = max(0.0, min(end, clip_duration_s))
+        # Clamping to [0, clip_duration_s] IS the overlap computation: the
+        # clamped span left after intersecting the segment's (unclamped)
+        # relative times with the clip window is exactly how much of the
+        # segment's own duration falls inside the clip. Checked BEFORE the
+        # degenerate-cue floor below, because that floor is 500x smaller and
+        # would let a boundary sliver through.
+        overlap_s = end - start
+        if overlap_s < MIN_SEGMENT_OVERLAP_S:
+            continue
         if end - start < MIN_CUE_S:
             continue
         cues.append((start, end, text))
@@ -280,10 +316,13 @@ def resolve_clip_zero(info: dict, candidate_id: int, slices_dir: str | None) -> 
 def build_for_candidate(cur, candidate_id: int, slices_dir: str | None) -> dict:
     """The full deterministic product: geometry, cues, SRT text, transcript.
 
-    The transcript returned here is the transcript of the CLIP'S ACTUAL
-    COVERAGE, so the same text feeds the captions, the vision prompt and the
-    writer prompt. Anything a model quotes is therefore audible in the shipped
-    clip, not merely somewhere in the recording.
+    The transcript returned here is built only from segments with at least
+    MIN_SEGMENT_OVERLAP_S of their own span inside the clip's actual
+    coverage (rebase_segments enforces the cutoff; a boundary sliver is
+    dropped, not kept whole), so the same text feeds the captions, the
+    vision prompt and the writer prompt. Anything a model quotes therefore
+    has substantial overlap with the shipped clip's audio, not a boundary
+    sliver and not merely somewhere in the recording.
     """
     info = fetch_clip_geometry_inputs(cur, candidate_id)
     geom = resolve_clip_zero(info, candidate_id, slices_dir)

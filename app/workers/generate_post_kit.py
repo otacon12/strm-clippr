@@ -48,8 +48,10 @@ same shape as transcript_signal_ingest.py's response gating):
   - all three hooks present, non-empty, distinct, within the research limits
   - hashtags a list of at most three, each a single '#' token
   - no em dash anywhere in anything that could reach a platform
-  - quoted_line, when present, must appear VERBATIM in the transcript of the
-    shipped clip, or the whole run fails
+  - quoted_line, when present, must appear VERBATIM in the shipped clip's
+    quotable transcript -- segments with at least 0.5s of their own span
+    inside the clip window (build_srt.MIN_SEGMENT_OVERLAP_S; a boundary
+    sliver is dropped entirely, not kept whole) -- or the whole run fails
   - and so must EVERY double-quoted span inside the hooks and the video
     caption, declared or not: a gate that reads only the field the model
     volunteered is a self-report, and a model that simply omits the
