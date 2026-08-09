@@ -180,11 +180,16 @@ FILTER_COMPLEX_D023 = FILTER_COMPLEX_D023_BODY + '[v]'
 #                    window for captions is 422..657 px. Two 72 px lines from a
 #                    453 px baseline occupy 453..597 px — inside that window,
 #                    in the blur, clear of both.
-#   Outline=2.5 + Shadow=1 on a black outline with white fill — a stroke, not a
-#                    box, so the frame never reads as "majority text" (which
-#                    Instagram demotes) while staying legible on any
-#                    background. Verified visually on a white frame and on a
+#   Outline=1.6 + Shadow=0.8 on a black outline with white fill — a stroke,
+#                    not a box, so the frame never reads as "majority text"
+#                    (which Instagram demotes) while staying legible on any
+#                    background. CHANGED from Outline=2.5/Shadow=1 in the same
+#                    2026-08-08 retune as the sizing above; that pair was the
+#                    one visually verified against a white frame and a
 #                    saturated colour-bar frame pulled back from the server.
+#                    These current values have NOT yet had that same visual
+#                    pass — re-verification against the retuned FontSize/
+#                    margins is still pending.
 #   FontName      -> Liberation Sans, chosen from the container's ACTUAL font
 #                    list (fc-list: 16 faces, the four Liberation families).
 #                    Never a font nobody has seen on the box.
@@ -222,25 +227,34 @@ FILTER_ESCAPE_PASS1 = "\\',;[]"
 
 # CUE LENGTH, CAPPED — BECAUSE libass WRAPS FOREVER AND THE FRAME DOES NOT.
 #
-# The style above deliberately leaves only 68% of the frame width usable
-# (MarginL/R clear the platform's right-hand button rail), and at a 100 px em
-# that is roughly 13-15 characters per line. libass will happily wrap a long
-# cue into as many lines as it needs and draw them straight up the frame, so
-# the cue's CHARACTER COUNT is what decides how much of the picture the text
-# covers. Nothing capped it.
+# RE-DERIVED 2026-08-08 for the retuned geometry above (this section
+# previously cited pre-retune numbers: a 68% usable band, a 100 px em and
+# ~13-15 chars/line, none of which match CAPTION_FORCE_STYLE any more). The
+# style above now leaves 84.4% of the frame's 1080 px width usable (912 px,
+# after MarginL/R=30 scales to ~84 px each side), and at the 60 px em
+# (FontSize=9 scaled onto the 1920-tall frame) that is ~29 characters per
+# line at ~31 px average advance for 60 px bold sans (see the geometry block
+# above). libass will still happily wrap a long cue into as many lines as it
+# needs and draw them straight up the frame, so the cue's CHARACTER COUNT is
+# still what decides how much of the picture the text covers. Nothing caps
+# that except this constant.
 #
 # MEASURED on this project's real corpus (7,252 non-empty transcript segments
 # in app/clpr.db.archive-20260806, read in full — not sampled):
 #   p50 = 35 chars, p88 = 63, p95 = 85, p99 = 110, max = 220.
-# At ~13 chars/line and a ~120 px line height, 110 chars is about 8 lines
-# (~47% of the frame height) and 220 chars is about 16 lines, which OVERFLOWS
-# the 1,467 px available above MarginV entirely. A frame that is half text is
-# the exact "majority text" shape D-061 says these clips must not become, so
-# this is not a cosmetic nicety.
+# At ~29 chars/line and a ~72 px line height (the 60 px em with normal
+# leading, matching the "72 px lines" cited in the geometry block above), an
+# UNCAPPED p99 segment (110 chars) would run to about 4 lines (~15% of the
+# frame height) and the uncapped max (220 chars) to about 8 lines (~30%). A
+# frame that is a third text is still well past the "majority text" shape
+# D-061 says these clips must not become, so a cap is still not a cosmetic
+# nicety, even though the retuned geometry no longer overflows the frame the
+# way the pre-retune numbers did.
 #
-# THE CAP IS 42 CHARACTERS ~= 3 lines ~= 19% of the frame height. 2,643 of the
-# 7,252 segments (36%) are longer and get split into consecutive sub-cues at
-# word boundaries. No text is ever dropped, reordered or hyphenated.
+# THE CAP IS 40 CHARACTERS ~= 2 lines ~= 7.5% of the frame height (2 lines at
+# ~72 px each on the 1920 px-tall frame). 2,643 of the 7,252 segments (36%)
+# are longer and get split into consecutive sub-cues at word boundaries. No
+# text is ever dropped, reordered or hyphenated.
 MAX_CAPTION_CHARS = 40
 
 # ...BUT A SPLIT THAT FLASHES IS WORSE THAN A LONG LINE, so the number of

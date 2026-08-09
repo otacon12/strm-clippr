@@ -277,9 +277,20 @@ def _ensure_ledger(conn, cur, paths: list[Path]) -> None:
     being re-run.
 
     A genuinely fresh/empty database has no evidence table, gets an empty
-    ledger, and runs every migration normally. (In the consolidated PG
-    database, 001_consolidated_schema.sql creates the ledger and records
-    itself, so this branch is a safety net, not the normal path.)
+    ledger, and runs every migration normally -- and on a fresh database this
+    function's plain CREATE TABLE IF NOT EXISTS (no backfill, since
+    already_populated is False) IS the normal path, not a safety net: it runs
+    on every first-time bootstrap, before 001_consolidated_schema.sql ever
+    executes, because apply_migrations() calls this function first. 001 also
+    creates schema_migrations (CREATE TABLE IF NOT EXISTS) and records itself
+    (INSERT .. ON CONFLICT DO NOTHING), and post-B12 (golden-review F13) both
+    creations are idempotent, so the two do not collide regardless of which
+    one a fresh DB happens to hit first. The true safety net is narrower: only
+    the already_populated BACKFILL branch above, which exists solely for a
+    database that had `recordings` rows before this ledger was introduced and
+    needs every migration retroactively marked applied so it is not re-run.
+    That legacy-transition case is the one path this function exists for that
+    is not exercised on an ordinary fresh install.
     """
     if _table_exists(cur, LEDGER_TABLE):
         return

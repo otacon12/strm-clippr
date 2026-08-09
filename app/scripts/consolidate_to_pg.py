@@ -376,7 +376,33 @@ def merge(imac_con, server_con):
                 kept_id = key_index[k]
                 incumbent = rows[kept_id]
                 ts = spec["ts_col"]
-                if ts is not None and (pg_row[ts] or "") > (incumbent[ts] or ""):
+                if ts is not None:
+                    # NULL MUST NOT LOSE SILENTLY. `(x or "") > (y or "")` treats a
+                    # missing timestamp as the empty string, which always compares
+                    # LESS than any real timestamp -- so a NULL on the server side
+                    # silently loses to imac even when the server row might be the
+                    # newer one, and a NULL on the imac side silently loses to
+                    # server for the same wrong reason. Either way the "winner" is
+                    # decided by an artifact of the comparison, not by evidence of
+                    # which row is actually newer, and this script has no second
+                    # chance to catch it: it is a one-shot generator that already
+                    # ran. So a NULL on either side refuses instead of guessing.
+                    pg_ts, incumbent_ts = pg_row[ts], incumbent[ts]
+                    if pg_ts is None or incumbent_ts is None:
+                        fail(
+                            "cannot resolve natural-key conflict in %s for key %r: "
+                            "ts_col=%r is NULL on the %s side (imac=%r server=%r), so "
+                            "which row is newer cannot be determined. Resolve this row "
+                            "by hand." % (
+                                pg, k, ts,
+                                "server" if pg_ts is None else "imac",
+                                incumbent_ts, pg_ts,
+                            )
+                        )
+                    newer = pg_ts > incumbent_ts
+                else:
+                    newer = False               # no ts column: seed wins
+                if newer:
                     winner = "server"
                     new_row = dict(pg_row)
                     new_row["id"] = kept_id     # merged entity keeps the seed id
@@ -599,6 +625,21 @@ def emit_verify_sql(counts, approved_ids, server_recordings, null_display_names)
             "approved clip_candidates (iMac ids: %s)" % ids_csv,
             "clip_candidates WHERE id IN (%s) AND state = 'approved'" % ids_csv,
             len(approved_ids))
+    else:
+        # A CHECK THAT CANNOT FAIL LOUDLY IS NOT A CHECK (charter gate 2).
+        # `if approved_ids:` False means the iMac source had ZERO approved
+        # clip_candidates, so there is genuinely nothing to spot-check here --
+        # but silently omitting the assert_count block left NO trace of that
+        # in the generated SQL, and the file still ended with "ALL CHECKS
+        # PASSED" as if every intended check had run, making a skipped check
+        # indistinguishable from a passed one. Name the skip explicitly, in
+        # the generated SQL's own output, so it can never be read as a pass.
+        a("")
+        a(
+            "SELECT 'verify_consolidation: SKIPPED approved clip_candidates spot check "
+            "(guard: approved_ids was empty -- the iMac source had zero approved "
+            "clip_candidates)' AS result;"
+        )
 
     # spot check: each server recording present under its remapped id + path
     for new_id, path in server_recordings:

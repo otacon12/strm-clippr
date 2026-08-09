@@ -306,7 +306,9 @@ def write_witness(conn, cur, candidate_id: int, dest: Path) -> str:
     committed happily and printed SYNCED while leaving NO witness — which is
     exactly the state that pins an approved card in the operator's Pending
     queue forever. Mirrors the n8n "Mark Delivered" node's assertion in
-    clpr/n8n/clpr-verdicts.json (rowcount != 1 -> rollback, error, exit 1).
+    clpr/n8n/clip-editor-d063.json, the canonical live editor workflow (this
+    docstring previously pointed at clpr/n8n/clpr-verdicts.json, a stale
+    export) (rowcount != 1 -> rollback, error, exit 1).
     Raising keeps per-candidate failure isolation: main() counts it FAILED and
     the batch continues.
     """

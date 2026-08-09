@@ -17,6 +17,17 @@ OBS_PORT = 4455
 OBS_CONNECT_TIMEOUT_S = 1.5
 OBS_CONFIG_PATH = Path.home() / 'Library/Application Support/obs-studio/plugin_config/obs-websocket/config.json'
 
+# A STABLE TOKEN FOR THIS REFUSAL, DISTINCT FROM THE PROSE. run_vod.py's
+# is_obs_refusal() currently matches this refusal by checking for two
+# English substrings of the message below ('OBS is actively' and
+# 'Refusing'), which means a future reword of the sentence would silently
+# stop being recognised as an OBS gate refusal (charter gate 10: specify the
+# invariant, never a proxy). This token is ADDITIVE: it is appended to the
+# existing message so the two English substrings still match unchanged; a
+# later pass migrates run_vod.is_obs_refusal to check for this token instead
+# (not done here -- run_vod.py is owned by another builder pass right now).
+OBS_GUARD_REFUSED = 'OBS_GUARD_REFUSED'
+
 
 def _read_obs_websocket_password() -> str:
     if not OBS_CONFIG_PATH.exists():
@@ -109,7 +120,8 @@ def require_obs_idle_or_raise(worker_name: str) -> None:
         state_text = ' and '.join(states)
         raise RuntimeError(
             f'OBS is actively {state_text}. Refusing {worker_name}. '
-            'Finish the stream/record first, or set CLPR_ALLOW_DURING_STREAM=1 for an explicit override.'
+            'Finish the stream/record first, or set CLPR_ALLOW_DURING_STREAM=1 for an explicit override. '
+            f'[{OBS_GUARD_REFUSED}]'
         )
 
     print(f'OBS_GUARD_OK worker={worker_name} OBS reachable and idle; safe to proceed')
