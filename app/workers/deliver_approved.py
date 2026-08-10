@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -140,6 +141,36 @@ def delivered_name(session_label: str, start_s: float, category: str, candidate_
     if seq <= 1:
         return f'{base}.mp4'
     return f'{base}_r{seq}.mp4'
+
+
+def delivery_folder_base(filename: str) -> str:
+    """BYTE-MATCH of the n8n 'Delivery Folder Name' node's baseName derivation
+    (clpr/n8n/clip-editor-d063.json's node on render_from_slice's output
+    filename, and clpr-postkit.json's node on generate_post_kit's kit_file
+    name -- both run the IDENTICAL two-step transform on their own filename):
+
+        const baseName = raw.replace(/\\.[^.]+$/, '').replace(/\\.v\\d+$/, '');
+
+    i.e. strip the extension, then strip a trailing '.v<N>' kit-version
+    marker. The second step is a no-op on every video filename -- a video
+    uses '_r<N>' for a re-render (delivered_name(), migration 011), never
+    '.v<N>'; that marker exists only on a kit's .txt/.srt name
+    (generate_post_kit.kit_file_paths: '<stem>.v<version>.txt') -- but it is
+    applied here unconditionally anyway, so this function is the exact same
+    transform as the n8n node, not merely one that happens to agree on video
+    names today.
+
+    generate_post_kit.clip_stem() builds a kit's <stem> from the DELIVERED
+    clip's own basename (clips.drive_sync_path or clips.file_path, minus
+    extension) -- i.e. from this same delivered_name() output -- so a video's
+    folder (this function, applied locally to the .mp4 name) and its kit's
+    folder (the n8n node above, applied server-side to the kit's own .txt
+    name) always resolve to the identical base, whatever render_seq or kit
+    version either file is currently at.
+    """
+    base = re.sub(r'\.[^.]+$', '', filename)
+    base = re.sub(r'\.v\d+$', '', base)
+    return base
 
 
 def fetch_approved(cur) -> list[dict]:
@@ -284,10 +315,22 @@ def is_sync_eligible(cand: dict) -> bool:
 
 
 def dest_path_for(drive_sync_dir: str, cand: dict) -> Path:
-    return Path(drive_sync_dir) / delivered_name(
+    """The delivery destination, now under a PER-CLIP SUBFOLDER (operator
+    ruling: local-engine runs must be indistinguishable from portable runs
+    except for speed). <sync_dir>/<base>/<name>.mp4, where <base> =
+    delivery_folder_base(name) -- the exact n8n derivation, so the drain's
+    server-side kit files (uploaded via the Drive API under the identical
+    <base>, see delivery_folder_base's docstring) land in the SAME Drive
+    folder the desktop sync client creates for this video. The subfolder
+    itself is created lazily, only at actual copy time (sync_candidate) --
+    never here, so a --dry-run plan (which prints this path) still touches
+    nothing on disk.
+    """
+    name = delivered_name(
         cand['session_label'], cand['start_s'], cand['category'], cand['candidate_id'],
         cand.get('render_seq', 1),
     )
+    return Path(drive_sync_dir) / delivery_folder_base(name) / name
 
 
 def delivery_file_check(cand: dict, dest: Path) -> tuple[bool, str]:
@@ -323,6 +366,87 @@ def already_delivered(cand: dict, dest: Path) -> bool:
     return matched
 
 
+def fetch_active_kit_version(cur, candidate_id: int) -> int:
+    """COALESCE(MAX(version), 0) FROM post_kits WHERE candidate_id = %s — the
+    EXACT computation the n8n 'Record Post Kit Request [D-074]' node runs
+    (clpr/n8n/clip-editor-d063.json) immediately before it inserts a request
+    row. Deliberately NOT filtered on is_active: the node isn't, so this
+    isn't either — mirrored byte-for-byte, not redesigned."""
+    cur.execute('SELECT COALESCE(MAX(version), 0) FROM post_kits WHERE candidate_id = %s', (candidate_id,))
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def outstanding_post_kit_request_exists(cur, candidate_id: int, active_version_at_request: int) -> bool:
+    """Idempotence guard shipped for request_post_kit(): a 'requested' row
+    for this candidate at the SAME active_version_at_request already covers
+    this delivery, so a second identical row would just be two open tickets
+    for the same kit. 'requested' only — 004_post_kit_requests.sql's own
+    contract (item 1) is that a 'requested' row whose active_version_at_request
+    is still the newest version is what "outstanding" means; a 'satisfied' or
+    'failed' row at that version is a CLOSED ticket, not a duplicate to guard
+    against."""
+    cur.execute(
+        "SELECT 1 FROM post_kit_requests WHERE candidate_id = %s AND state = 'requested' "
+        "AND active_version_at_request = %s LIMIT 1",
+        (candidate_id, active_version_at_request),
+    )
+    return cur.fetchone() is not None
+
+
+def request_post_kit(cur, candidate_id: int) -> None:
+    """The LOCAL lane's mirror of the n8n 'Record Post Kit Request [D-074]'
+    node (clpr/n8n/clip-editor-d063.json): on every successful delivery,
+    INSERT a post_kit_requests row. Called from write_witness(), in the SAME
+    transaction as the witness write, so a request can never exist for a
+    delivery that did not actually commit (and vice versa).
+
+    UNCONDITIONAL — NO post_kit_enabled GATE HERE (operator ruling,
+    2026-08-10, superseding an earlier brief that asked for exactly that
+    gate). The opt-out lives in generate_post_kit.py, which reads
+    clip_candidates.post_kit_enabled and closes a disabled candidate's
+    request as state='failed' (POST_KIT_DISABLED) — the request row is
+    written either way, it just resolves differently. Gating the INSERT here
+    would be a SECOND copy of that same rule, and this project has already
+    paid for that class of drift: d063-editor-surgery.py's own docstring on
+    the n8n trigger, verbatim — "the opt-out gate lives in the worker, not in
+    the wiring... duplicating it would be a second copy of a rule, which is
+    how they drift." This function exists so BOTH engines request (and gate)
+    post kits identically; the gate itself lives in exactly one place either
+    way.
+
+    Idempotence: outstanding_post_kit_request_exists() guards against writing
+    a second 'requested' row for the same candidate at the same
+    active_version_at_request. A re-delivery that hits SKIP_DELIVERED never
+    reaches this function at all (write_witness only runs on an actual sync),
+    so that path writes zero new rows on its own; this guard covers the
+    narrower case of write_witness itself running twice for one candidate
+    (e.g. a witness backfill) while a prior request is still open.
+    """
+    active_version = fetch_active_kit_version(cur, candidate_id)
+    if outstanding_post_kit_request_exists(cur, candidate_id, active_version):
+        print(
+            f'POST_KIT_REQUEST_SKIPPED candidate={candidate_id} reason=already_outstanding '
+            f'active_version_at_request={active_version}'
+        )
+        return
+    cur.execute(
+        "INSERT INTO post_kit_requests "
+        "(candidate_id, active_version_at_request, force_over_operator_edit, state, requested_by, requested_at) "
+        "VALUES (%s, %s, 0, 'requested', 'worker:deliver_approved', %s) RETURNING id",
+        (candidate_id, active_version, utc_now_iso()),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(
+            f'post_kit_requests insert for candidate_id={candidate_id} returned no row'
+        )
+    print(
+        f'POST_KIT_REQUESTED candidate={candidate_id} request_id={int(row[0])} '
+        f'active_version_at_request={active_version}'
+    )
+
+
 def write_witness(conn, cur, candidate_id: int, dest: Path) -> str:
     """Write the D-056 delivery witness (clips.drive_synced_at + drive_sync_path)
     and return the timestamp written. ONE truth for the witness write: a fresh
@@ -339,6 +463,14 @@ def write_witness(conn, cur, candidate_id: int, dest: Path) -> str:
     export) (rowcount != 1 -> rollback, error, exit 1).
     Raising keeps per-candidate failure isolation: main() counts it FAILED and
     the batch continues.
+
+    D-074 fixer: in the SAME transaction as the witness UPDATE, this also
+    requests a post kit (request_post_kit) — the local lane's mirror of the
+    n8n "Mark Delivered" -> "Record Post Kit Request [D-074]" edge. Either
+    both the witness and the request commit together, or (on any failure in
+    either step) neither does, so a later retry of this same delivery always
+    sees a clean, retryable starting point rather than a witness with no
+    request or a request with no witness.
     """
     ts = utc_now_iso()
     try:
@@ -353,6 +485,7 @@ def write_witness(conn, cur, candidate_id: int, dest: Path) -> str:
                 f'delivery-witness UPDATE matched {rowcount} clips rows for '
                 f'candidate_id={candidate_id} (expected exactly 1); nothing committed'
             )
+        request_post_kit(cur, candidate_id)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -387,8 +520,15 @@ def backfill_witness(conn, cur, cand: dict, dest: Path) -> None:
 
 def sync_candidate(conn, cur, cand: dict, dest: Path) -> None:
     """sync_clip_to_drive's mechanism (copy2, byte-size verification,
-    drive_synced_at/drive_sync_path columns) with the descriptive dest name."""
+    drive_synced_at/drive_sync_path columns) with the descriptive dest name,
+    now inside its own per-clip subfolder (dest_path_for). The subfolder is
+    created here, immediately before the copy that needs it -- the one place
+    in this worker that actually writes to CLPR_DRIVE_SYNC_DIR -- so it is
+    never created as a side effect of a --dry-run plan or an idempotency
+    check (both of which only ever call dest_path_for/delivery_file_check,
+    never this function)."""
     src_path = Path(cand['clip_file_path'])
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
     print(f'SYNC_CMD src="{src_path}" dst="{dest}"')
     shutil.copy2(src_path, dest)
