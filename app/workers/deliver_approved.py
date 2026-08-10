@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -140,6 +141,36 @@ def delivered_name(session_label: str, start_s: float, category: str, candidate_
     if seq <= 1:
         return f'{base}.mp4'
     return f'{base}_r{seq}.mp4'
+
+
+def delivery_folder_base(filename: str) -> str:
+    """BYTE-MATCH of the n8n 'Delivery Folder Name' node's baseName derivation
+    (clpr/n8n/clip-editor-d063.json's node on render_from_slice's output
+    filename, and clpr-postkit.json's node on generate_post_kit's kit_file
+    name -- both run the IDENTICAL two-step transform on their own filename):
+
+        const baseName = raw.replace(/\\.[^.]+$/, '').replace(/\\.v\\d+$/, '');
+
+    i.e. strip the extension, then strip a trailing '.v<N>' kit-version
+    marker. The second step is a no-op on every video filename -- a video
+    uses '_r<N>' for a re-render (delivered_name(), migration 011), never
+    '.v<N>'; that marker exists only on a kit's .txt/.srt name
+    (generate_post_kit.kit_file_paths: '<stem>.v<version>.txt') -- but it is
+    applied here unconditionally anyway, so this function is the exact same
+    transform as the n8n node, not merely one that happens to agree on video
+    names today.
+
+    generate_post_kit.clip_stem() builds a kit's <stem> from the DELIVERED
+    clip's own basename (clips.drive_sync_path or clips.file_path, minus
+    extension) -- i.e. from this same delivered_name() output -- so a video's
+    folder (this function, applied locally to the .mp4 name) and its kit's
+    folder (the n8n node above, applied server-side to the kit's own .txt
+    name) always resolve to the identical base, whatever render_seq or kit
+    version either file is currently at.
+    """
+    base = re.sub(r'\.[^.]+$', '', filename)
+    base = re.sub(r'\.v\d+$', '', base)
+    return base
 
 
 def fetch_approved(cur) -> list[dict]:
@@ -284,10 +315,22 @@ def is_sync_eligible(cand: dict) -> bool:
 
 
 def dest_path_for(drive_sync_dir: str, cand: dict) -> Path:
-    return Path(drive_sync_dir) / delivered_name(
+    """The delivery destination, now under a PER-CLIP SUBFOLDER (operator
+    ruling: local-engine runs must be indistinguishable from portable runs
+    except for speed). <sync_dir>/<base>/<name>.mp4, where <base> =
+    delivery_folder_base(name) -- the exact n8n derivation, so the drain's
+    server-side kit files (uploaded via the Drive API under the identical
+    <base>, see delivery_folder_base's docstring) land in the SAME Drive
+    folder the desktop sync client creates for this video. The subfolder
+    itself is created lazily, only at actual copy time (sync_candidate) --
+    never here, so a --dry-run plan (which prints this path) still touches
+    nothing on disk.
+    """
+    name = delivered_name(
         cand['session_label'], cand['start_s'], cand['category'], cand['candidate_id'],
         cand.get('render_seq', 1),
     )
+    return Path(drive_sync_dir) / delivery_folder_base(name) / name
 
 
 def delivery_file_check(cand: dict, dest: Path) -> tuple[bool, str]:
@@ -387,8 +430,15 @@ def backfill_witness(conn, cur, cand: dict, dest: Path) -> None:
 
 def sync_candidate(conn, cur, cand: dict, dest: Path) -> None:
     """sync_clip_to_drive's mechanism (copy2, byte-size verification,
-    drive_synced_at/drive_sync_path columns) with the descriptive dest name."""
+    drive_synced_at/drive_sync_path columns) with the descriptive dest name,
+    now inside its own per-clip subfolder (dest_path_for). The subfolder is
+    created here, immediately before the copy that needs it -- the one place
+    in this worker that actually writes to CLPR_DRIVE_SYNC_DIR -- so it is
+    never created as a side effect of a --dry-run plan or an idempotency
+    check (both of which only ever call dest_path_for/delivery_file_check,
+    never this function)."""
     src_path = Path(cand['clip_file_path'])
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
     print(f'SYNC_CMD src="{src_path}" dst="{dest}"')
     shutil.copy2(src_path, dest)

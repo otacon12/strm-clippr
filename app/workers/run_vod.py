@@ -134,6 +134,8 @@ from pathlib import Path
 from typing import Optional
 
 import db
+import slice_candidates
+import stage_slices_remote
 
 APP_DIR = Path(__file__).resolve().parent.parent
 WORKERS_DIR = APP_DIR / 'workers'
@@ -162,6 +164,8 @@ STAGE_ORDER = [
     'energy',
     'signal',
     'fusion',
+    'slice',
+    'push',
 ]
 
 STAGE_BLURB = {
@@ -173,6 +177,10 @@ STAGE_BLURB = {
     'energy': 'ebur128 5s loudness buckets (audio_energy.py) [OBS-gated]',
     'signal': 'LLM signal candidates (transcript_signal.py) [costs OpenRouter money]',
     'fusion': 'score fusion into clip candidates (score_fusion.py)',
+    'slice': 'stream-copy per-candidate slices for the server lane (slice_candidates.py)',
+    'push': 'push staged slices+sidecars to the n8n server (stage_slices_remote.py) — a '
+            'failed push is a loud stage failure, not a skip: the server drain needs '
+            'these slices to generate post kits',
 }
 
 
@@ -259,7 +267,7 @@ class StageResult:
         self.stderr_lines: list[str] = []
 
 
-def run_child(label: str, cmd: list[str]) -> tuple[int, list[str], list[str]]:
+def run_child(label: str, cmd: list[str], env: Optional[dict] = None) -> tuple[int, list[str], list[str]]:
     """Run a child, STREAMING its output live, and return (rc, stdout, stderr).
 
     Live streaming is not a nicety. A silent multi-hour gap is the "long quiet
@@ -269,6 +277,13 @@ def run_child(label: str, cmd: list[str]) -> tuple[int, list[str], list[str]]:
 
     stdin is DEVNULL on every child: ffmpeg without -nostdin swallows keystrokes
     from the terminal the operator is watching.
+
+    env=None (every existing stage) inherits this process's environment
+    unchanged, exactly as before. Only the `slice` stage passes a real dict
+    (a copy of os.environ with CLPR_SLICES_DIR set) — see main()'s stage
+    loop — so slice_candidates.py stages into the same directory `push`
+    (stage_slices_remote.py, which computes that directory itself) will
+    look for it in.
     """
     say(f'    $ {" ".join(cmd)}')
     proc = subprocess.Popen(
@@ -278,6 +293,7 @@ def run_child(label: str, cmd: list[str]) -> tuple[int, list[str], list[str]]:
         stdin=subprocess.DEVNULL,
         text=True,
         bufsize=1,
+        env=env,
     )
 
     out_lines: list[str] = []
@@ -583,7 +599,87 @@ def stage_done(stage: str, recording_id: Optional[int], video: str, duration_s: 
             return True, f'{n} clip candidates already present'
         return False, 'no clip candidates'
 
+    if stage == 'slice':
+        ids = slice_candidate_ids(recording_id)
+        if not ids:
+            return True, 'no candidates in slice-eligible states (candidate/maybe/approved) — nothing to stage'
+        staging = slice_staging_dir(recording_id)
+        missing = [cid for cid in ids if not candidate_has_valid_staged_slice(staging, cid, video)]
+        if missing:
+            return False, (
+                f'{len(missing)}/{len(ids)} slice-eligible candidate(s) missing a valid, '
+                f'source-matched staged slice+sidecar under {staging}: {missing}'
+            )
+        return True, f'all {len(ids)} slice-eligible candidates already staged (slice+sidecar) at {staging}'
+
+    if stage == 'push':
+        # stage_slices_remote.py already does its own per-file remote verify
+        # (size + ownership, its own module docstring step 5) and its own
+        # idempotent size-compare skip on mp4s (sidecars always resend,
+        # ~200 bytes each) on EVERY invocation — duplicating a remote-side
+        # done-check here would be a second, unverified copy of exactly what
+        # that script already proves for real. Honest choice, same shape as
+        # quality/zebra above: always re-run. It is cheap (a fully-up-to-date
+        # push is all remote-size skips plus tiny sidecar resends) and the
+        # server drain needs the push's OWN verify to have actually run, not
+        # a local guess that it would agree.
+        return False, ('stage_slices_remote does its own remote verify + idempotent '
+                        'size-compare skip on every run; always re-run (cheap)')
+
     raise ValueError(f'unknown stage: {stage}')
+
+
+def slice_candidate_ids(recording_id: int) -> list[int]:
+    """clip_candidates in a slice-eligible state for this recording, taken
+    from stage_slices_remote.SLICE_STATES BY REFERENCE (itself a re-export of
+    slice_candidates.SLICE_STATES) so this driver's done-check can never
+    disagree with which candidates the stagers themselves will act on."""
+    rows = db_rows(
+        'SELECT id FROM clip_candidates WHERE recording_id = %s AND state IN %s ORDER BY id',
+        (recording_id, stage_slices_remote.SLICE_STATES),
+    )
+    return [int(r[0]) for r in rows]
+
+
+def slice_staging_dir(recording_id: int):
+    """The exact local staging directory the portable lane's own stager uses
+    (stage_slices_remote.staging_dir_for), reused BY REFERENCE — never a
+    second copy of that <base>/<recording_id> formula — so `slice` and `push`
+    always agree on where staged slices live."""
+    return stage_slices_remote.staging_dir_for(recording_id)
+
+
+def candidate_has_valid_staged_slice(staging_dir, candidate_id: int, video: str) -> bool:
+    """Is candidate_id already staged at `staging_dir` with a slice+sidecar
+    slice_candidates.py would itself SKIP_EXISTING rather than restage?
+
+    Replicates slice_candidates.run()'s own skip predicate exactly (mp4
+    present and non-empty; sidecar present and schema/candidate/coordinate
+    valid via slice_candidates.load_valid_sidecar; AND the sidecar's SOURCE
+    WITNESS — source_path/source_size_bytes — matches the CURRENT video) —
+    not a weaker approximation of it. Skipping the source-witness check would
+    accept a valid-but-WRONG-video sidecar (this happened live: recording 19
+    was repointed to a different local file, commit 36c6e91) as "already
+    staged", so this stage would report done, slice_candidates would never
+    get the chance to RESTAGE it, and `push` would then ship a slice cut from
+    the wrong source video as verified-good.
+    """
+    mp4 = staging_dir / f'c{candidate_id}.mp4'
+    if not mp4.is_file() or mp4.stat().st_size == 0:
+        return False
+    sidecar_data = slice_candidates.load_valid_sidecar(
+        slice_candidates.sidecar_path_for(mp4), candidate_id
+    )
+    if sidecar_data is None:
+        return False
+    try:
+        video_size_bytes = os.stat(video).st_size
+    except OSError:
+        return False
+    return (
+        sidecar_data.get('source_path') == str(video)
+        and sidecar_data.get('source_size_bytes') == video_size_bytes
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +692,20 @@ def stage_command(stage: str, video: str, recording_id: Optional[int]) -> list[s
         return [py, str(WORKERS_DIR / 'ingest_vods.py')]
     if stage == 'audio_guard':
         return ['bash', str(SCRIPTS_DIR / 'extract_audio.sh'), video]
+    if stage == 'slice':
+        # The exact invocation the portable lane's own stager uses
+        # (stage_slices_remote.run_slice_candidates): slice_candidates.py
+        # --vod-id <id> --video <path>, with CLPR_SLICES_DIR pointed at
+        # stage_slices_remote.staging_dir_for(recording_id) — see the env=
+        # built for this stage in main()'s stage loop below, so `push`
+        # (stage_slices_remote.py itself) finds these slices already staged.
+        return [py, str(WORKERS_DIR / 'slice_candidates.py'),
+                '--vod-id', str(recording_id), '--video', video]
+    if stage == 'push':
+        # Reused as-is (stage_slices_remote.py's own CLI uses --recording-id,
+        # not --vod-id like every sibling worker here).
+        return [py, str(WORKERS_DIR / 'stage_slices_remote.py'),
+                '--recording-id', str(recording_id), '--video', video]
     worker = {
         'transcribe': 'transcribe.py',
         'quality': 'quality_gate.py',
@@ -628,9 +738,9 @@ def require_registered(stage: str, recording_id: Optional[int], video: str) -> N
     )
 
 
-def execute_stage(stage: str, cmd: list[str], res: StageResult) -> None:
+def execute_stage(stage: str, cmd: list[str], res: StageResult, env: Optional[dict] = None) -> None:
     started = time.monotonic()
-    rc, out_lines, err_lines = run_child(stage, cmd)
+    rc, out_lines, err_lines = run_child(stage, cmd, env=env)
     res.elapsed_s = time.monotonic() - started
     res.stdout_lines = out_lines
     res.stderr_lines = err_lines
@@ -1073,7 +1183,19 @@ def main() -> int:
 
             say(f'[{idx}/{total}] {stage:<11} RUNNING — {STAGE_BLURB[stage]}')
             cmd = stage_command(stage, video, recording_id)
-            execute_stage(stage, cmd, res)
+            stage_env = None
+            if stage == 'slice':
+                # The exact env construction stage_slices_remote.
+                # run_slice_candidates uses for its own subprocess call to
+                # this same worker: a copy of the environment with
+                # CLPR_SLICES_DIR pointed at the shared staging directory, so
+                # `push` (which computes that directory itself) finds these
+                # slices already there.
+                staging = slice_staging_dir(recording_id)
+                stage_env = os.environ.copy()
+                stage_env['CLPR_SLICES_DIR'] = str(staging)
+                say(f'         CLPR_SLICES_DIR={staging}')
+            execute_stage(stage, cmd, res, env=stage_env)
             res.detail = res.result_line or 'ok'
             say(f'[{idx}/{total}] {stage:<11} DONE in {hms(res.elapsed_s)}')
 
