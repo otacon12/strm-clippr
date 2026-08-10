@@ -596,26 +596,67 @@ def eager_generate_pending_proxies() -> None:
         for row in pending:
             candidate_id = int(row['candidate_id'])
             try:
-                with _clip_fetch_lock(candidate_id):
-                    row_created_at = row.get('created_at')
-                    if _valid_proxy(candidate_id, row_created_at) is not None:
-                        continue
-                    if row.get('file_path') or row.get('drive_sync_path'):
-                        source = resolve_local_clip(row.get('file_path'), row.get('drive_sync_path'))
-                        if source is not None and _clip_file_is_stale(source, row_created_at):
-                            source = None
-                        if source is None:
-                            source = fetch_clip_from_server(
-                                row.get('file_path'), candidate_id, row_created_at)
-                    else:
-                        # No clips row yet -- the pre-approval slice, same
-                        # fallback _serve_clip_media uses (row_created_at is
-                        # None there too: no clips row means no created_at
-                        # to gate on).
-                        slice_path = f'/home/node/.n8n/clpr/media/slices/c{candidate_id}.mp4'
-                        source = fetch_clip_from_server(slice_path, candidate_id, None)
-                        row_created_at = None
+                row_created_at = row.get('created_at')
+
+                # FAST EARLY-OUT, NO LOCK: a candidate that already has a
+                # valid proxy needs neither a resolve/fetch nor a lock at
+                # all -- this is the function's own stated contract ("does
+                # not already have a valid one"), and skipping here is what
+                # keeps a repeated eager pass from re-fetching a multi-MB
+                # source clip over ssh for a candidate that is already
+                # done. Safe without the lock: `_generate_proxy` only ever
+                # promotes a proxy via `os.replace` (atomic), so a read here
+                # can observe an old-but-complete file or a new-but-complete
+                # one, never a torn one.
+                if _valid_proxy(candidate_id, row_created_at) is not None:
+                    continue
+
+                # RESOLVE/FETCH THE FULL CLIP -- DELIBERATELY OUTSIDE
+                # `_clip_fetch_lock`. `fetch_clip_from_server` takes that
+                # SAME per-candidate lock internally (it is how it
+                # serialises its own cache write against a concurrent
+                # on-demand request for the same candidate) -- `Lock` is
+                # non-reentrant, so holding it here before calling into
+                # `fetch_clip_from_server` deadlocks the calling thread
+                # against itself on the very first candidate that needs a
+                # fetch (confirmed by direct reproduction: the eager pass
+                # printed its pending count and then produced no ffmpeg,
+                # no ssh, no proxy dir, and never reached
+                # EAGER_PROXY_PASS_DONE). `fetch_clip_from_server` needs no
+                # help serialising here -- that is the whole reason it
+                # takes the lock itself.
+                if row.get('file_path') or row.get('drive_sync_path'):
+                    source = resolve_local_clip(row.get('file_path'), row.get('drive_sync_path'))
+                    if source is not None and _clip_file_is_stale(source, row_created_at):
+                        source = None
                     if source is None:
+                        source = fetch_clip_from_server(
+                            row.get('file_path'), candidate_id, row_created_at)
+                else:
+                    # No clips row yet -- the pre-approval slice, same
+                    # fallback _serve_clip_media uses (row_created_at is
+                    # None there too: no clips row means no created_at
+                    # to gate on).
+                    slice_path = f'/home/node/.n8n/clpr/media/slices/c{candidate_id}.mp4'
+                    source = fetch_clip_from_server(slice_path, candidate_id, None)
+                    row_created_at = None
+                if source is None:
+                    continue
+
+                # THE LOCK NOW GUARDS ONLY THE PROXY WORK -- exactly the
+                # `_generate_proxy` contract ("MUST be called with
+                # candidate_id's `_clip_fetch_lock` already held"), and
+                # nothing this function calls inside the `with` below ever
+                # takes `_clip_fetch_lock` itself, so there is no
+                # reentrancy needed and none is used (an RLock here would
+                # only paper over a lock-SCOPE error and leave the next
+                # caller free to repeat it somewhere that does real harm).
+                # Re-check `_valid_proxy` inside the lock: another thread
+                # (a concurrent eager pass, once one exists) could have
+                # built a proxy for this candidate in the window between
+                # the early-out check above and acquiring the lock here.
+                with _clip_fetch_lock(candidate_id):
+                    if _valid_proxy(candidate_id, row_created_at) is not None:
                         continue
                     if _generate_proxy(source, candidate_id) is not None:
                         built += 1
