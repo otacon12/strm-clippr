@@ -318,290 +318,6 @@ def invalidate_clip_cache(candidate_id: int) -> int:
     return removed
 
 
-# ---------------------------------------------------------------- preview proxies
-# Preview proxies for the review UI (operator-approved 2026-08-10, verbatim:
-# "approved - just make sure the final output is full quality. let's go with
-# eager"). MEASURED PROBLEM: /clipmedia/<id> was serving the full-quality
-# source slice over a Tailscale DERP relay -- a 47s preview measured
-# 1920x1080 @ 6.0 Mbps = 36.8 MB with atom order ftyp/free/mdat/moov (the
-# index at the END), so the player stalled before the first frame. Preview
-# quality does not need to match output quality: the final render is always
-# built SERVER-SIDE from the original staged slice (render_from_slice.py,
-# untouched by this change), so a light preview costs nothing in the
-# delivered clip.
-#
-# THE INVARIANT THIS WHOLE ADDITION IS JUDGED AGAINST: a proxy must never be
-# reachable as a render or delivery source. That is a structural property,
-# not a promise -- rendering reads /home/node/.n8n/clpr/media/slices/<...>
-# ON THE SERVER, proxies live only in CLPR_PROXY_CACHE on THIS machine, and
-# CLPR_PROXY_CACHE is a directory CLIP_CACHE_DIR's own single-level glob
-# (invalidate_clip_cache, above) cannot see -- a proxy is never written into
-# CLIP_CACHE_DIR and never uploaded anywhere.
-CLPR_PROXY_CACHE = Path(
-    os.environ.get('CLPR_PROXY_CACHE', str(Path.home() / '.cache' / 'clpr' / 'proxies')))
-
-# The trim slider maps player currentTime to real clip time 1:1, so a proxy
-# whose duration drifts from its source would silently produce WRONG TRIM
-# POINTS. 0.05s is generous versus typical GOP-boundary rounding from the
-# `-g 30 -keyint_min 30` encode below, while still catching a genuinely
-# truncated/corrupt encode.
-PROXY_DURATION_TOLERANCE_S = 0.05
-
-# Operator-approved encode: scale to 720p, fast preset, faststart so the
-# index is at the FRONT of the file (the fix for the measured defect above).
-FFMPEG_PROXY_ARGS = (
-    '-vf', 'scale=-2:720',
-    '-c:v', 'libx264',
-    '-crf', '28',
-    '-preset', 'veryfast',
-    '-g', '30',
-    '-keyint_min', '30',
-    '-sc_threshold', '0',
-    '-c:a', 'aac',
-    '-b:a', '96k',
-    '-movflags', '+faststart',
-)
-
-
-def _proxy_path_for(candidate_id: int) -> Path:
-    """The one proxy path for a candidate. Keyed only by candidate_id (unlike
-    the clip cache, which also keys on the source basename) because there is
-    only ever one CURRENT preview for a candidate at a time; staleness
-    (`_valid_proxy` below) is what keeps this filename from ever serving the
-    wrong generation of it -- including across the pre-approval-slice ->
-    rendered-clip transition, where the underlying source changes identity
-    but the proxy path does not."""
-    return CLPR_PROXY_CACHE / f'c{candidate_id}.proxy.mp4'
-
-
-def _valid_proxy(candidate_id: int, row_created_at: str | None) -> Path | None:
-    """An existing, non-empty, non-stale proxy for this candidate, or None.
-
-    Reuses `_clip_file_is_stale` -- the SAME staleness gate the clip cache
-    uses against `clips.created_at` -- rather than inventing a second
-    signal (build brief point 5, and charter §1.5 gate 1: one truth). A
-    re-render (or a first render following a pre-approval preview) writes a
-    NEWER created_at than any proxy built before it, so the same >
-    comparison that protects the clip cache from serving pre-rerender bytes
-    also protects the proxy from showing the operator stale video while the
-    UI tells him it is current.
-    """
-    path = _proxy_path_for(candidate_id)
-    if not (path.is_file() and path.stat().st_size > 0):
-        return None
-    if _clip_file_is_stale(path, row_created_at):
-        return None
-    return path
-
-
-def _ffprobe_duration(path: Path) -> float | None:
-    """`path`'s real duration in seconds per ffprobe, or None on any
-    failure/unparseable output -- never raises, this is a side channel for
-    the duration-invariant guard below, which itself treats None as
-    'refuse, don't guess' (see _finalize_proxy)."""
-    try:
-        proc = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-             '-of', 'default=noprint_wrappers=1:nokey=1', str(path)],
-            capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            return None
-        return float(proc.stdout.strip())
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
-
-
-def _finalize_proxy(tmp: Path, final: Path, source_duration: float | None,
-                     candidate_id: int) -> Path | None:
-    """THE DURATION INVARIANT GATE, isolated from the ffmpeg call so it can be
-    exercised directly against a deliberately-wrong `source_duration` (build
-    brief verification 4: 'a guard you assert but never watch fail is not a
-    guard'). `tmp` must already be a complete, successfully-encoded proxy
-    file sitting in CLPR_PROXY_CACHE.
-
-    A wrong trim is a wrong clip: DELETE and refuse (return None) rather
-    than promote a proxy whose duration disagrees with its source by more
-    than PROXY_DURATION_TOLERANCE_S, or whose duration could not be read at
-    all on either side. The caller (`_generate_proxy`) falls back to serving
-    the untouched source file on a None return -- refusing here never breaks
-    preview, it only forfeits the speed-up for this one clip.
-    """
-    proxy_duration = _ffprobe_duration(tmp)
-    if source_duration is None or proxy_duration is None:
-        print(f'PROXY_DURATION_UNKNOWN candidate_id={candidate_id} '
-              f'source_duration={source_duration} proxy_duration={proxy_duration} '
-              f'-- refusing proxy, serving source', file=sys.stderr)
-        tmp.unlink(missing_ok=True)
-        return None
-    delta = abs(proxy_duration - source_duration)
-    if delta > PROXY_DURATION_TOLERANCE_S:
-        print(f'PROXY_DURATION_MISMATCH candidate_id={candidate_id} '
-              f'source_duration={source_duration} proxy_duration={proxy_duration} '
-              f'delta={delta} > {PROXY_DURATION_TOLERANCE_S}s -- '
-              f'refusing proxy, serving source', file=sys.stderr)
-        tmp.unlink(missing_ok=True)
-        return None
-    os.replace(tmp, final)
-    return final
-
-
-def _generate_proxy(source: Path, candidate_id: int) -> Path | None:
-    """Encode a lightweight, faststart preview proxy from `source` (an
-    ALREADY-FETCHED full-quality clip on this machine -- never a remote
-    path) into CLPR_PROXY_CACHE, or None on any failure. A proxy is an
-    optimization, never a hard dependency: every caller falls back to
-    `source` on a None return, exactly today's pre-proxy behaviour.
-
-    Write-then-rename via `_finalize_proxy` (`os.replace`), the same
-    atomic-write discipline `fetch_clip_from_server`'s cache already uses --
-    a reader must never observe a partially-written proxy.
-
-    MUST be called with `candidate_id`'s `_clip_fetch_lock` already held by
-    the caller (serialises with a concurrent on-demand fetch/serve for the
-    same candidate, same pattern as the clip cache).
-    """
-    CLPR_PROXY_CACHE.mkdir(parents=True, exist_ok=True)
-    final = _proxy_path_for(candidate_id)
-    source_duration = _ffprobe_duration(source)
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        dir=CLPR_PROXY_CACHE, prefix=f'.c{candidate_id}_', suffix='.proxy.mp4.part')
-    os.close(tmp_fd)
-    tmp = Path(tmp_name)
-    try:
-        # -f mp4 forces the muxer explicitly: `tmp`'s real extension is
-        # `.part` (tempfile.mkstemp's suffix, so a crashed encode can never
-        # leave a `.mp4`-named partial file lying around for a stale glob to
-        # pick up), and ffmpeg's own format auto-detection keys off the
-        # extension it actually sees -- without this it refuses to guess an
-        # output format at all (measured: "Unable to choose an output format
-        # for '...proxy.mp4.part'").
-        proc = subprocess.run(
-            ['ffmpeg', '-y', '-i', str(source), *FFMPEG_PROXY_ARGS, '-f', 'mp4', str(tmp)],
-            capture_output=True, text=True, timeout=300)
-        if proc.returncode != 0 or not tmp.is_file() or tmp.stat().st_size == 0:
-            print(f'PROXY_ENCODE_FAILED candidate_id={candidate_id} source={source} '
-                  f'rc={proc.returncode} stderr={proc.stderr[-2000:]!r}', file=sys.stderr)
-            tmp.unlink(missing_ok=True)
-            return None
-        return _finalize_proxy(tmp, final, source_duration, candidate_id)
-    except Exception as exc:  # noqa: BLE001 -- a side channel must never break preview
-        print(f'PROXY_GENERATE_FAILED candidate_id={candidate_id} source={source} '
-              f'error={exc!r}', file=sys.stderr)
-        tmp.unlink(missing_ok=True)
-        return None
-
-
-def _pending_candidates_for_eager() -> list[dict]:
-    """The exact population `_serve_candidates('candidate')` shows the
-    operator (D-056's delivery-gated pending WHERE clause), duplicated here
-    for the same reason `_serve_run_progress`'s pending_count duplicates it:
-    this addition must never touch that already-verified, live endpoint.
-    Carries clips.file_path/drive_sync_path/created_at (LEFT JOIN, null when
-    no clips row yet) so eager generation can resolve a source exactly the
-    way `_serve_clip_media` does, for both the pre-approval-slice and the
-    rendered-clip case."""
-    conn = db.connect()
-    try:
-        cur = dict_cursor(conn)
-        cur.execute(
-            '''
-            SELECT c.id AS candidate_id, cl.file_path, cl.drive_sync_path, cl.created_at
-            FROM clip_candidates c
-            LEFT JOIN clips cl ON cl.candidate_id = c.id
-            WHERE (c.state = 'candidate' OR (c.state = 'approved' AND cl.drive_synced_at IS NULL))
-            '''
-        )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-    return [dict(r) for r in rows]
-
-
-# One eager pass at a time -- a run finishing right as the server also
-# starts must collapse into one pass, not two racing ones. Per-candidate
-# work still serialises through `_clip_fetch_lock` exactly like an on-demand
-# request would, so this can never race a live /clipmedia request either.
-_eager_proxy_lock = threading.Lock()
-
-
-def eager_generate_pending_proxies() -> None:
-    """Background pass: build a proxy for every pending candidate that does
-    not already have a valid one (operator ruling 2026-08-10: "let's go with
-    eager" -- ready before he opens it, rather than generated on his first
-    request). Triggered on server start (`main`) and after a LOCAL
-    find-clips run completes (`_start_local_find_clips`'s watcher) -- the
-    two triggers named in the build brief.
-
-    Never raises out to its caller: eager generation is a pure optimization
-    and must never take the server down or block a preview if a single
-    candidate's fetch/encode fails (build brief point 6). Each candidate's
-    own exception is caught and logged; the pass moves on to the next.
-    """
-    if not _eager_proxy_lock.acquire(blocking=False):
-        print('EAGER_PROXY_PASS_SKIPPED already running', file=sys.stderr)
-        return
-    try:
-        try:
-            pending = _pending_candidates_for_eager()
-        except Exception as exc:  # noqa: BLE001
-            print(f'EAGER_PROXY_PASS_QUERY_FAILED error={exc!r}', file=sys.stderr)
-            return
-        built = 0
-        for row in pending:
-            candidate_id = int(row['candidate_id'])
-            try:
-                with _clip_fetch_lock(candidate_id):
-                    row_created_at = row.get('created_at')
-                    if _valid_proxy(candidate_id, row_created_at) is not None:
-                        continue
-                    if row.get('file_path') or row.get('drive_sync_path'):
-                        source = resolve_local_clip(row.get('file_path'), row.get('drive_sync_path'))
-                        if source is not None and _clip_file_is_stale(source, row_created_at):
-                            source = None
-                        if source is None:
-                            source = fetch_clip_from_server(
-                                row.get('file_path'), candidate_id, row_created_at)
-                    else:
-                        # No clips row yet -- the pre-approval slice, same
-                        # fallback _serve_clip_media uses (row_created_at is
-                        # None there too: no clips row means no created_at
-                        # to gate on).
-                        slice_path = f'/home/node/.n8n/clpr/media/slices/c{candidate_id}.mp4'
-                        source = fetch_clip_from_server(slice_path, candidate_id, None)
-                        row_created_at = None
-                    if source is None:
-                        continue
-                    if _generate_proxy(source, candidate_id) is not None:
-                        built += 1
-            except Exception as exc:  # noqa: BLE001 -- one candidate must never stop the pass
-                print(f'EAGER_PROXY_CANDIDATE_FAILED candidate_id={candidate_id} '
-                      f'error={exc!r}', file=sys.stderr)
-                continue
-        print(f'EAGER_PROXY_PASS_DONE candidates={len(pending)} built={built}', file=sys.stderr)
-    finally:
-        _eager_proxy_lock.release()
-
-
-def _spawn_eager_proxy_pass() -> None:
-    """Fire-and-forget: run `eager_generate_pending_proxies` on a daemon
-    thread so the caller (server startup, or a completed local run) never
-    blocks on it (build brief point 6: run off the request thread)."""
-    threading.Thread(target=eager_generate_pending_proxies, daemon=True).start()
-
-
-def _watch_local_run_and_generate_proxies(proc: 'subprocess.Popen[bytes]') -> None:
-    """Block (on a background thread, never the request thread) until the
-    local find-clips child `proc` exits, then run the eager proxy pass --
-    "after a run completes" (build brief point 6) for the local engine.
-    Called from `_start_local_find_clips` right after it spawns `proc`."""
-    try:
-        proc.wait()
-    except Exception as exc:  # noqa: BLE001 -- a side channel must never break anything else
-        print(f'EAGER_PROXY_RUN_WATCH_FAILED error={exc!r}', file=sys.stderr)
-        return
-    _spawn_eager_proxy_pass()
-
-
 def resolve_local_vod(stored_path: str) -> Path | None:
     """A locally-readable VIDEO for this recording, or None.
 
@@ -1221,21 +937,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         preview along with everything else cached for this candidate; the
         wipe procedure's cache-dir clear covers it too. A stale slice can
         therefore only be served in the narrow window between a re-render and
-        its own cache invalidation, same as every other cached copy here.
-
-        PREVIEW PROXIES (2026-08-10): checks for a valid proxy (`_valid_proxy`)
-        FIRST in both branches, BEFORE any local resolve / ssh fetch of the
-        full clip -- so a proxy already on disk is served even in the moment
-        the full clip is unreachable (Drive unmounted, ssh down), and a
-        reachable full clip is never paid for just to be thrown away in
-        favour of the proxy. Generation itself never happens on this request
-        path, only on the eager background pass
-        (`eager_generate_pending_proxies`), so this handler never blocks on
-        ffmpeg. A missing/stale/failed proxy is not an error: it falls
-        straight through to resolving the full file, i.e. today's pre-proxy
-        behaviour, unchanged. `_serve_file_range` (the Range/206/
-        Accept-Ranges handling the operator's seeking depends on) is
-        untouched either way."""
+        its own cache invalidation, same as every other cached copy here."""
         try:
             candidate_id = int(candidate_id_text)
         except ValueError:
@@ -1264,10 +966,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     HTTPStatus.NOT_FOUND, f'no candidate {candidate_id}', head_only=head_only)
                 return
             slice_path = f'/home/node/.n8n/clpr/media/slices/c{candidate_id}.mp4'
-            proxy = _valid_proxy(candidate_id, None)
-            if proxy is not None:
-                self._serve_file_range(proxy, head_only=head_only)
-                return
             resolved = fetch_clip_from_server(slice_path, candidate_id, None)
             if resolved is not None:
                 self._serve_file_range(resolved, head_only=head_only)
@@ -1277,18 +975,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 f'clip slice not reachable from this machine: candidate {candidate_id}',
                 head_only=head_only,
             )
-            return
-
-        # Proxy-first, same as the no-row branch above: check BEFORE paying
-        # for a local resolve / ssh fetch of the full clip, and BEFORE that
-        # full-clip resolution can fail. A valid, non-stale proxy already on
-        # disk (eager-built earlier) must be servable even in the moment the
-        # full clip is unreachable (Drive unmounted, ssh down) -- checking
-        # only after a successful full-clip resolve would 404 a candidate
-        # whose proxy is sitting right there.
-        proxy = _valid_proxy(candidate_id, row['created_at'])
-        if proxy is not None:
-            self._serve_file_range(proxy, head_only=head_only)
             return
 
         resolved = resolve_local_clip(row['file_path'], row['drive_sync_path'])
@@ -2545,17 +2231,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 logf.close()
             _local_run_proc = proc
 
-            # Preview proxies (2026-08-10, eager): "after a run completes" for
-            # the LOCAL engine, whose completion this server can observe
-            # directly by waiting on its own child -- unlike the portable/n8n
-            # lane, which finishes on n8n's machine with no signal back here
-            # (the on-server-start pass in main() is that lane's coverage).
-            # Runs on its own daemon thread so this HTTP response is never
-            # delayed by it.
-            threading.Thread(
-                target=_watch_local_run_and_generate_proxies, args=(proc,), daemon=True,
-            ).start()
-
         self._send_json(HTTPStatus.OK, {'started': True, 'engine': 'local'})
 
     def _rerender_clip(self, candidate_id: int, body_raw: bytes) -> None:
@@ -3101,11 +2776,6 @@ def main() -> int:
     # never print the URL itself — it may carry credentials.
     db.get_db_url()
     print(f'Starting review server on http://{HOST}:{PORT} using CLPR_DB_URL from environment')
-    # Preview proxies (2026-08-10, eager): "on server start" -- build a proxy
-    # for every already-pending candidate before the operator opens the UI.
-    # Backgrounded (build brief point 6): server startup must never block on
-    # ffmpeg encodes.
-    _spawn_eager_proxy_pass()
     with ThreadingHTTPServer((HOST, PORT), ReviewHandler) as httpd:
         httpd.serve_forever()
 
