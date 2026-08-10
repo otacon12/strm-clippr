@@ -340,49 +340,12 @@ def invalidate_clip_cache(candidate_id: int) -> int:
 CLPR_PROXY_CACHE = Path(
     os.environ.get('CLPR_PROXY_CACHE', str(Path.home() / '.cache' / 'clpr' / 'proxies')))
 
-# THE GUARD IS ASYMMETRIC ON PURPOSE (revised 2026-08-10, operator
-# escalation from the first cut's symmetric 0.05s equality check -- read
-# this before "fixing" it back to equality).
-#
-# Temporal alignment between proxy and source is guaranteed STRUCTURALLY,
-# not by matching durations: FFMPEG_PROXY_ARGS performs no temporal
-# operation whatsoever -- no -ss, no -t, no setpts, no rate change, only a
-# spatial scale and a re-encode. Every input frame is encoded in order at
-# its original presentation time; there is no code path by which the proxy
-# could drift out of sync with the source frame-for-frame. MEASURED, not
-# assumed: whole-clip SSIM of the proxy against the scaled source on the
-# real c3 file = 0.979376; a 2-frame-offset negative control drops that to
-# 0.961665, so the metric is sensitive enough to catch real drift. Worst
-# case checked at the clip's TAIL (t=45s, where any drift would have had
-# the most time to accumulate) -- scoring the source frame at 45.0s against
-# proxy frames at 44.4/44.7/45.0/45.3/45.6s: SSIM 0.792/0.837/**0.952**
-# /0.882/0.855, a clean peak at ZERO offset. No drift, even at the tail.
-#
-# So exact duration equality was never the right property to assert, and
-# is unattainable against these sources in general: they are cut with
-# `-c copy` and land on irregular timestamps, so several are genuinely
-# variable-frame-rate despite a nominal fps tag -- c3 itself claims
-# nb_frames=1430 over duration=47.233984s (≈30.27fps effective), while this
-# module's CFR re-encode produces a self-consistent 1414 frames /
-# 47.133333s. Two correct, alignment-preserving files can legitimately
-# report different container durations; a symmetric equality check with
-# ANY tolerance tight enough to mean something will misfire on real VFR
-# input (measured: c3 delta 0.100651s, c4 delta 0.066667s, both rejected by
-# the original 0.05s check despite the proxy being frame-accurate).
-#
-# What the guard actually needs to catch is a BROKEN encode, and only two
-# shapes of broken are possible given the above:
-#   - a proxy LONGER than its source: FFMPEG_PROXY_ARGS has no way to add
-#     time, so this implies padding or an unintended rate change -- exactly
-#     the case that COULD misalign trim points. Zero tolerance beyond
-#     ordinary probe rounding.
-#   - a proxy dramatically SHORTER than its source: a died-halfway or
-#     truncated encode. The threshold is generous (0.5s) specifically to
-#     admit the ≤0.11s container/VFR artifact measured across every real
-#     clip probed, while still catching a genuine truncation (which loses
-#     seconds, not tenths).
-PROXY_MAX_LONGER_S = 0.05
-PROXY_MAX_SHORTER_S = 0.5
+# The trim slider maps player currentTime to real clip time 1:1, so a proxy
+# whose duration drifts from its source would silently produce WRONG TRIM
+# POINTS. 0.05s is generous versus typical GOP-boundary rounding from the
+# `-g 30 -keyint_min 30` encode below, while still catching a genuinely
+# truncated/corrupt encode.
+PROXY_DURATION_TOLERANCE_S = 0.05
 
 # Operator-approved encode: scale to 720p, fast preset, faststart so the
 # index is at the FRONT of the file (the fix for the measured defect above).
@@ -450,21 +413,18 @@ def _ffprobe_duration(path: Path) -> float | None:
 
 def _finalize_proxy(tmp: Path, final: Path, source_duration: float | None,
                      candidate_id: int) -> Path | None:
-    """THE BROKEN-ENCODE GATE (see PROXY_MAX_LONGER_S / PROXY_MAX_SHORTER_S
-    above for why it is asymmetric, not an equality check), isolated from
-    the ffmpeg call so it can be exercised directly against a
-    deliberately-wrong `source_duration` (build brief verification: 'a
-    guard you assert but never watch fail is not a guard'). `tmp` must
-    already be a complete, successfully-encoded proxy file sitting in
-    CLPR_PROXY_CACHE.
+    """THE DURATION INVARIANT GATE, isolated from the ffmpeg call so it can be
+    exercised directly against a deliberately-wrong `source_duration` (build
+    brief verification 4: 'a guard you assert but never watch fail is not a
+    guard'). `tmp` must already be a complete, successfully-encoded proxy
+    file sitting in CLPR_PROXY_CACHE.
 
-    Alignment is guaranteed structurally (no temporal op in the encode);
-    this gate exists only to catch a proxy that is not what a correct
-    encode of `source` could ever produce -- DELETE and refuse (return
-    None) rather than promote one. The caller (`_generate_proxy`) falls
-    back to serving the untouched source file on a None return -- refusing
-    here never breaks preview, it only forfeits the speed-up for this one
-    clip.
+    A wrong trim is a wrong clip: DELETE and refuse (return None) rather
+    than promote a proxy whose duration disagrees with its source by more
+    than PROXY_DURATION_TOLERANCE_S, or whose duration could not be read at
+    all on either side. The caller (`_generate_proxy`) falls back to serving
+    the untouched source file on a None return -- refusing here never breaks
+    preview, it only forfeits the speed-up for this one clip.
     """
     proxy_duration = _ffprobe_duration(tmp)
     if source_duration is None or proxy_duration is None:
@@ -473,17 +433,11 @@ def _finalize_proxy(tmp: Path, final: Path, source_duration: float | None,
               f'-- refusing proxy, serving source', file=sys.stderr)
         tmp.unlink(missing_ok=True)
         return None
-    if proxy_duration > source_duration + PROXY_MAX_LONGER_S:
-        print(f'PROXY_DURATION_LONGER_THAN_SOURCE candidate_id={candidate_id} '
+    delta = abs(proxy_duration - source_duration)
+    if delta > PROXY_DURATION_TOLERANCE_S:
+        print(f'PROXY_DURATION_MISMATCH candidate_id={candidate_id} '
               f'source_duration={source_duration} proxy_duration={proxy_duration} '
-              f'over_by={proxy_duration - source_duration} > {PROXY_MAX_LONGER_S}s -- '
-              f'refusing proxy, serving source', file=sys.stderr)
-        tmp.unlink(missing_ok=True)
-        return None
-    if source_duration - proxy_duration > PROXY_MAX_SHORTER_S:
-        print(f'PROXY_DURATION_TRUNCATED candidate_id={candidate_id} '
-              f'source_duration={source_duration} proxy_duration={proxy_duration} '
-              f'short_by={source_duration - proxy_duration} > {PROXY_MAX_SHORTER_S}s -- '
+              f'delta={delta} > {PROXY_DURATION_TOLERANCE_S}s -- '
               f'refusing proxy, serving source', file=sys.stderr)
         tmp.unlink(missing_ok=True)
         return None
