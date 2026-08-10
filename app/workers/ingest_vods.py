@@ -16,6 +16,19 @@ find-or-create, per-file failure isolation, RESULT line shape):
   --video <path>: ingest EXACTLY that one file, regardless of scan root --
     closes the local-engine ingest gap (an operator-ruled to_clip source
     that lives outside VIDEO_ROOT; see DECISIONS.md).
+
+MIN_AGE_SECONDS BYPASS -- opt-in, off by default (--skip-age-check, or the
+env var CLPR_SKIP_AGE_CHECK=1; either engages it -- see resolve_skip_age_check
+below). The guard exists to catch a file whose mtime is still moving because
+it is a Google Drive DESKTOP sync in progress -- an in-progress recording or
+a half-synced file. That reasoning does not hold for a caller that downloaded
+the file itself via the Drive API and already verified, byte-for-byte, that
+what landed on disk matches Drive's own reported size: for that caller the
+file's mtime is simply the download-completion time (always seconds old),
+never a signal of an in-progress write, and the guard would reject a
+genuinely-complete file forever. Absent the flag/env var, behaviour is
+UNCHANGED: the 30-minute guard applies exactly as before to every existing
+caller (scan mode and --video alike).
 """
 
 import argparse
@@ -104,7 +117,29 @@ def parse_args() -> argparse.Namespace:
              f'i.e. {VIDEO_ROOT}, or $CLPR_VIDEO_ROOT if set). Ignored when '
              '--video is given.',
     )
+    p.add_argument(
+        '--skip-age-check', action='store_true',
+        help='bypass the MIN_AGE_SECONDS (30m) guard for every file in this '
+             'invocation. Off by default -- the guard applies exactly as '
+             'today unless this is passed (or $CLPR_SKIP_AGE_CHECK=1 is '
+             'set; either engages it). Only safe for a caller that has '
+             'independently verified the file is completely written (e.g. '
+             'on-disk bytes verified against Drive-reported metadata '
+             'bytes) -- this flag does not perform that verification '
+             'itself, it only trusts the caller already did.',
+    )
     return p.parse_args()
+
+
+def resolve_skip_age_check(cli_flag: bool) -> bool:
+    """--skip-age-check wins if passed; otherwise CLPR_SKIP_AGE_CHECK=1 (the
+    established CLPR_* env-var pattern this codebase already uses elsewhere,
+    e.g. CLPR_ALLOW_DURING_STREAM) engages the same bypass. Absent both, this
+    returns False and behaviour is byte-unchanged for every existing caller.
+    """
+    if cli_flag:
+        return True
+    return os.environ.get('CLPR_SKIP_AGE_CHECK', '').strip() == '1'
 
 
 def resolve_video_root(root_arg) -> Path:
@@ -122,6 +157,7 @@ def resolve_video_root(root_arg) -> Path:
 
 def main() -> int:
     args = parse_args()
+    skip_age_check = resolve_skip_age_check(args.skip_age_check)
 
     if args.video:
         # Single-file mode: ingest EXACTLY this file, regardless of scan
@@ -165,11 +201,26 @@ def main() -> int:
                 # is exactly the in-progress-recording case it exists to
                 # catch, regardless of which directory it lives in -- a
                 # to_clip file synced in from Google Drive desktop is not
-                # exempt just because it arrived via --video.
+                # exempt just because it arrived via --video. skip_age_check
+                # is the one opt-in exception: a caller that has already
+                # verified this exact file is completely written by a means
+                # other than mtime (byte-count match against Drive metadata)
+                # bypasses this proxy in favour of that direct witness -- see
+                # the module docstring.
                 if age_seconds < MIN_AGE_SECONDS:
-                    skipped_recent += 1
-                    print(f'SKIP_RECENT file="{p.name}" age_seconds={age_seconds:.1f} reason="modified <30m"')
-                    continue
+                    if skip_age_check:
+                        print(
+                            f'AGE_CHECK_BYPASSED file="{p.name}" age_seconds={age_seconds:.1f} '
+                            'reason="MIN_AGE_SECONDS guard bypassed: completeness verified by '
+                            'byte-count match against Drive metadata (the mtime-staleness proxy '
+                            'this guard checks does not apply -- the file was downloaded via the '
+                            'Drive API, not synced in place, so its mtime is the download-'
+                            'completion time, not a signal of an in-progress write)"'
+                        )
+                    else:
+                        skipped_recent += 1
+                        print(f'SKIP_RECENT file="{p.name}" age_seconds={age_seconds:.1f} reason="modified <30m"')
+                        continue
 
                 session_label = parse_session_label(p.name)
                 duration_raw = probe_duration_seconds(p)

@@ -127,6 +127,16 @@ ENV_RUN_VOD_PATH = 'CLPR_RUN_VOD_PATH'
 ENV_SSH_HOST = 'CLPR_SSH_HOST'  # same name review_server.py already uses -- one truth
 ENV_N8N_CONTAINER = 'CLPR_N8N_CONTAINER'
 ENV_PORTABLE_LOCK_PATH = 'CLPR_PORTABLE_LOCK_PATH'
+# Same name ingest_vods.py itself reads (resolve_skip_age_check) -- set here,
+# on THIS process, right before invoking run_vod.py, so it is inherited down
+# the subprocess chain (find_clips_local -> run_vod -> ingest_vods, all
+# spawned with env=None/inherited env -- see run_run_vod below) without
+# needing to change run_vod.py's own argument handling at all. Only ever set
+# once ensure_local_video() has already verified, byte-for-byte, that the
+# downloaded file's on-disk size matches Drive's reported size for it -- the
+# direct completeness witness that makes the mtime guard's proxy unnecessary
+# for this one file (see ingest_vods.py's module docstring).
+ENV_SKIP_AGE_CHECK = 'CLPR_SKIP_AGE_CHECK'
 
 DEFAULT_LOCAL_MEDIA_DIR = Path.home() / 'clpr-media'
 DEFAULT_LOCAL_LOCK_FILE = Path.home() / 'Library' / 'Logs' / 'clpr-local-run.lock'
@@ -293,6 +303,20 @@ def ensure_local_video(meta: dict, sa_json: str) -> tuple[Optional[Path], Option
     fetch_drive_file.py writes to a `.part` file and only os.replace()s it
     onto the final name after its own byte-for-byte size verification, so a
     re-fetch cannot leave a mismatched file behind.
+
+    THE COMPLETENESS WITNESS (both branches below, made explicit): a
+    (Path, None) return from this function means on-disk bytes == meta['bytes']
+    (Drive's own reported size for this file) was checked, just now, either
+    by the reuse branch's own condition or by the post-download size compare.
+    That equality is the direct, positive proof this file is completely
+    written -- the caller (main(), via run_run_vod) relies on exactly this
+    witness to bypass ingest_vods.py's mtime-based MIN_AGE_SECONDS guard for
+    this file (see ingest_vods.py's module docstring: that guard is a PROXY
+    for completeness; a byte-count match against Drive metadata is the real
+    property, and this is where it is checked). A (None, reason) return
+    means that could NOT be established, and the caller must refuse rather
+    than proceed -- there is no second, competing completeness check
+    anywhere else in this file.
     """
     media_dir = local_media_dir()
     dest = media_dir / meta['name']
@@ -493,10 +517,24 @@ def run_run_vod(video: Path) -> int:
     """Exec run_vod.py --video <video> as a subprocess, streaming ITS stdout
     to this process's stdout and ITS stderr to this process's stderr live
     (same "no long quiet bout" reasoning as run_vod.run_child), and return
-    its exit code UNCHANGED."""
+    its exit code UNCHANGED.
+
+    Every call into this function is made only AFTER ensure_local_video() has
+    established the completeness witness (on-disk bytes == Drive-reported
+    bytes) for `video` -- see main() below, where this is the only call site.
+    So CLPR_SKIP_AGE_CHECK=1 is set on THIS process's environment right here,
+    which subprocess.Popen(..., env=None) below inherits into run_vod.py,
+    which itself spawns ingest_vods.py the same way (env=None for the
+    `ingest` stage -- see run_vod.execute_stage's stage loop), so the bypass
+    reaches ingest_vods.py without run_vod.py needing to know about it or
+    pass anything through explicitly. run_vod.py is not otherwise touched by
+    this change.
+    """
+    os.environ[ENV_SKIP_AGE_CHECK] = '1'
     py = sys.executable or 'python3'
     cmd = [py, str(run_vod_path()), '--video', str(video)]
     say(f'  $ {" ".join(cmd)}')
+    say(f'  {ENV_SKIP_AGE_CHECK}=1 (completeness verified above; bypassing the mtime guard for this file)')
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
