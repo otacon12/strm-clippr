@@ -7,8 +7,18 @@ PostgreSQL port (D-052 P3): connects via the shared adapter app/workers/db.py
 (CLPR_DB_URL); tables per app/docs/naming-map.md (vods -> recordings). The
 worker name (and its RESULT/VODS_* output labels) are an external contract
 and stay as-is.
+
+Two modes, identical per-file semantics (MIN_AGE_SECONDS guard, idempotent
+find-or-create, per-file failure isolation, RESULT line shape):
+  scan mode (default, no --video): iterate --root (or $CLPR_VIDEO_ROOT, or
+    the VIDEO_ROOT constant if neither is given -- byte-unchanged for every
+    existing caller) for files matching VIDEO_EXTS.
+  --video <path>: ingest EXACTLY that one file, regardless of scan root --
+    closes the local-engine ingest gap (an operator-ruled to_clip source
+    that lives outside VIDEO_ROOT; see DECISIONS.md).
 """
 
+import argparse
 import datetime as dt
 import os
 import re
@@ -75,9 +85,59 @@ def probe_duration_seconds(path: Path) -> str:
     return raw
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description='Scan a VOD directory (or ingest one named file) and '
+                     'register eligible files in recordings.',
+    )
+    p.add_argument(
+        '--video', default=None,
+        help='ingest EXACTLY this one file (find-or-create its recordings '
+             'row), regardless of VIDEO_ROOT/--root/$CLPR_VIDEO_ROOT -- '
+             'bypasses the directory scan entirely. All per-file semantics '
+             '(the MIN_AGE_SECONDS guard, idempotent find-or-create, failure '
+             'isolation) still apply to this one file.',
+    )
+    p.add_argument(
+        '--root', default=None,
+        help='override the scan-mode VOD directory (default: VIDEO_ROOT, '
+             f'i.e. {VIDEO_ROOT}, or $CLPR_VIDEO_ROOT if set). Ignored when '
+             '--video is given.',
+    )
+    return p.parse_args()
+
+
+def resolve_video_root(root_arg) -> Path:
+    """--root wins, then $CLPR_VIDEO_ROOT, then the VIDEO_ROOT constant --
+    so a caller that passes neither (every existing caller, before this
+    change) is byte-unchanged: it still scans VIDEO_ROOT exactly as before.
+    """
+    if root_arg:
+        return Path(root_arg)
+    env_root = os.environ.get('CLPR_VIDEO_ROOT', '').strip()
+    if env_root:
+        return Path(env_root)
+    return VIDEO_ROOT
+
+
 def main() -> int:
-    if not VIDEO_ROOT.exists():
-        raise FileNotFoundError(f'VOD root not found: {VIDEO_ROOT}')
+    args = parse_args()
+
+    if args.video:
+        # Single-file mode: ingest EXACTLY this file, regardless of scan
+        # root. os.path.abspath(os.path.expanduser(...)) matches run_vod.py's
+        # own normalization of --video (see its main()), so the path string
+        # written to recordings.path here is byte-identical to the one
+        # run_vod.py's post-ingest lookup_recording() queries for.
+        targets = [Path(os.path.abspath(os.path.expanduser(args.video)))]
+    else:
+        root = resolve_video_root(args.root)
+        if not root.exists():
+            raise FileNotFoundError(f'VOD root not found: {root}')
+        targets = [
+            p for p in sorted(root.iterdir())
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+        ]
 
     now_epoch = dt.datetime.now(dt.timezone.utc).timestamp()
     inserted = 0
@@ -92,10 +152,7 @@ def main() -> int:
 
         # autocommit is OFF: the first statement below opens the transaction
         # implicitly (no explicit BEGIN in PostgreSQL/psycopg2).
-        for p in sorted(VIDEO_ROOT.iterdir()):
-            if not p.is_file() or p.suffix.lower() not in VIDEO_EXTS:
-                continue
-
+        for p in targets:
             try:
                 # Per-file savepoint: a failed SQL statement aborts a PG
                 # transaction, so without this the FILE_FAILED-and-continue
@@ -103,6 +160,12 @@ def main() -> int:
                 cur.execute('SAVEPOINT ingest_file')
                 mtime_epoch = p.stat().st_mtime
                 age_seconds = now_epoch - mtime_epoch
+                # This guard applies identically in scan mode and single-file
+                # (--video) mode: a file still mid-Drive-sync (mtime moving)
+                # is exactly the in-progress-recording case it exists to
+                # catch, regardless of which directory it lives in -- a
+                # to_clip file synced in from Google Drive desktop is not
+                # exempt just because it arrived via --video.
                 if age_seconds < MIN_AGE_SECONDS:
                     skipped_recent += 1
                     print(f'SKIP_RECENT file="{p.name}" age_seconds={age_seconds:.1f} reason="modified <30m"')

@@ -689,7 +689,12 @@ def candidate_has_valid_staged_slice(staging_dir, candidate_id: int, video: str)
 def stage_command(stage: str, video: str, recording_id: Optional[int]) -> list[str]:
     py = sys.executable or 'python3'
     if stage == 'ingest':
-        return [py, str(WORKERS_DIR / 'ingest_vods.py')]
+        # ingest_vods.py --video <path>: register EXACTLY the file this
+        # driver was told to process, regardless of ingest_vods' own
+        # VIDEO_ROOT scan default -- closes the local-engine ingest gap (an
+        # operator-ruled to_clip source that lives outside VIDEO_ROOT; see
+        # DECISIONS.md).
+        return [py, str(WORKERS_DIR / 'ingest_vods.py'), '--video', video]
     if stage == 'audio_guard':
         return ['bash', str(SCRIPTS_DIR / 'extract_audio.sh'), video]
     if stage == 'slice':
