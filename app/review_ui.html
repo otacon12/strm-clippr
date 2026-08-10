@@ -128,6 +128,16 @@
     a.linklike, button.linklike { background: transparent; color: var(--pop); padding: 0; font-weight: 600;
       text-decoration: underline; text-underline-offset: 2px; }
 
+    /* ---- Engine picker: Local (this Mac) / Portable (server), under Find
+       clips (operator ruling 2026-08-09: DEFAULT = LOCAL). Same pill-segmented
+       vocabulary as .tabs/.tab -- these ARE <button> elements, so they inherit
+       the global button rule (including the mobile 44px touch-target bump). ---- */
+    .engine-picker { display: flex; gap: 4px; margin-top: 8px; background: var(--studio);
+      border: 1px solid var(--hairline); border-radius: var(--radius-pill); padding: 3px; }
+    .engine-opt { flex: 1 1 50%; background: transparent; color: var(--muted); border: 0;
+      padding: 7px 10px; border-radius: var(--radius-pill); font-size: 11.5px; }
+    .engine-opt.active { background: var(--pop); color: #1A0900; }
+
     /* ---- Run progress: REAL witnesses only, never a fake timer (operator
        ask, 2026-08-09: "anyway to add a progress bar to shpw real dynamic
        progressiom"). Every step below is exactly what GET /api/run-progress
@@ -150,6 +160,19 @@
     @keyframes pstep-pulse { 0%, 100% { box-shadow: 0 0 0 0 var(--pop-tint-strong); }
       50% { box-shadow: 0 0 0 5px transparent; } }
     @media (prefers-reduced-motion: reduce) { .pstep.active .pstep-dot { animation: none; } }
+
+    /* ---- Local engine status line, inside the same progress card: "Local
+       engine running" while alive, and -- when it ends nonzero -- the honest
+       classified sentence read from its own log (GET /api/run-progress
+       local_run). An OBS gate refusal is a DESIGNED refusal (D-009), not a
+       failure, so it renders with the .info palette; everything else nonzero
+       renders .error. ---- */
+    .local-run-status { margin-top: 9px; padding: 8px 10px; border-radius: var(--radius-sm);
+      font-size: 11.5px; line-height: 1.5; }
+    .local-run-status.info { color: var(--paper-text); background: rgba(63,190,130,.10);
+      border: 1px solid rgba(63,190,130,.35); }
+    .local-run-status.error { color: var(--bad); background: rgba(242,86,77,.08);
+      border: 1px solid var(--bad-deep); }
 
     /* ---- Fine-edit numeric fallback: kept functional, visually secondary
        to the trim slider above it (spec section 2: "inputs remain as a
@@ -535,6 +558,7 @@
          box instead, so the track itself doesn't look fatter. */
       button { min-height: 44px; min-width: 44px; padding: 11px 18px; }
       .tab { padding: 11px 16px; }
+      .engine-opt { padding: 11px 16px; }
       .copybtn, .pick, .nudge { padding: 11px 14px; }
       .swatch { width: 44px; height: 44px; }
       .notice-close { min-width: 44px; min-height: 44px; top: 2px; right: 2px;
@@ -574,6 +598,10 @@
         <div class="findclips-row">
           <button id="findClipsBtn" class="findclips" type="button">Find clips</button>
         </div>
+        <div id="enginePicker" class="engine-picker" role="group" aria-label="Clip-finding engine">
+          <button id="engineLocalBtn" class="engine-opt active" type="button" aria-pressed="true">Local (this Mac)</button>
+          <button id="enginePortableBtn" class="engine-opt" type="button" aria-pressed="false">Portable (server)</button>
+        </div>
         <div id="progressCard" class="progress-card" hidden>
           <div class="progress-head">
             <span class="progress-title">Finding clips</span>
@@ -585,6 +613,7 @@
             <li class="pstep" data-stage="detect"><span class="pstep-dot" aria-hidden="true"></span><span class="pstep-label">Reading the transcript for moments</span></li>
             <li class="pstep" data-stage="score"><span class="pstep-dot" aria-hidden="true"></span><span class="pstep-label">Scoring and building clips</span></li>
           </ol>
+          <div id="localRunStatus" class="local-run-status" hidden></div>
         </div>
         <div class="kbd">j/k or arrows move<span class="kbdchip">J K</span> &middot; approve<span class="kbdchip">A</span> &middot; reject, not in Rejected<span class="kbdchip">R</span> &middot; maybe, Pending/Rejected<span class="kbdchip">M</span> &middot; toggle Rejected<span class="kbdchip">X</span> &middot; set in/out at the playhead<span class="kbdchip">I</span><span class="kbdchip">O</span><br />Keys are inert while typing in a field.</div>
       </div>
@@ -653,6 +682,8 @@
     const tabRejectedEl = document.getElementById('tabRejected');
     const tabDeliveredEl = document.getElementById('tabDelivered');
     const findClipsBtnEl = document.getElementById('findClipsBtn');
+    const engineLocalBtnEl = document.getElementById('engineLocalBtn');
+    const enginePortableBtnEl = document.getElementById('enginePortableBtn');
 
     // D-061 post kit state.
     // kitDrafts: unsaved operator edits, keyed by candidate id. Same discipline
@@ -2061,6 +2092,24 @@
     // is the real backstop against a stacked run, this is just the client
     // avoiding the round trip on the common case.
     let findClipsInFlight = false;
+    // Engine picker (operator ruling 2026-08-09, verbatim: "the option to
+    // either trigger the portable or local engine... the result should be
+    // the same... the routing will just be different." DEFAULT = LOCAL).
+    let selectedEngine = 'local';
+    function setEngine(eng) {
+      selectedEngine = eng;
+      if (engineLocalBtnEl) {
+        engineLocalBtnEl.classList.toggle('active', eng === 'local');
+        engineLocalBtnEl.setAttribute('aria-pressed', String(eng === 'local'));
+      }
+      if (enginePortableBtnEl) {
+        enginePortableBtnEl.classList.toggle('active', eng === 'portable');
+        enginePortableBtnEl.setAttribute('aria-pressed', String(eng === 'portable'));
+      }
+    }
+    if (engineLocalBtnEl) engineLocalBtnEl.onclick = () => setEngine('local');
+    if (enginePortableBtnEl) enginePortableBtnEl.onclick = () => setEngine('portable');
+
     async function findClips() {
       if (findClipsInFlight) return;
       findClipsInFlight = true;
@@ -2068,7 +2117,11 @@
       findClipsBtnEl.disabled = true;
       findClipsBtnEl.textContent = 'Starting run';
       try {
-        const res = await fetch('/api/find-clips', { method: 'POST' });
+        const res = await fetch('/api/find-clips', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ engine: selectedEngine }),
+        });
         const j = await res.json().catch(() => ({}));
         if (!res.ok || !j.started) {
           notify('Could not start the find-clips run.', { technical: String(j.error || res.status) });
@@ -2142,6 +2195,41 @@
     function hideProgressCard() {
       stopProgressPolling();
       if (progressCardEl) progressCardEl.hidden = true;
+      if (localRunStatusEl) localRunStatusEl.hidden = true;
+    }
+
+    // Local engine status line (2026-08-09 operator ruling: local + portable
+    // engines, LOCAL default). GET /api/run-progress's local_run.last_line is
+    // this codebase's usual "RESULT <worker> ... key=value ..." convention
+    // (see workers/find_clips_local.py), carrying a quoted note="..." field
+    // for exactly this reason -- extract it for client-grade copy instead of
+    // dumping the raw machine line; fall back to the raw line if the field is
+    // ever missing so nothing is silently hidden.
+    const localRunStatusEl = document.getElementById('localRunStatus');
+    function parseWorkerNote(line) {
+      const m = /\bnote="([^"]*)"/.exec(line || '');
+      return m ? m[1] : '';
+    }
+
+    function renderLocalRunStatus(lr) {
+      if (!localRunStatusEl) return;
+      if (!lr || (!lr.alive && (lr.exit_code === null || lr.exit_code === 0))) {
+        localRunStatusEl.hidden = true;
+        return;
+      }
+      localRunStatusEl.hidden = false;
+      if (lr.alive) {
+        localRunStatusEl.className = 'local-run-status info';
+        localRunStatusEl.textContent = 'Local engine running';
+        return;
+      }
+      // Ended, nonzero. OBS gate refusals are DESIGNED refusals (D-009), not
+      // a failure -- render as info, not error, when the line carries the
+      // OBS_GUARD_REFUSED marker.
+      const line = lr.last_line || '';
+      const isObsRefusal = line.includes('OBS_GUARD_REFUSED');
+      localRunStatusEl.className = 'local-run-status ' + (isObsRefusal ? 'info' : 'error');
+      localRunStatusEl.textContent = parseWorkerNote(line) || line || 'The local engine run ended with an error.';
     }
 
     async function pollRunProgress() {
@@ -2153,7 +2241,26 @@
       } catch (_) {
         return; // background poll only -- never surface a transient fetch error
       }
-      if (!data || data.idle) { hideProgressCard(); return; }
+      if (!data) { hideProgressCard(); return; }
+
+      const lr = data.local_run || null;
+      // A local run can be alive, or have just refused (lock busy, the
+      // portable engine busy), before it ever creates a recordings row --
+      // `idle` is a GLOBAL "no recording has EVER existed" flag, computed
+      // only from the shared DB witnesses (untouched below), so it says
+      // nothing about the local engine's own state.
+      const localHasSomethingToShow = !!(lr && (lr.alive || (lr.exit_code !== null && lr.exit_code !== 0)));
+
+      if (data.idle) {
+        renderLocalRunStatus(lr);
+        if (localHasSomethingToShow) {
+          if (progressCardEl) progressCardEl.hidden = false;
+          renderProgressStages(null); // nothing to animate yet; steps render 'waiting'
+          return;
+        }
+        hideProgressCard();
+        return;
+      }
       if (typeof data.pending_count === 'number' && data.pending_count > progressBaselinePending) {
         // This run's candidates landed -- the existing pending-list poll
         // (pollRefresh) takes it from here.
@@ -2164,6 +2271,7 @@
       progressStartedAtMs = data.started_at ? Date.parse(data.started_at) : null;
       renderProgressStages(data.stages);
       tickProgressElapsed();
+      renderLocalRunStatus(lr);
     }
 
     function startProgressPolling() {

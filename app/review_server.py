@@ -606,6 +606,76 @@ def fire_find_clips_webhook() -> tuple[str, int]:
         return 'failed', 0
 
 
+# ---------------------------------------------------------------- local engine
+# The LOCAL clip-finding engine (2026-08-09 operator ruling, verbatim: "the
+# option to either trigger the portable or local engine... the result should
+# be the same... the routing will just be different." DEFAULT = LOCAL.)
+# Unlike the portable lane (an n8n webhook, fire-and-forget), the local lane
+# is a real child process on THIS Mac -- app/workers/find_clips_local.py,
+# which itself execs run_vod.py. This server only spawns it, remembers the
+# pid in its OWN module state (this is in-memory: it does not survive a
+# server restart -- find_clips_local.py's own file lock is the durable
+# backstop for that case, see that module's docstring), and tails its log
+# for honest status. It never re-implements any of find_clips_local's logic.
+LOCAL_RUN_LOG = Path(os.environ.get(
+    'CLPR_LOCAL_RUN_LOG', str(Path.home() / 'Library' / 'Logs' / 'clpr-local-run.log')))
+FIND_CLIPS_LOCAL_PATH = Path(__file__).resolve().parent / 'workers' / 'find_clips_local.py'
+
+_local_run_state_lock = threading.Lock()
+_local_run_proc: Optional['subprocess.Popen[bytes]'] = None
+
+
+def tail_last_nonempty_line(path: Path, tail_bytes: int = 65536) -> str:
+    """The last non-empty line of `path`, reading only its final `tail_bytes`
+    -- the logfile is appended forever across runs (never truncated), so a
+    full read on every /api/run-progress poll would grow unboundedly slower
+    over the project's life. Bounded, not exact-from-EOF: if the last
+    `tail_bytes` happen to contain no non-empty line at all (essentially
+    impossible given how short every line these workers print is), this
+    returns '' rather than growing the read -- a smaller honest answer, not
+    a hang."""
+    if not path.exists():
+        return ''
+    try:
+        with path.open('rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - tail_bytes))
+            data = f.read()
+    except OSError:
+        return ''
+    lines = [ln for ln in data.split(b'\n') if ln.strip()]
+    if not lines:
+        return ''
+    return lines[-1].decode('utf-8', errors='replace')
+
+
+def local_run_status() -> dict:
+    """The local engine child's honest state for GET /api/run-progress
+    (local_run: {alive, exit_code, last_line}). `alive`/`exit_code` come from
+    THIS server process's own module state (see the module note above);
+    `last_line` is read from the shared logfile regardless of module state,
+    so it can carry a stale historical line when alive=False and
+    exit_code=None (no run this server process knows about) -- callers
+    (the UI) must treat that specific combination as "nothing to show",
+    never trust last_line on its own."""
+    with _local_run_state_lock:
+        proc = _local_run_proc
+    alive = False
+    exit_code: Optional[int] = None
+    if proc is not None:
+        rc = proc.poll()
+        if rc is None:
+            alive = True
+        else:
+            exit_code = int(rc)
+    return {
+        'alive': alive,
+        'exit_code': exit_code,
+        'last_line': tail_last_nonempty_line(LOCAL_RUN_LOG),
+    }
+
+
 def fetch_candidate_payload(cur, candidate_id: int) -> Optional[dict]:
     """The candidate row in EXACTLY the list-endpoint shape (state included —
     CANDIDATE_PAYLOAD_COLUMNS carries it since the D-055 fixer)."""
@@ -1231,6 +1301,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     'stages': None,
                     'counts': None,
                     'pending_count': pending_count,
+                    'local_run': local_run_status(),
                 })
                 return
 
@@ -1281,6 +1352,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 'clips': clip_count,
             },
             'pending_count': pending_count,
+            'local_run': local_run_status(),
         })
 
     # ---------------------------------------------------------------- D-061
@@ -2037,12 +2109,50 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
         self._send_json(HTTPStatus.OK, updated)
 
-    def _find_clips(self) -> None:
-        """POST /api/find-clips: fire the n8n Form Trigger that starts a new
-        clip-finding run over the operator's recordings. No DB row here --
-        n8n owns everything about the run itself; this endpoint only starts
-        it and reports whether the start succeeded.
+    def _find_clips(self, body_raw: bytes) -> None:
+        """POST /api/find-clips: start a new clip-finding run, either engine
+        (2026-08-09 operator ruling, verbatim: "the option to either trigger
+        the portable or local engine... the result should be the same...
+        the routing will just be different." DEFAULT = LOCAL).
+
+        engine resolution:
+          - no body, or a body whose "engine" key is absent/empty -> local
+            (the ruling's default)
+          - {"engine": "local"} -> local (workers/find_clips_local.py, this
+            Mac)
+          - {"engine": "portable"} -> UNCHANGED below: the existing n8n Form
+            Trigger webhook relay. No DB row here either -- n8n owns
+            everything about that run itself; this endpoint only starts it
+            and reports whether the start succeeded.
+          - any other engine value -> refused (400), naming the bad value
         """
+        engine = 'local'
+        if body_raw:
+            try:
+                payload = json.loads(body_raw.decode('utf-8'))
+            except Exception:
+                self._send_json(HTTPStatus.BAD_REQUEST, {
+                    'started': False,
+                    'error': 'Request body is not valid JSON.',
+                })
+                return
+            if not isinstance(payload, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {
+                    'started': False,
+                    'error': 'Request body must be a JSON object.',
+                })
+                return
+            raw_engine = payload.get('engine')
+            if raw_engine:  # a non-empty value was explicitly given
+                if raw_engine not in ('local', 'portable'):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {
+                        'started': False,
+                        'error': f'Unknown engine "{raw_engine}"; expected "local" or "portable".',
+                    })
+                    return
+                engine = raw_engine
+            # engine key omitted, None, or '' -> falls through, stays 'local'
+
         if not _find_clips_lock.acquire(blocking=False):
             self._send_json(HTTPStatus.CONFLICT, {
                 'started': False,
@@ -2050,6 +2160,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             })
             return
         try:
+            if engine == 'local':
+                self._start_local_find_clips()
+                return
             result, status = fire_find_clips_webhook()
             if result == 'unconfigured':
                 self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
@@ -2068,6 +2181,56 @@ class ReviewHandler(BaseHTTPRequestHandler):
             })
         finally:
             _find_clips_lock.release()
+
+    def _start_local_find_clips(self) -> None:
+        """The LOCAL half of _find_clips: spawn workers/find_clips_local.py
+        detached (fire-and-forget -- this HTTP request does not wait for the
+        run), remembering its pid so a second overlapping POST can be
+        refused loudly (409) without even spawning a redundant process.
+        Called ONLY from inside _find_clips's _find_clips_lock critical
+        section, same as the portable branch above.
+        """
+        to_clip = os.environ.get('CLPR_TO_CLIP_DIR', '').strip()
+        if not to_clip:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                'started': False,
+                'error': 'CLPR_TO_CLIP_DIR is not set, so the local engine has nowhere to look '
+                         'for new recordings. Set it in the environment before using this button.',
+            })
+            return
+
+        global _local_run_proc
+        with _local_run_state_lock:
+            if _local_run_proc is not None and _local_run_proc.poll() is None:
+                self._send_json(HTTPStatus.CONFLICT, {
+                    'started': False,
+                    'error': 'A local find-clips run is already in progress. Wait for it to finish.',
+                })
+                return
+
+            LOCAL_RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+            # CLPR_TO_CLIP_DIR (checked above) and every other CLPR_* override
+            # (CLPR_DB_URL, CLPR_LOCAL_LOCK_FILE, CLPR_SSH_HOST, ...) reach the
+            # child by ordinary environment inheritance -- no `env=` override
+            # here, so nothing is filtered out ("read at spawn and pass
+            # through").
+            logf = open(LOCAL_RUN_LOG, 'a', buffering=1, encoding='utf-8')
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable or 'python3', str(FIND_CLIPS_LOCAL_PATH)],
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            finally:
+                # The child already holds its own duplicated fd to the file
+                # (Popen dup2's it before this returns); closing OUR handle
+                # does not affect the child's ability to keep writing.
+                logf.close()
+            _local_run_proc = proc
+
+        self._send_json(HTTPStatus.OK, {'started': True, 'engine': 'local'})
 
     def _rerender_clip(self, candidate_id: int, body_raw: bytes) -> None:
         """RE-RENDER an already-rendered clip, so a caption decision taken after
@@ -2578,9 +2741,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         if parsed.path == '/api/find-clips':
             content_len = int(self.headers.get('Content-Length', '0') or '0')
-            if content_len > 0:
-                _ = self.rfile.read(content_len)  # the client sends no body; drain defensively
-            self._find_clips()
+            body_raw = self.rfile.read(content_len) if content_len > 0 else b''
+            self._find_clips(body_raw)
             return
 
         m = POST_ACTION_RE.match(parsed.path)
