@@ -2190,12 +2190,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
         Called ONLY from inside _find_clips's _find_clips_lock critical
         section, same as the portable branch above.
         """
-        to_clip = os.environ.get('CLPR_TO_CLIP_DIR', '').strip()
-        if not to_clip:
+        sa_json = os.environ.get('CLPR_GDRIVE_SA_JSON', '').strip()
+        if not sa_json:
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
                 'started': False,
-                'error': 'CLPR_TO_CLIP_DIR is not set, so the local engine has nowhere to look '
-                         'for new recordings. Set it in the environment before using this button.',
+                'error': 'CLPR_GDRIVE_SA_JSON is not set, so the local engine has no '
+                         'service-account key to read the to_clip Drive folder with. Set it '
+                         'in the environment before using this button.',
             })
             return
 
@@ -2209,7 +2210,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return
 
             LOCAL_RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
-            # CLPR_TO_CLIP_DIR (checked above) and every other CLPR_* override
+            # CLPR_GDRIVE_SA_JSON (checked above) and every other CLPR_* override
             # (CLPR_DB_URL, CLPR_LOCAL_LOCK_FILE, CLPR_SSH_HOST, ...) reach the
             # child by ordinary environment inheritance -- no `env=` override
             # here, so nothing is filtered out ("read at spawn and pass

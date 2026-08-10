@@ -3,8 +3,22 @@
 
 Operator ruling (2026-08-09, verbatim, law): under Find clips, "the option to
 either trigger the portable or local engine... the result should be the
-same... the routing will just be different." Both engines read the SAME
-to_clip directory via Drive desktop sync. DEFAULT = LOCAL.
+same... the routing will just be different." DEFAULT = LOCAL.
+
+SOURCE MECHANISM -- SUPERSEDED SAME DAY. The ruling above originally meant
+"both engines read the SAME to_clip directory via Drive desktop sync." That
+was replaced hours later by a second operator ruling (2026-08-09, verbatim):
+"The durable alternative is to have the local engine read Drive through the
+same service-account API -> apply this . still true to local makes more
+sense." Reason: the desktop-sync path lives under ~/Library/CloudStorage,
+which macOS protects with TCC; this driver runs as a LaunchAgent, LaunchAgents
+hold no Full Disk Access grant, and every local run died instantly with
+[Errno 1] Operation not permitted before doing any work (proven with a
+two-way control: launchd-spawned `ls` denied, identical `ls` from an
+FDA-holding shell succeeded). So this driver now resolves and downloads the
+to_clip video through the Drive API -- via workers/fetch_drive_file.py, the
+SAME worker and the SAME query the portable/n8n lane's node 0b already uses
+-- which removes the protected path from the process entirely.
 
 This mirrors the portable (n8n) finder's front half -- resolve the newest
 candidate, refuse honestly when there is nothing new to do -- then hands the
@@ -23,17 +37,18 @@ this file to a moving target. Where the same SQL shape is genuinely needed
 not imported.
 
 KNOWN GAP -- NOT FIXED HERE, FLAGGED FOR THE OPERATOR/DESIGN AGENT.
-CLPR_TO_CLIP_DIR (this driver's video source, per the ruling above) and
-workers/ingest_vods.VIDEO_ROOT (currently hardcoded to
-/Volumes/GOLDMINE/vibecoder-recordings/, the ONLY directory run_vod.py's
-`ingest` stage ever scans -- no CLI flag exists to point it elsewhere) are
-TWO DIFFERENT DIRECTORIES. On the day this file was written, to_clip held
-zero video files and GOLDMINE held 15. So: a genuinely new recording that
-lands in to_clip will be picked by find_newest_video() below, handed to
-`run_vod.py --video <to_clip-path>`, sail through preflight, and then fail
-at the `ingest` stage -- ingest_vods.py will not register a to_clip path
-(it never scans that directory), so run_vod's own post-ingest lookup will
-raise a StageFailure ("no recordings row exists for path=..."). run_vod.py
+CLPR_LOCAL_MEDIA_DIR (this driver's download destination, default
+~/clpr-media -- see the ruling above) and workers/ingest_vods.VIDEO_ROOT
+(currently hardcoded to /Volumes/GOLDMINE/vibecoder-recordings/, the ONLY
+directory run_vod.py's `ingest` stage ever scans -- no CLI flag exists to
+point it elsewhere) are TWO DIFFERENT DIRECTORIES. On the day this file was
+written, to_clip held zero video files and GOLDMINE held 15. So: a genuinely
+new recording that lands in to_clip will be resolved and downloaded by
+resolve_to_clip_video()/ensure_local_video() below, handed to `run_vod.py
+--video <downloaded-local-path>`, sail through preflight, and then fail at
+the `ingest` stage -- ingest_vods.py will not register that path (it never
+scans CLPR_LOCAL_MEDIA_DIR), so run_vod's own post-ingest lookup will raise
+a StageFailure ("no recordings row exists for path=..."). run_vod.py
 already half-anticipates this (see its own NOTE at the "ingest will not
 register it" check), but the actual failure is real and reproducible; fixing
 it means changing ingest_vods.py's scan root or adding a single-file ingest
@@ -48,12 +63,16 @@ StageFailure, propagated verbatim below, never swallowed or worked around.
 Exit codes
 ----------
     0  pipeline complete (run_vod exit 0), OR NO_NEW_VOD (nothing to do --
-       an empty to_clip dir, or the newest file is already processed; see
-       dedupe_skip_reason() for the exact rule shipped)
+       an empty to_clip Drive folder, or the newest file is already
+       processed; see dedupe_skip_reason() for the exact rule shipped)
     1  run_vod.py exited 1 (a stage failed for a reason other than the three
-       classified below), or an unexpected error in this driver itself
+       classified below), resolving or fetching the to_clip video failed
+       (more than one match, an auth/transport failure, a size-ceiling
+       refusal, ...; marker=none, note carries the raw detail), or an
+       unexpected error in this driver itself
     2  usage/config problem in THIS driver, before run_vod.py is ever
-       invoked: CLPR_TO_CLIP_DIR unset, or the directory it names is missing
+       invoked: CLPR_GDRIVE_SA_JSON unset, or the file it names does not
+       exist
     3  passthrough of run_vod's EXIT_OBS_GATE (D-009/D-019) -- NOT a
        failure; the RESULT line below carries marker=OBS_GUARD_REFUSED
     4  passthrough of run_vod's EXIT_QUALITY_GATE (D-028) -- marker=QUALITY_GATE_FAILED
@@ -86,6 +105,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -100,23 +120,15 @@ import db
 APP_DIR = Path(__file__).resolve().parent.parent
 WORKERS_DIR = APP_DIR / 'workers'
 
-# Kept in sync with ingest_vods.VIDEO_EXTS by reading it, never by copying it
-# (charter: never describe existing code from memory) -- ingest_vods.py is
-# NOT on the concurrent-edit list this brief named, so importing this one
-# stable constant from it is safe (unlike run_vod.py, deliberately not
-# imported anywhere in this file -- see the module docstring).
-try:
-    from ingest_vods import VIDEO_EXTS
-except Exception:  # pragma: no cover - only if ingest_vods cannot be imported
-    VIDEO_EXTS = {'.mov', '.mp4', '.mkv'}
-
-ENV_TO_CLIP_DIR = 'CLPR_TO_CLIP_DIR'
+ENV_SA_JSON = 'CLPR_GDRIVE_SA_JSON'  # same env var name the n8n server lane uses
+ENV_LOCAL_MEDIA_DIR = 'CLPR_LOCAL_MEDIA_DIR'
 ENV_LOCAL_LOCK_FILE = 'CLPR_LOCAL_LOCK_FILE'
 ENV_RUN_VOD_PATH = 'CLPR_RUN_VOD_PATH'
 ENV_SSH_HOST = 'CLPR_SSH_HOST'  # same name review_server.py already uses -- one truth
 ENV_N8N_CONTAINER = 'CLPR_N8N_CONTAINER'
 ENV_PORTABLE_LOCK_PATH = 'CLPR_PORTABLE_LOCK_PATH'
 
+DEFAULT_LOCAL_MEDIA_DIR = Path.home() / 'clpr-media'
 DEFAULT_LOCAL_LOCK_FILE = Path.home() / 'Library' / 'Logs' / 'clpr-local-run.lock'
 DEFAULT_RUN_VOD_PATH = WORKERS_DIR / 'run_vod.py'
 DEFAULT_SSH_HOST = 'n8nserver'
@@ -125,6 +137,23 @@ DEFAULT_PORTABLE_LOCK_PATH = '/home/node/.n8n/clpr/run.lock'
 PORTABLE_LOCK_FRESH_MINUTES = 30
 SSH_TIMEOUT_S = 10
 LOCAL_LOCK_GRACE_SECONDS = 5.0
+
+# The to_clip Drive folder + query: the SAME query the portable lane's node
+# 0b uses, so both lanes see the identical source set (brief, 2026-08-09).
+TO_CLIP_QUERY = (
+    "'1lLg9ZwSBSPO7Vgkc_5RZQ63wYwy6_-Jp' in parents and mimeType contains "
+    "'video/' and trashed = false"
+)
+
+# Exact integer the operator raised both node 0b and node 7b to, 2026-08-09
+# (verbatim ruling) -- the bare literal, not 5*1024**3 and not
+# 5_000_000_000, so a grep for the literal digits finds this file too.
+MAX_INPUT_BYTES = 5000000000
+
+# The EXACT text fetch_drive_file.py's require_exactly_one() emits for the
+# zero-match case, and ONLY that case -- matched verbatim so an auth failure
+# or any other refusal can never be misread as clean idle.
+FETCH_DRIVE_FILE_ZERO_MATCH_TEXT = 'Drive query matched ZERO files, refusing'
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -160,36 +189,143 @@ def utc_now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: resolve the newest candidate video in CLPR_TO_CLIP_DIR
+# Step 1: resolve the to_clip video via the Drive API (2026-08-09 ruling,
+# superseding desktop sync -- see module docstring), then ensure it exists on
+# local disk, downloading it via the EXISTING, already-proven
+# app/workers/fetch_drive_file.py (not re-implemented here; see that file's
+# own docstring for the transfer/auth/retry/idempotence-on-failure contract).
 # ---------------------------------------------------------------------------
 
-def resolve_to_clip_dir() -> tuple[Optional[Path], Optional[str]]:
-    """(dir, None) on success, (None, refusal message) otherwise. Refuses
-    loudly, naming the env var, when it is unset; refuses when the directory
-    it names does not exist."""
-    raw = os.environ.get(ENV_TO_CLIP_DIR, '').strip()
+def fetch_drive_file_path() -> Path:
+    return WORKERS_DIR / 'fetch_drive_file.py'
+
+
+def resolve_sa_json() -> tuple[Optional[str], Optional[str]]:
+    """(path, None) on success, (None, refusal message) otherwise. Refuses
+    loudly, naming the env var, when it is unset; refuses when the file it
+    names does not exist. Never lets fetch_drive_file.py's own
+    DEFAULT_SA_PATH fallback engage -- that fallback is built for the n8n
+    container, not this Mac, and letting it engage here would mean the
+    negative control downstream refuses for the WRONG reason."""
+    raw = os.environ.get(ENV_SA_JSON, '').strip()
     if not raw:
-        return None, f'{ENV_TO_CLIP_DIR} is not set. Point it at the to_clip Drive-synced directory.'
-    d = Path(raw)
-    if not d.is_dir():
-        return None, f'{ENV_TO_CLIP_DIR} names a directory that does not exist: {d}'
-    return d, None
+        return None, (f'{ENV_SA_JSON} is not set. Point it at the service-account JSON '
+                       f'key the local engine uses to read the to_clip Drive folder.')
+    p = Path(raw)
+    if not p.is_file():
+        return None, f'{ENV_SA_JSON} names a file that does not exist: {p}'
+    return raw, None
 
 
-def find_newest_video(directory: Path) -> Optional[Path]:
-    """The newest (by mtime) video file directly in `directory`, or None.
+def safe_note(text: str) -> str:
+    """Sanitize free text -- some of it sourced from fetch_drive_file.py's own
+    error output, which makes no promise about this file's note="..."
+    contract -- before it reaches this driver's own RESULT line: no literal
+    double-quote, no em dash, collapsed to one line (module docstring: "note
+    text is authored to never contain a literal double-quote character ...
+    and never an em dash")."""
+    return ' '.join(text.replace('"', "'").replace('—', '-').split())
 
-    Matches node 0b's semantics: exactly one candidate video is expected at
-    a time in normal operation, so "pick the newest" is the whole rule --
-    older files are silently ignored (not an error), and an empty directory
-    is not an error either (see NO_NEW_VOD in main())."""
-    candidates = [
-        p for p in directory.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+def _run_fetch_drive_file(args: list) -> subprocess.CompletedProcess:
+    py = sys.executable or 'python3'
+    cmd = [py, str(fetch_drive_file_path())] + args
+    say(f'  $ {" ".join(cmd)}')
+    return subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def _parse_metadata_result_line(text: str) -> Optional[dict]:
+    """Parse fetch_drive_file.py's own metadata-only RESULT line:
+    'RESULT fetch_drive_file file_id=... ok=1 metadata_only=1 name="..."
+    bytes=... mime="..." elapsed_s=...'. Returns {'id','name','bytes'}, or
+    None if no such line is found / it is not shaped as expected."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith('RESULT fetch_drive_file'):
+            continue
+        m_id = re.search(r'file_id=(\S+)', line)
+        m_name = re.search(r'name="(.*?)" bytes=', line)
+        m_bytes = re.search(r'bytes=(\d+)', line)
+        if m_id and m_name and m_bytes:
+            return {'id': m_id.group(1), 'name': m_name.group(1), 'bytes': int(m_bytes.group(1))}
+    return None
+
+
+def resolve_to_clip_video(sa_json: str) -> tuple[Optional[dict], Optional[str], bool]:
+    """Resolve exactly one video in the to_clip Drive folder via
+    fetch_drive_file.py --metadata-only (no bytes moved yet).
+
+    Returns (meta, refusal, is_no_new_vod):
+      - (meta, None, False)     exactly one match; meta = {'id','name','bytes'}
+      - (None, None, True)      ZERO matches -- clean idle, NOT an error
+      - (None, refusal, False)  more than one match, or any other resolve
+        failure (auth, transport, malformed response, ...) -- refuse loudly
+    """
+    proc = _run_fetch_drive_file([
+        '--query', TO_CLIP_QUERY,
+        '--metadata-only',
+        '--sa-json', sa_json,
+    ])
+    combined = (proc.stdout or '') + '\n' + (proc.stderr or '')
+    if proc.returncode == 0:
+        meta = _parse_metadata_result_line(proc.stdout or '')
+        if meta is None:
+            return None, (f'fetch_drive_file.py exited 0 but its RESULT line could not be '
+                           f'parsed: {(proc.stdout or "").strip()!r}'), False
+        return meta, None, False
+    if FETCH_DRIVE_FILE_ZERO_MATCH_TEXT in combined:
+        return None, None, True
+    detail = (proc.stderr or '').strip() or (proc.stdout or '').strip() or (
+        f'fetch_drive_file.py exited {proc.returncode} with no output')
+    return None, detail, False
+
+
+def local_media_dir() -> Path:
+    raw = os.environ.get(ENV_LOCAL_MEDIA_DIR, '').strip()
+    d = Path(raw) if raw else DEFAULT_LOCAL_MEDIA_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def ensure_local_video(meta: dict, sa_json: str) -> tuple[Optional[Path], Optional[str]]:
+    """Ensure meta's video exists on local disk, downloading it via
+    fetch_drive_file.py if it does not. Enforces MAX_INPUT_BYTES BEFORE
+    downloading (parity with the portable lane's node 0b/7b ceiling, raised
+    to this exact integer by the operator 2026-08-09).
+
+    IDEMPOTENCE: a same-name file of the SAME byte size already present is
+    reused, not re-downloaded -- the source VOD is multi-gigabyte and this
+    runs from a UI button a person may press twice. A same-name file of a
+    DIFFERENT size is treated as incomplete/stale and re-fetched:
+    fetch_drive_file.py writes to a `.part` file and only os.replace()s it
+    onto the final name after its own byte-for-byte size verification, so a
+    re-fetch cannot leave a mismatched file behind.
+    """
+    media_dir = local_media_dir()
+    dest = media_dir / meta['name']
+    if dest.is_file() and dest.stat().st_size == meta['bytes']:
+        say(f'  already downloaded  {dest}  ({meta["bytes"]} bytes) -- reusing, not re-fetching.')
+        return dest, None
+
+    proc = _run_fetch_drive_file([
+        '--file-id', meta['id'],
+        '--out-dir', str(media_dir),
+        '--sa-json', sa_json,
+        '--max-bytes', str(MAX_INPUT_BYTES),
+    ])
+    for line in (proc.stdout or '').splitlines():
+        say(f'  [fetch_drive_file] {line}')
+    if proc.returncode != 0:
+        detail = (proc.stderr or '').strip() or (proc.stdout or '').strip() or (
+            f'fetch_drive_file.py exited {proc.returncode} with no output')
+        return None, f'download failed: {detail}'
+    if not dest.is_file():
+        return None, f'fetch_drive_file.py reported success but the expected file is missing: {dest}'
+    actual = dest.stat().st_size
+    if actual != meta['bytes']:
+        return None, (f'downloaded file size mismatch: expected {meta["bytes"]} bytes, '
+                       f'got {actual} at {dest}')
+    return dest, None
 
 
 # ---------------------------------------------------------------------------
@@ -403,21 +539,34 @@ def main() -> int:
     say('find_clips_local -- LOCAL engine driver (operator default, 2026-08-09)')
     say('=' * 78)
 
-    to_clip_dir, dir_problem = resolve_to_clip_dir()
-    if dir_problem:
-        print(f'ERROR: {dir_problem}', file=sys.stderr)
+    sa_json, sa_problem = resolve_sa_json()
+    if sa_problem:
+        print(f'ERROR: {sa_problem}', file=sys.stderr)
         say(f'RESULT find_clips_local ok=0 video="" run_vod_exit=none marker=USAGE_ERROR '
-            f'note="{dir_problem}"')
+            f'note="{safe_note(sa_problem)}"')
         return EXIT_USAGE
-    say(f'  to_clip dir    {to_clip_dir}')
+    say(f'  service-account key  {sa_json}')
 
-    video = find_newest_video(to_clip_dir)
-    if video is None:
-        note = f'No new recording to process: {to_clip_dir} has no video files.'
+    meta, resolve_problem, no_new_vod = resolve_to_clip_video(sa_json)
+    if no_new_vod:
+        note = 'No new recording to process: the to_clip Drive folder has no video files.'
         say(f'NO_NEW_VOD reason="{note}"')
         say(f'RESULT find_clips_local ok=1 video="" run_vod_exit=none marker=NO_NEW_VOD note="{note}"')
         return EXIT_OK
-    say(f'  newest video   {video}  (mtime {time.ctime(video.stat().st_mtime)})')
+    if resolve_problem:
+        print(f'ERROR: {resolve_problem}', file=sys.stderr)
+        say(f'RESULT find_clips_local ok=0 video="" run_vod_exit=none marker=none '
+            f'note="{safe_note(resolve_problem)}"')
+        return EXIT_FAIL
+    say(f'  to_clip video  {meta["name"]}  ({meta["bytes"]} bytes, id={meta["id"]})')
+
+    video, fetch_problem = ensure_local_video(meta, sa_json)
+    if fetch_problem:
+        print(f'ERROR: {fetch_problem}', file=sys.stderr)
+        say(f'RESULT find_clips_local ok=0 video="" run_vod_exit=none marker=none '
+            f'note="{safe_note(fetch_problem)}"')
+        return EXIT_FAIL
+    say(f'  local video    {video}')
 
     skip_reason = dedupe_skip_reason(str(video))
     if skip_reason:
