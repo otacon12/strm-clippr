@@ -145,6 +145,19 @@ TO_CLIP_QUERY = (
     "'video/' and trashed = false"
 )
 
+# The to_clip folder id itself, as a named constant separate from
+# TO_CLIP_QUERY above (kept in sync by hand rather than parsed out of the
+# query string) -- this is the --src-folder-id passed to move_drive_file.py
+# in move_out_of_to_clip() below: the folder this run's video was actually
+# resolved FROM.
+TO_CLIP_FOLDER_ID = '1lLg9ZwSBSPO7Vgkc_5RZQ63wYwy6_-Jp'
+
+# Destination for a VOD once it has started processing (operator ruling,
+# verbatim, 2026-08-10): "after the file in to_clip starts processing it
+# should be moved to: 19mErWEhWlux_Hw8A7hFE4jYwgWm5mU5X". Operator-supplied
+# and used exactly as given -- see move_out_of_to_clip() below.
+PROCESSED_FOLDER_ID = '19mErWEhWlux_Hw8A7hFE4jYwgWm5mU5X'
+
 # The EXACT text fetch_drive_file.py's require_exactly_one() emits for the
 # zero-match case, and ONLY that case -- matched verbatim so an auth failure
 # or any other refusal can never be misread as clean idle.
@@ -318,6 +331,60 @@ def ensure_local_video(meta: dict, sa_json: str) -> tuple[Optional[Path], Option
         return None, (f'downloaded file size mismatch: expected {meta["bytes"]} bytes, '
                        f'got {actual} at {dest}')
     return dest, None
+
+
+# ---------------------------------------------------------------------------
+# Step 1b: move the VOD out of to_clip now that it is safely local and
+# verified (operator ruling, 2026-08-10 -- see move_out_of_to_clip() below).
+# Via the EXISTING, already-proven app/workers/move_drive_file.py (not
+# re-implemented here; see that file's own docstring for the
+# addParents/removeParents/idempotence/non-destructive contract).
+# ---------------------------------------------------------------------------
+
+def move_drive_file_path() -> Path:
+    return WORKERS_DIR / 'move_drive_file.py'
+
+
+def _run_move_drive_file(args: list) -> subprocess.CompletedProcess:
+    py = sys.executable or 'python3'
+    cmd = [py, str(move_drive_file_path())] + args
+    say(f'  $ {" ".join(cmd)}')
+    return subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def move_out_of_to_clip(meta: dict, sa_json: str) -> None:
+    """Move the to_clip video meta describes to PROCESSED_FOLDER_ID.
+
+    Uses meta['id'] -- the file id ALREADY resolved by
+    resolve_to_clip_video() above -- and never re-queries Drive to find it
+    again: the file may already have moved (a prior run, a retry), and a
+    second query could then resolve nothing, or resolve a DIFFERENT file.
+
+    THE MOVE IS NOT ALLOWED TO FAIL THIS RUN (brief, 2026-08-10). On any
+    failure this prints a loud, clearly-marked WARNING naming the file and
+    the reason, then returns normally so the caller proceeds to the
+    pipeline -- the hour of compute the pipeline is about to spend is worth
+    far more than the Drive tidy-up. No retry loop; a single attempt only.
+    Idempotence (a file already in PROCESSED_FOLDER_ID) is handled inside
+    move_drive_file.py itself and reports as an ordinary success here.
+    """
+    proc = _run_move_drive_file([
+        '--file-id', meta['id'],
+        '--dest-folder-id', PROCESSED_FOLDER_ID,
+        '--src-folder-id', TO_CLIP_FOLDER_ID,
+        '--sa-json', sa_json,
+    ])
+    for line in (proc.stdout or '').splitlines():
+        say(f'  [move_drive_file] {line}')
+    if proc.returncode != 0:
+        detail = (proc.stderr or '').strip() or (proc.stdout or '').strip() or (
+            f'move_drive_file.py exited {proc.returncode} with no output')
+        say('!' * 78)
+        say(f'WARNING: could not move "{meta.get("name", meta["id"])}" '
+            f'(id={meta["id"]}) out of to_clip. It will remain in to_clip '
+            f'and may be picked up again by a future run. The pipeline is '
+            f'proceeding anyway. Reason: {detail}')
+        say('!' * 78)
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +626,14 @@ def main() -> int:
             f'note="{safe_note(fetch_problem)}"')
         return EXIT_FAIL
     say(f'  local video    {video}')
+
+    # Move the VOD out of to_clip now that the download is complete and the
+    # local file is verified on disk, and BEFORE any pipeline stage runs
+    # (brief, 2026-08-10) -- a failed move must never race a Drive change
+    # against bytes that are not yet safely local. See
+    # move_out_of_to_clip()'s own docstring for why a move failure here can
+    # never fail this run.
+    move_out_of_to_clip(meta, sa_json)
 
     skip_reason = dedupe_skip_reason(str(video))
     if skip_reason:
