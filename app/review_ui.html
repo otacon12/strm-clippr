@@ -1616,6 +1616,7 @@
             <button class="nudge" id="btnRegen">Regenerate copy</button>
             <span class="unsaved" id="kitUnsaved" style="display:${kitHasUnsaved(c) ? 'inline-flex' : 'none'};">Unsaved edit</span>
           </div>
+          <div class="hint">Writes new kit text only. The video file is not touched.</div>
           <div class="kitmeta">Saving never overwrites. It writes v${(c.kit_version || 0) + 1} and keeps
             every earlier version. Regenerating asks first if the active version is yours, and the server
             refuses it outright without that confirmation.</div>
@@ -1656,7 +1657,7 @@
                is a COPY action. Same id/handler as before; only its position
                moved, so it is no longer trapped inside the kit-exists branch. -->
           <button class="nudge" id="btnRerender" title="Re-cut the video file with the current caption setting">Re-render video</button>
-          <span class="hint">Re-cuts this file with the current caption setting and uploads it again.</span>
+          <span class="hint">Cuts the video again with the current captions, hook, colors, and window, and delivers the new file.</span>
         </div>` : ''}
         <div class="kitgrid">
           <div>
@@ -2019,7 +2020,8 @@
     // only way a caption decision taken AFTER delivery reaches Drive.
     async function rerenderClip(c, btn) {
       const on = c.burn_captions === 1;
-      const msg = 'Re-render this clip?\n\n'
+      const msg = 'Cuts the video again with the current captions, hook, colors, and window, and delivers the new file.\n\n'
+        + 'Re-render this clip?\n\n'
         + 'It re-cuts the video with captions ' + (on ? 'on' : 'off')
         + ' and uploads it again.\n\n'
         + 'The upload creates a new file rather than replacing one, so delete the '
@@ -2196,7 +2198,8 @@
         // The server refuses this without confirm=true regardless of what the
         // browser does. This dialog exists so the refusal is not a dead end.
         if (!window.confirm(
-          `The active version (v${c.kit_version}) is your edit.\n\n`
+          `Writes new kit text only. The video file is not touched.\n\n`
+          + `The active version (v${c.kit_version}) is your edit.\n\n`
           + 'Regenerating asks the generator to write a new machine draft on top of it. Your version is '
           + 'kept forever and stays readable in the history, but the active kit will no longer be your '
           + 'words.\n\nRegenerate anyway?')) {
