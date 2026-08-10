@@ -67,9 +67,9 @@ Exit codes
        processed; see dedupe_skip_reason() for the exact rule shipped)
     1  run_vod.py exited 1 (a stage failed for a reason other than the three
        classified below), resolving or fetching the to_clip video failed
-       (more than one match, an auth/transport failure, a size-ceiling
-       refusal, ...; marker=none, note carries the raw detail), or an
-       unexpected error in this driver itself
+       (more than one match, an auth/transport failure, ...; marker=none,
+       note carries the raw detail), or an unexpected error in this driver
+       itself
     2  usage/config problem in THIS driver, before run_vod.py is ever
        invoked: CLPR_GDRIVE_SA_JSON unset, or the file it names does not
        exist
@@ -144,11 +144,6 @@ TO_CLIP_QUERY = (
     "'1lLg9ZwSBSPO7Vgkc_5RZQ63wYwy6_-Jp' in parents and mimeType contains "
     "'video/' and trashed = false"
 )
-
-# Exact integer the operator raised both node 0b and node 7b to, 2026-08-09
-# (verbatim ruling) -- the bare literal, not 5*1024**3 and not
-# 5_000_000_000, so a grep for the literal digits finds this file too.
-MAX_INPUT_BYTES = 5000000000
 
 # The EXACT text fetch_drive_file.py's require_exactly_one() emits for the
 # zero-match case, and ONLY that case -- matched verbatim so an auth failure
@@ -289,9 +284,7 @@ def local_media_dir() -> Path:
 
 def ensure_local_video(meta: dict, sa_json: str) -> tuple[Optional[Path], Optional[str]]:
     """Ensure meta's video exists on local disk, downloading it via
-    fetch_drive_file.py if it does not. Enforces MAX_INPUT_BYTES BEFORE
-    downloading (parity with the portable lane's node 0b/7b ceiling, raised
-    to this exact integer by the operator 2026-08-09).
+    fetch_drive_file.py if it does not.
 
     IDEMPOTENCE: a same-name file of the SAME byte size already present is
     reused, not re-downloaded -- the source VOD is multi-gigabyte and this
@@ -311,7 +304,6 @@ def ensure_local_video(meta: dict, sa_json: str) -> tuple[Optional[Path], Option
         '--file-id', meta['id'],
         '--out-dir', str(media_dir),
         '--sa-json', sa_json,
-        '--max-bytes', str(MAX_INPUT_BYTES),
     ])
     for line in (proc.stdout or '').splitlines():
         say(f'  [fetch_drive_file] {line}')
