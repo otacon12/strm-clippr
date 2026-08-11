@@ -3575,6 +3575,13 @@
     function move(delta) {
       if (!candidates.length) return;
       idx = Math.max(0, Math.min(candidates.length - 1, idx + delta));
+      // Follow the selection to whichever page now contains it -- pagination
+      // (this same brief) sliced the list to one page at a time, so without
+      // this a j/k move past the current page's boundary highlights a row
+      // the operator cannot see, while the detail pane shows a different
+      // clip than the list appears to. No auto-scroll-within-page here;
+      // this only picks the right PAGE, same as a click already did.
+      page = Math.floor(idx / PAGE_SIZE);
       renderList();
       renderDetail();
     }
