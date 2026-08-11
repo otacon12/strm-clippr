@@ -155,6 +155,11 @@ EXIT_OBS_GATE = 3
 EXIT_QUALITY_GATE = 4
 EXIT_EXTRACT_REFUSED = 5
 
+# Opt-out for the post-push local slice staging cleanup (operator "do both"
+# directive): unset/anything else means DELETE, the operator-approved
+# default. Same shape as find_clips_local.py's CLPR_KEEP_LOCAL_SOURCE.
+ENV_KEEP_SLICE_STAGING = 'CLPR_KEEP_SLICE_STAGING'
+
 STAGE_ORDER = [
     'ingest',
     'audio_guard',
@@ -647,6 +652,71 @@ def slice_staging_dir(recording_id: int):
     second copy of that <base>/<recording_id> formula — so `slice` and `push`
     always agree on where staged slices live."""
     return stage_slices_remote.staging_dir_for(recording_id)
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Total bytes of every regular file under path, recursively."""
+    total = 0
+    for entry in path.rglob('*'):
+        if entry.is_file():
+            try:
+                total += entry.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def cleanup_slice_staging_on_push_success(recording_id: int, res: 'StageResult') -> None:
+    """Delete recording_id's OWN local slice staging directory after a push
+    that has ALREADY SUCCEEDED.
+
+    CALL-SITE GUARANTEE (not re-checked here): this is invoked only from the
+    `if stage == 'push':` block in main(), placed AFTER
+    execute_stage(stage, cmd, res, ...) returns without raising. execute_stage
+    raises StageFailure on any non-zero exit, which unwinds straight to
+    main()'s `except StageFailure` handler — so a failed, refused, or never-
+    run push can never reach this function. Same guarantee the pre-existing
+    audio_guard .m4a cleanup above already relies on.
+
+    WHY (operator "do both"): local slice staging is never cleaned otherwise
+    and reached 4.6 GB across two recordings on a machine at 98% capacity.
+    Rendering happens SERVER-SIDE from the server's own copy —
+    stage_slices_remote.py's own per-file remote verify (size + ownership)
+    is what just ran inside this successful push — so once we are here the
+    local copy has no remaining consumer.
+
+    SCOPE: deletes ONLY slice_staging_dir(recording_id), which is
+    <base>/<recording_id> by construction (stage_slices_remote.
+    staging_dir_for) — this recording's own directory, never the base
+    directory and never a sibling recording's. No glob, no listing of the
+    parent.
+
+    OPT-OUT: CLPR_KEEP_SLICE_STAGING=1 disables this entirely (same shape as
+    find_clips_local.py's CLPR_KEEP_LOCAL_SOURCE); unset/anything else means
+    DELETE, the operator-approved default.
+
+    NEVER FAILS THE RUN: the push already succeeded and the pipeline's work
+    is already committed by the time this runs. A failed rmtree
+    (permissions, a race) is reported loudly and swallowed — it must never
+    turn a successful push into a failed run.
+    """
+    if os.environ.get(ENV_KEEP_SLICE_STAGING, '').strip() == '1':
+        say(f'  {ENV_KEEP_SLICE_STAGING}=1 -- keeping local slice staging for recording '
+            f'{recording_id} (not deleted).')
+        return
+
+    staging = slice_staging_dir(recording_id)
+    try:
+        if not staging.is_dir():
+            say(f'         slice staging dir {staging} does not exist -- nothing to clean up.')
+            return
+        reclaimed = _dir_size_bytes(staging)
+        shutil.rmtree(staging)
+        res.detail += f'; slice staging cleaned up ({reclaimed} bytes reclaimed)'
+        say(f'SLICE_STAGING_CLEANUP deleted dir="{staging}" bytes_reclaimed={reclaimed}')
+    except OSError as exc:
+        say(f'         WARNING: could not remove slice staging dir {staging}: {exc} '
+            f'(the push already succeeded; this does not fail the run).')
 
 
 def candidate_has_valid_staged_slice(staging_dir, candidate_id: int, video: str) -> bool:
@@ -1276,6 +1346,13 @@ def main() -> int:
                         say(f'         .m4a discarded ({guard_out.name}) — nothing downstream reads it (LO-03)')
                     except OSError as exc:
                         say(f'         WARNING: could not remove discarded .m4a artifact {guard_out}: {exc}')
+
+            if stage == 'push':
+                # Reached ONLY when execute_stage(...) above returned without
+                # raising, i.e. the push already succeeded — see
+                # cleanup_slice_staging_on_push_success's own docstring for
+                # the full guarantee.
+                cleanup_slice_staging_on_push_success(recording_id, res)
 
     except StageFailure as exc:
         say('')
