@@ -137,6 +137,9 @@ ENV_PORTABLE_LOCK_PATH = 'CLPR_PORTABLE_LOCK_PATH'
 # direct completeness witness that makes the mtime guard's proxy unnecessary
 # for this one file (see ingest_vods.py's module docstring).
 ENV_SKIP_AGE_CHECK = 'CLPR_SKIP_AGE_CHECK'
+# Opt-out for the post-success local-source deletion below (Step 6). Default
+# is DELETE -- operator ruling, verbatim: "yes do delete after success".
+ENV_KEEP_LOCAL_SOURCE = 'CLPR_KEEP_LOCAL_SOURCE'
 
 DEFAULT_LOCAL_MEDIA_DIR = Path.home() / 'clpr-media'
 DEFAULT_LOCAL_LOCK_FILE = Path.home() / 'Library' / 'Logs' / 'clpr-local-run.lock'
@@ -561,6 +564,73 @@ def run_run_vod(video: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Step 6: delete the local source after a SUCCESSFUL run (operator ruling,
+# 2026-08-10, verbatim: "yes do delete after success"). His Mac was at 98%
+# capacity and disk cost was growing as the SUM of every VOD ever processed
+# rather than the largest single one; this is the fix.
+#
+# NEVER TOUCHES GOOGLE DRIVE. Drive remains the source of truth, which is
+# precisely what makes deleting the LOCAL copy safe: it is a cache, not the
+# asset. This function only calls Path.unlink() on local paths; no Drive
+# call is made anywhere in or near it.
+# ---------------------------------------------------------------------------
+
+def delete_local_source(video: Path) -> None:
+    """Delete the local source file this driver downloaded (`video`), plus
+    the derived .m4a beside it if present -- run_vod.py's own module
+    docstring: that .m4a "is consumed by NOTHING downstream". run_vod.py's
+    audio_guard stage already unlinks that .m4a immediately after every run
+    (D-074 ruling 9 / LO-03), so in the ordinary case it is already gone by
+    the time this runs; deleting it here too is a defensive no-op for that
+    case, not a second source of truth for where it lives. Same derivation
+    run_vod.audio_artifact_path() uses (Path.with_suffix('.m4a')) --
+    reproduced here rather than imported, matching this file's existing
+    shallow-coupling rule (run_vod.py is on the do-not-touch list and is
+    under concurrent, unrelated edit -- see the module docstring).
+
+    TIMING -- SAFE ONLY HERE: called from main() only inside the
+    `rc == RUN_VOD_EXIT_OK` branch, i.e. only after run_vod.py has exited 0.
+    The slice stage cuts clips FROM this exact source file and the push
+    stage ships those slices to the review server; exit 0 means both stages
+    already completed, so the source is no longer needed by anything
+    downstream. Deleting it any earlier -- on a non-zero exit, an exception,
+    or any refusal path -- would destroy the evidence a failed run needs for
+    diagnosis, and could break slicing outright if it ever ran mid-pipeline.
+    This function is never called from any other branch of main().
+
+    SCOPE -- DELETES ONLY THE EXACT PATH RESOLVED: the same Path
+    ensure_local_video() returned and run_run_vod() was invoked with (plus
+    that exact path's .m4a sibling). No globbing, no directory listing, no
+    directory removal. A neighbouring file in the same CLPR_LOCAL_MEDIA_DIR
+    -- a different VOD, a partially-downloaded one -- is never touched by
+    this function, no matter what else is sitting next to it.
+
+    OPT-OUT: CLPR_KEEP_LOCAL_SOURCE=1 disables this entirely; unset/anything
+    else means DELETE (the operator-approved default).
+
+    NEVER FAILS THE RUN: by the time this is called the pipeline's real work
+    is already done and committed (run_vod exited 0). A failed unlink
+    (permissions, the file already gone, a race) is reported loudly and
+    otherwise swallowed -- it must never turn a successful pipeline run into
+    a failure return from this driver.
+    """
+    if os.environ.get(ENV_KEEP_LOCAL_SOURCE, '').strip() == '1':
+        say(f'  {ENV_KEEP_LOCAL_SOURCE}=1 -- keeping local source {video} (not deleted).')
+        return
+
+    for path in (video, video.with_suffix('.m4a')):
+        try:
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            say(f'LOCAL_SOURCE_CLEANUP deleted path="{path}" bytes_reclaimed={size}')
+        except OSError as exc:
+            say(f'  WARN: could not delete local source {path}: {exc} '
+                f'(the pipeline run itself already succeeded; this does not fail the run).')
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -628,6 +698,7 @@ def main() -> int:
 
         if rc == RUN_VOD_EXIT_OK:
             say(f'Local engine run complete for {video.name}.')
+            delete_local_source(video)
             say(f'RESULT find_clips_local ok=1 video="{video}" run_vod_exit=0 marker=none '
                 f'note="Local engine run complete."')
             return EXIT_OK
