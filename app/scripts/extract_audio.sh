@@ -61,7 +61,7 @@ IN="$1"
 # --- 2. enumerate audio streams; input must HAVE audio ---------------------
 # A whole session once recorded silent (clpr D-028, vod 6). Refuse loudly
 # rather than produce an empty artifact.
-AUD_LIST=$(ffprobe -v error -select_streams a -show_entries stream=index,codec_name,sample_rate \
+AUD_LIST=$(ffprobe -v error -select_streams a -show_entries stream=index,codec_name,sample_rate,channels \
   -of csv=p=0 "$IN" || true)
 if [ -z "$AUD_LIST" ]; then
   echo "REFUSED: input has NO audio stream: $IN" >&2
@@ -71,10 +71,11 @@ if [ -z "$AUD_LIST" ]; then
 fi
 
 N_STREAMS=0
-while IFS=, read -r gidx codec srate; do
+while IFS=, read -r gidx codec srate chan; do
   S_GIDX[$N_STREAMS]="$gidx"
   S_CODEC[$N_STREAMS]="$codec"
   S_SRATE[$N_STREAMS]="$srate"
+  S_CHAN[$N_STREAMS]="$chan"
   N_STREAMS=$((N_STREAMS+1))
 done <<< "$AUD_LIST"
 
@@ -110,13 +111,17 @@ while [ "$i" -lt "$N_STREAMS" ]; do
   N_SEGS=$(printf '%s\n' "$SEGS" | wc -l | tr -d ' ')
   if [ "$N_SEGS" -gt "$MAX_SEGS" ]; then MAX_SEGS="$N_SEGS"; fi
 
-  # Per-segment detail. ~min = n_samples / sample_rate / 60, with sample_rate
-  # from the ffprobe stream header — APPROXIMATE across mid-file parameter
-  # changes (rate and channel layout can differ per segment).
+  # Per-segment detail. volumedetect's n_samples counts samples across ALL
+  # CHANNELS (interleaved), not per-channel — so ~min = n_samples / channels /
+  # sample_rate / 60. Dividing by sample_rate alone overstates duration by the
+  # channel count (a 103.9-min stereo file once reported ~207.8 min, exactly
+  # 2x). sample_rate and channels both come from the ffprobe stream header —
+  # APPROXIMATE across mid-file parameter changes (rate and channel layout can
+  # differ per segment).
   echo "  a:$i  segments=${N_SEGS}"
-  printf '%s\n' "$SEGS" | awk -v sr="${S_SRATE[$i]}" -v s="$i" '{
-    if (sr + 0 > 0) printf "  a:%s    segment %d: ~%.1f min, mean %s dB\n", s, NR, $1 / sr / 60, $2
-    else            printf "  a:%s    segment %d: n_samples %s, mean %s dB\n", s, NR, $1, $2
+  printf '%s\n' "$SEGS" | awk -v sr="${S_SRATE[$i]}" -v ch="${S_CHAN[$i]}" -v s="$i" '{
+    if (sr + 0 > 0 && ch + 0 > 0) printf "  a:%s    segment %d: ~%.1f min, mean %s dB\n", s, NR, $1 / ch / sr / 60, $2
+    else                          printf "  a:%s    segment %d: n_samples %s, mean %s dB\n", s, NR, $1, $2
   }'
 
   # Stream liveness = the LOUDEST segment's mean.
