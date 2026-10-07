@@ -197,6 +197,16 @@ FILTER_COMPLEX_D023_BODY_AMP = _swap_once(FILTER_COMPLEX_D023_BODY, 'fps=30', f'
 AMP_CAPTION_STROKE_OFF = ('Outline=1.6,Shadow=0.8', 'Outline=0,Shadow=0')
 AMP_LOUDNORM_I = -14.0
 AMP_LOUDNORM_TP = -1.0
+# The bar is on the FINAL encoded file: the AAC encode overshoots loudnorm's
+# own output (measured: EP1 clip 1, -1.0 dBTP into the encoder, -0.9 out). So
+# the encoded mp4 is measured; above the ceiling, pass 1 and the encode rerun
+# with the TP target lowered by the measured overshoot plus a margin. A clip
+# already under the ceiling is never re-encoded, so a Linear clip stays as it
+# was. Integrated loudness outside the tolerance fails loudly.
+AMP_TP_CEILING = -1.0
+AMP_I_TOLERANCE = 0.5
+AMP_TP_MARGIN = 0.1
+AMP_TP_MAX_ATTEMPTS = 3
 # loudnorm's own default LRA target. Raised to the measured LRA when the
 # window's range is wider, so the second pass is never pushed into dynamic
 # range compression by the LRA target alone (only a true-peak overshoot can
@@ -839,18 +849,20 @@ def resolve_amp_ffmpeg() -> str:
     return ffmpeg_bin
 
 
-def amp_loudnorm_measure(ffmpeg_bin: str, slice_path: Path, ss_text: str,
-                         t_text: str) -> dict:
+def amp_loudnorm_measure(ffmpeg_bin: str, slice_path: Path, ss_text: str | None,
+                         t_text: str | None, tp: float = AMP_LOUDNORM_TP,
+                         label: str = 'AMP_LOUDNORM_PASS1') -> dict:
     """Amp mode, loudnorm pass 1: measure the EXACT window the encode will cut
-    (same -ss/-t/-i). Writes nothing. No audio stream, or a measurement that
+    (same -ss/-t/-i), or a whole file when ss_text/t_text are None (the
+    encoded output). Writes nothing. No audio stream, or a measurement that
     is not finite (silence), fails loudly."""
+    window = [] if ss_text is None else ['-ss', ss_text, '-t', t_text]
     proc = run_capture([
         ffmpeg_bin, '-hide_banner', '-nostats',
-        '-ss', ss_text,
-        '-t', t_text,
+        *window,
         '-i', str(slice_path),
         '-map', '0:a:0',
-        '-af', f'loudnorm=I={AMP_LOUDNORM_I}:TP={AMP_LOUDNORM_TP}:print_format=json',
+        '-af', f'loudnorm=I={AMP_LOUDNORM_I}:TP={tp}:print_format=json',
         '-f', 'null', '-',
     ])
     match = re.search(r'\{\s*"input_i".*?\}', proc.stderr or '', re.S)
@@ -874,20 +886,54 @@ def amp_loudnorm_measure(ffmpeg_bin: str, slice_path: Path, ss_text: str,
                 f'(silent or empty audio in the window of {slice_path})'
             )
     print(
-        'AMP_LOUDNORM_PASS1 ' + ' '.join(f'{k}={measured[k]}' for k in keys)
+        f'{label} tp_target={tp} ' + ' '.join(f'{k}={measured[k]}' for k in keys)
     )
     return values
 
 
-def amp_loudnorm_filter(measured: dict) -> str:
+def amp_loudnorm_filter(measured: dict, tp: float = AMP_LOUDNORM_TP) -> str:
     """Amp mode, loudnorm pass 2: the -af chain for the encode."""
     lra = min(AMP_LOUDNORM_LRA_MAX, max(AMP_LOUDNORM_LRA_DEFAULT, measured['input_lra']))
     return (
-        f'loudnorm=I={AMP_LOUDNORM_I}:TP={AMP_LOUDNORM_TP}:LRA={lra}'
+        f'loudnorm=I={AMP_LOUDNORM_I}:TP={tp}:LRA={lra}'
         f':measured_I={measured["input_i"]}:measured_TP={measured["input_tp"]}'
         f':measured_LRA={measured["input_lra"]}:measured_thresh={measured["input_thresh"]}'
         f':offset={measured["target_offset"]}:linear=true:print_format=summary'
         f',aresample={AMP_AUDIO_RATE}'
+    )
+
+
+def amp_hold_true_peak_ceiling(ffmpeg_cmd: list[str], amp_ffmpeg: str, slice_path: Path,
+                               ss_text: str, t_text: str, encoded_path: Path) -> None:
+    """Amp mode, after the encode wrote encoded_path: measure the ENCODED file;
+    while its true peak is above AMP_TP_CEILING, rerun pass 1 and the encode
+    (same argv, -af rebuilt) with the TP target lowered by the overshoot plus
+    AMP_TP_MARGIN. Integrated loudness outside AMP_I_TOLERANCE, or a peak still
+    over after AMP_TP_MAX_ATTEMPTS encodes, fails loudly."""
+    af_index = ffmpeg_cmd.index('-af') + 1
+    tp_target = AMP_LOUDNORM_TP
+    for attempt in range(1, AMP_TP_MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            measured = amp_loudnorm_measure(amp_ffmpeg, slice_path, ss_text, t_text, tp=tp_target)
+            ffmpeg_cmd[af_index] = amp_loudnorm_filter(measured, tp=tp_target)
+            proc = run_capture(ffmpeg_cmd)
+            print(f'FFMPEG_EXIT_CODE {proc.returncode}')
+            print_amp_loudnorm_summary(proc.stderr)
+        enc = amp_loudnorm_measure(amp_ffmpeg, encoded_path, None, None, tp=tp_target,
+                                   label='AMP_ENCODED_MEASURE')
+        print(f'AMP_ENCODED attempt={attempt} tp_target={tp_target} '
+              f'integrated_lufs={enc["input_i"]} true_peak_dbtp={enc["input_tp"]}')
+        if abs(enc['input_i'] - AMP_LOUDNORM_I) > AMP_I_TOLERANCE:
+            raise RuntimeError(
+                f'AMP_LOUDNESS_OUT_OF_RANGE: encoded integrated {enc["input_i"]} LUFS is not '
+                f'within {AMP_LOUDNORM_I} +/- {AMP_I_TOLERANCE}'
+            )
+        if enc['input_tp'] <= AMP_TP_CEILING:
+            return
+        tp_target = round(tp_target - (enc['input_tp'] - AMP_TP_CEILING) - AMP_TP_MARGIN, 2)
+    raise RuntimeError(
+        f'AMP_TRUE_PEAK_OVER: encoded true peak still above {AMP_TP_CEILING} dBTP after '
+        f'{AMP_TP_MAX_ATTEMPTS} encodes'
     )
 
 
@@ -1525,6 +1571,8 @@ def render_from_slice(candidate_id: int) -> int:
             print(f'FFMPEG_EXIT_CODE {ffmpeg_proc.returncode}')
             if amp_ffmpeg is not None:
                 print_amp_loudnorm_summary(ffmpeg_proc.stderr)
+                amp_hold_true_peak_ceiling(ffmpeg_cmd, amp_ffmpeg, slice_path,
+                                           ss_text, t_text, tmp_path)
 
             # The encode succeeded (run_capture raises on a nonzero ffmpeg
             # exit, caught below) -- promote the temp file to out_path. Same

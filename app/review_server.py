@@ -1172,19 +1172,23 @@ RENDER_FROM_SLICE_PATH = Path(__file__).resolve().parent / 'workers' / 'render_f
 AMP_REQUIRED_ENV = ('CLPR_SLICES_DIR', 'CLPR_AMP_RENDER_OUT', 'CLPR_AMP_FFMPEG')
 
 
-def amp_render_candidate(candidate_id: int) -> tuple[int, str, str]:
+def amp_render_candidate(candidate_id: int) -> tuple[int, str, str, list[str]]:
     """Run the amp render for one approved candidate as a child process with
-    this server's environment. Returns (exit_code, RESULT line or '', stderr)."""
+    this server's environment. Returns (exit_code, RESULT line or '', stderr,
+    the render's AMP_* lines: loudness passes and the encoded-file readings)."""
     proc = subprocess.run(
         [sys.executable, str(RENDER_FROM_SLICE_PATH), '--candidate-id', str(candidate_id)],
         capture_output=True, text=True,
     )
     result = ''
+    amp_lines = []
     for line in (proc.stdout or '').splitlines():
         if line.startswith('RESULT '):
             result = line
+        elif line.startswith('AMP_'):
+            amp_lines.append(line)
     print(f'AMP_RENDER candidate_id={candidate_id} exit={proc.returncode} {result}', file=sys.stderr)
-    return proc.returncode, result, (proc.stderr or '').strip()
+    return proc.returncode, result, (proc.stderr or '').strip(), amp_lines
 
 
 def amp_refuse(handler: 'ReviewHandler', what: str) -> None:
@@ -1662,7 +1666,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 updated['webhook'] = 'amp-mode-none'
             self._send_json(HTTPStatus.OK, updated)
             return
-        code, result, stderr = amp_render_candidate(candidate_id)
+        code, result, stderr, amp_lines = amp_render_candidate(candidate_id)
         if code != 0:
             conn = db.connect()
             try:
@@ -1690,7 +1694,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             conn.close()
         if payload is not None:
             payload['webhook'] = 'amp-mode-none'
-            payload['render'] = {'exit': code, 'result': result}
+            payload['render'] = {'exit': code, 'result': result, 'amp_lines': amp_lines}
         self._send_json(HTTPStatus.OK, payload)
 
     def _edit_window(self, candidate_id: int, body_raw: bytes) -> None:
