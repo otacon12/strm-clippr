@@ -212,11 +212,11 @@ AMP_AUDIO_RATE = 48000
 # never reach the previous frame (41.7 ms away at 24 fps); -t is unchanged, so
 # the window's end frame stays excluded.
 AMP_SEEK_GUARD_S = 0.001
-# ...and the video frame count is pinned to the window's own length on the
-# 24 fps grid (-frames:v round(duration * 24)). Without it, a -t rounded UP to
-# the ms (664 frames = 27.66667 s -> '27.667') let the fps filter emit one
-# duplicated frame past the window's end (measured: 665 and 539 frames for
-# 664- and 538-frame windows).
+# ...and -t is the window's length on the 24 fps grid, rounded DOWN to the ms
+# (664 frames = 27.66667 s -> '27.666'). Rounded up ('27.667') the fps filter
+# emitted one duplicated frame past the window's end (measured: 665 and 539
+# frames for 664- and 538-frame windows); pinning -frames:v instead cut the
+# audio ~18 ms short, so the fix lives in -t.
 # The sidecar key the amp import writes and the amp render names the file by.
 AMP_SIDECAR_CLIP_PREFIX = 'amp_clip_prefix'
 
@@ -1339,7 +1339,11 @@ def render_from_slice(candidate_id: int) -> int:
         # The -ss/-t strings, shared by the encode and amp loudnorm pass 1.
         ss_text = (f'{offset_s:.3f}' if amp_ffmpeg is None
                    else f'{max(0.0, offset_s - AMP_SEEK_GUARD_S):.3f}')
-        t_text = f'{cut_duration_s:.3f}'
+        if amp_ffmpeg is None:
+            t_text = f'{cut_duration_s:.3f}'
+        else:
+            grid_s = round(cut_duration_s * AMP_FPS) / AMP_FPS
+            t_text = f'{math.floor(grid_s * 1000 + 1e-6) / 1000:.3f}'
 
         # `filter_stages` starts as ONLY the D-023 body (no label). Copied
         # EXACTLY from cut_clip.py (operator-proven live on Instagram, D-023).
@@ -1490,8 +1494,9 @@ def render_from_slice(candidate_id: int) -> int:
         tmp_path = Path(tmp_name)
 
         # Amp mode changes these things in this argv: the binary, -ss taken
-        # AMP_SEEK_GUARD_S early, -r 30 -> -r 24, -frames:v pinned to the
-        # window, and the -af loudnorm chain (amp_audio_args, empty when off).
+        # AMP_SEEK_GUARD_S early, -t on the 24 fps grid rounded down,
+        # -r 30 -> -r 24, and the -af loudnorm chain (amp_audio_args, empty
+        # when off).
         # With amp mode off the argv is the pre-amp one.
         ffmpeg_cmd = [
             'ffmpeg' if amp_ffmpeg is None else amp_ffmpeg,
@@ -1508,8 +1513,6 @@ def render_from_slice(candidate_id: int) -> int:
             '-profile:v', 'high',
             '-pix_fmt', 'yuv420p',
             '-r', '30' if amp_ffmpeg is None else str(AMP_FPS),
-            *([] if amp_ffmpeg is None
-              else ['-frames:v', str(round(cut_duration_s * AMP_FPS))]),
             *amp_audio_args,
             '-c:a', 'aac',
             '-b:a', '192k',
