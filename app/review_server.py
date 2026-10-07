@@ -1158,6 +1158,43 @@ def compute_run_stages(recording_state: str, seg_count: int, signal_count: int,
     return stages
 
 
+# ---------------------------------------------------------------- amp mode
+# CLPR-AMP-02 item 7 (ruling clpr-amp-mode-eight-changes-approved-amp-project-
+# only-2026-10-07): with CLPR_AMP_MODE=1 this server is the amp project's own
+# review page, run as its own process on its own port (CLPR_REVIEW_PORT) against
+# the amp database. Approve renders the clip HERE through the amp render path
+# (workers/render_from_slice.py in amp mode) and nothing else: no verdict
+# webhook for any verdict, no ssh fetch, no Drive folder lookup, no eager proxy
+# pass, and the routes that would reach n8n or run transcription (find-clips,
+# rerender) are refused. Previews play local files only. Amp mode off: every
+# route below behaves exactly as before.
+RENDER_FROM_SLICE_PATH = Path(__file__).resolve().parent / 'workers' / 'render_from_slice.py'
+AMP_REQUIRED_ENV = ('CLPR_SLICES_DIR', 'CLPR_AMP_RENDER_OUT', 'CLPR_AMP_FFMPEG')
+
+
+def amp_render_candidate(candidate_id: int) -> tuple[int, str, str]:
+    """Run the amp render for one approved candidate as a child process with
+    this server's environment. Returns (exit_code, RESULT line or '', stderr)."""
+    proc = subprocess.run(
+        [sys.executable, str(RENDER_FROM_SLICE_PATH), '--candidate-id', str(candidate_id)],
+        capture_output=True, text=True,
+    )
+    result = ''
+    for line in (proc.stdout or '').splitlines():
+        if line.startswith('RESULT '):
+            result = line
+    print(f'AMP_RENDER candidate_id={candidate_id} exit={proc.returncode} {result}', file=sys.stderr)
+    return proc.returncode, result, (proc.stderr or '').strip()
+
+
+def amp_refuse(handler: 'ReviewHandler', what: str) -> None:
+    handler._send_json(HTTPStatus.CONFLICT, {
+        'error': f'amp mode: {what} is not available on the amp review page '
+                 '(approve renders on this Mac only; nothing reaches n8n, Drive or a '
+                 'transcription run)',
+    })
+
+
 class ReviewHandler(BaseHTTPRequestHandler):
     server_version = 'clpr-review/0.1'
 
@@ -1244,6 +1281,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_text(HTTPStatus.NOT_FOUND, f'vod_id not found: {recording_id}')
             return
 
+        if db.amp_mode():
+            stored = Path(str(row['path']))
+            file_path = stored if stored.is_file() else None
+            if file_path is None:
+                self._send_text(HTTPStatus.NOT_FOUND,
+                                f'amp mode: source not on this Mac: {row["path"]}')
+                return
+            self._serve_file_range(file_path)
+            return
         file_path = resolve_local_vod(str(row['path']))
         if file_path is None:
             searched = ' ; '.join(str(d) for d in local_vod_dirs())
@@ -1329,6 +1375,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_text(HTTPStatus.BAD_REQUEST, 'Invalid candidate id', head_only=head_only)
             return
 
+        if db.amp_mode():
+            self._serve_clip_media_amp(candidate_id, head_only)
+            return
+
         conn = db.connect()
         try:
             cur = dict_cursor(conn)
@@ -1400,6 +1450,33 @@ class ReviewHandler(BaseHTTPRequestHandler):
             f'clip file not reachable from this machine: candidate {candidate_id}',
             head_only=head_only,
         )
+
+    def _serve_clip_media_amp(self, candidate_id: int, head_only: bool) -> None:
+        """Amp mode /clipmedia/<id>: the rendered clip at clips.file_path once
+        one exists, else the import's local preview
+        $CLPR_SLICES_DIR/c<id>.preview.mp4 (cut to the slice bounds the page
+        assumes). Local files only: never a proxy cache, never ssh."""
+        conn = db.connect()
+        try:
+            cur = dict_cursor(conn)
+            cur.execute('SELECT file_path FROM clips WHERE candidate_id = %s', (candidate_id,))
+            row = cur.fetchone()
+            cur.execute('SELECT id FROM clip_candidates WHERE id = %s', (candidate_id,))
+            exists = cur.fetchone()
+        finally:
+            conn.close()
+        if not exists:
+            self._send_text(HTTPStatus.NOT_FOUND, f'no candidate {candidate_id}', head_only=head_only)
+            return
+        if row:
+            path = Path(str(row['file_path']))
+        else:
+            path = Path(os.environ.get('CLPR_SLICES_DIR', '')) / f'c{candidate_id}.preview.mp4'
+        if not path.is_file():
+            self._send_text(HTTPStatus.NOT_FOUND,
+                            f'amp mode: local file not found: {path}', head_only=head_only)
+            return
+        self._serve_file_range(path, head_only=head_only)
 
     def _serve_file_range(self, file_path: Path, content_type: str = 'video/mp4',
                            head_only: bool = False) -> None:
@@ -1554,6 +1631,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+        if db.amp_mode():
+            self._finish_verdict_amp(candidate_id, observed_state, target_state, updated)
+            return
+
         # This point is reached ONLY when the UPDATE above actually matched a
         # row (rowcount == 1) -- every rowcount == 0 path returns from inside
         # the try block (via the 404/409 branches) before falling through
@@ -1569,6 +1650,48 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if updated is not None:
             updated['webhook'] = webhook_status
         self._send_json(HTTPStatus.OK, updated)
+
+    def _finish_verdict_amp(self, candidate_id: int, observed_state: str, target_state: str,
+                            updated: Optional[dict]) -> None:
+        """Amp mode, after the verdict committed: NO webhook, ever. An approve
+        renders the clip here; if the render fails, the verdict is reverted to
+        the state it had (a failed run leaves nothing behind) and the error is
+        returned."""
+        if target_state != 'approved':
+            if updated is not None:
+                updated['webhook'] = 'amp-mode-none'
+            self._send_json(HTTPStatus.OK, updated)
+            return
+        code, result, stderr = amp_render_candidate(candidate_id)
+        if code != 0:
+            conn = db.connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE clip_candidates SET state = %s WHERE id = %s AND state = 'approved'",
+                    (observed_state, candidate_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                'error': 'amp render failed; the approve was reverted',
+                'id': candidate_id, 'state': observed_state,
+                'render_exit': code, 'render_stderr': stderr[-2000:],
+            })
+            return
+        conn = db.connect()
+        try:
+            payload = fetch_candidate_payload(dict_cursor(conn), candidate_id)
+        finally:
+            conn.close()
+        if payload is not None:
+            payload['webhook'] = 'amp-mode-none'
+            payload['render'] = {'exit': code, 'result': result}
+        self._send_json(HTTPStatus.OK, payload)
 
     def _edit_window(self, candidate_id: int, body_raw: bytes) -> None:
         # D-055: operator window edit. Originals start_s/end_s are IMMUTABLE;
@@ -2527,6 +2650,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             and reports whether the start succeeded.
           - any other engine value -> refused (400), naming the bad value
         """
+        if db.amp_mode():
+            amp_refuse(self, 'find-clips (transcription / detection / the n8n finder)')
+            return
         engine = 'local'
         if body_raw:
             try:
@@ -2673,6 +2799,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
         clearing the witness and stranding the clip as undelivered with no
         chain to deliver it.
         """
+        if db.amp_mode():
+            amp_refuse(self, 're-render (it runs through the n8n verdict webhook)')
+            return
         conn = db.connect()
         try:
             cur = dict_cursor(conn)
@@ -3187,6 +3316,16 @@ def main() -> int:
     # Validate the URL is set at startup (fail loudly now, not per-request);
     # never print the URL itself — it may carry credentials.
     db.get_db_url()
+    if db.amp_mode():
+        missing = [n for n in AMP_REQUIRED_ENV if not os.environ.get(n, '').strip()]
+        if missing:
+            print(f'ERROR: amp mode needs {", ".join(missing)}', file=sys.stderr)
+            return 1
+        print(f'Starting AMP review server on http://{HOST}:{PORT} using CLPR_AMP_DB_URL; '
+              'approve renders locally, no webhook, no eager proxy pass')
+        with ThreadingHTTPServer((HOST, PORT), ReviewHandler) as httpd:
+            httpd.serve_forever()
+        return 0
     print(f'Starting review server on http://{HOST}:{PORT} using CLPR_DB_URL from environment')
     # Preview proxies (2026-08-10, eager): "on server start" -- build a proxy
     # for every already-pending candidate before the operator opens the UI.

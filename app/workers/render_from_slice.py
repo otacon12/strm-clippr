@@ -205,6 +205,15 @@ AMP_LOUDNORM_LRA_DEFAULT = 7.0
 AMP_LOUDNORM_LRA_MAX = 50.0
 # loudnorm outputs 192 kHz; resample back for the AAC encode.
 AMP_AUDIO_RATE = 48000
+# CLPR-AMP-02 (items 4, 5): amp windows are cut exactly (no publish pad), and
+# the -ss value is taken 1 ms early before its .3f formatting: a window start
+# stored to the ms (5.417) lies AFTER its frame's pts (130/24 = 5.41667), and
+# ffmpeg's accurate seek drops a frame whose pts is before -ss. 1 ms early can
+# never reach the previous frame (41.7 ms away at 24 fps); -t is unchanged, so
+# the window's end frame stays excluded.
+AMP_SEEK_GUARD_S = 0.001
+# The sidecar key the amp import writes and the amp render names the file by.
+AMP_SIDECAR_CLIP_PREFIX = 'amp_clip_prefix'
 
 # THE CAPTION STYLE, IN libass UNITS, MEASURED ON THE REAL SERVER RENDERER.
 #
@@ -825,15 +834,15 @@ def resolve_amp_ffmpeg() -> str:
     return ffmpeg_bin
 
 
-def amp_loudnorm_measure(ffmpeg_bin: str, slice_path: Path, offset_s: float,
-                         cut_duration_s: float) -> dict:
+def amp_loudnorm_measure(ffmpeg_bin: str, slice_path: Path, ss_text: str,
+                         t_text: str) -> dict:
     """Amp mode, loudnorm pass 1: measure the EXACT window the encode will cut
     (same -ss/-t/-i). Writes nothing. No audio stream, or a measurement that
     is not finite (silence), fails loudly."""
     proc = run_capture([
         ffmpeg_bin, '-hide_banner', '-nostats',
-        '-ss', f'{offset_s:.3f}',
-        '-t', f'{cut_duration_s:.3f}',
+        '-ss', ss_text,
+        '-t', t_text,
         '-i', str(slice_path),
         '-map', '0:a:0',
         '-af', f'loudnorm=I={AMP_LOUDNORM_I}:TP={AMP_LOUDNORM_TP}:print_format=json',
@@ -889,6 +898,49 @@ def print_amp_loudnorm_summary(stderr: str) -> None:
         raise RuntimeError('AMP_LOUDNORM_NO_SUMMARY: loudnorm pass 2 printed no summary')
     for line in found:
         print(f'AMP_LOUDNORM_PASS2 {line}')
+
+
+def amp_caption_srt_text(cur, recording_id: int, window_start_abs_s: float,
+                         window_end_abs_s: float) -> tuple[str | None, int]:
+    """Amp mode captions (CLPR-AMP-02 item 4): the recording's caption cues
+    (amp_import_moments.py stores the EP1 caption file's cues byte for byte in
+    transcript_segments) re-timed to the clip, text VERBATIM. No clamping, no
+    annotation drop, no whitespace collapse, no splitting: a cue is in the clip
+    only when it lies wholly inside the window, and a cue that overlaps the
+    window but crosses either edge fails loudly."""
+    import build_srt  # deferred for the same import-cycle reason as below
+    cur.execute(
+        'SELECT start_s, end_s, text FROM transcript_segments '
+        'WHERE recording_id = %s ORDER BY start_s, id',
+        (recording_id,),
+    )
+    cues = []
+    for start, end, text in cur.fetchall():
+        start, end = float(start), float(end)
+        if end <= window_start_abs_s or start >= window_end_abs_s:
+            continue
+        if start < window_start_abs_s or end > window_end_abs_s:
+            raise RuntimeError(
+                f'AMP_CAPTION_CROSSES_WINDOW: recording_id={recording_id} cue '
+                f'[{start:.3f}..{end:.3f}]s {str(text)!r} crosses the window '
+                f'[{window_start_abs_s:.3f}..{window_end_abs_s:.3f}]s; every cue of a '
+                'window must land whole in its clip. Refusing to render.'
+            )
+        cues.append((start - window_start_abs_s, end - window_start_abs_s, str(text)))
+    return build_srt.render_srt(cues), len(cues)
+
+
+def amp_clip_name(sidecar: dict, start_s: float, end_s: float) -> str:
+    """Amp mode file name: <prefix>-<start>-<end>.mp4 from the sidecar's
+    amp_clip_prefix (written by amp_import_moments.py, e.g. EP1-SOCIAL-01) and
+    the effective window. A sidecar without the key fails loudly."""
+    prefix = sidecar.get(AMP_SIDECAR_CLIP_PREFIX)
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise RuntimeError(
+            f'AMP_SIDECAR_NO_PREFIX: sidecar for candidate_id={sidecar.get("candidate_id")} '
+            f'has no {AMP_SIDECAR_CLIP_PREFIX}; stage it with workers/amp_import_moments.py.'
+        )
+    return f'{prefix}-{start_s:.3f}-{end_s:.3f}.mp4'
 
 
 def build_caption_srt_text(cur, recording_id: int, clip_t0_abs_s: float,
@@ -1185,7 +1237,8 @@ def render_from_slice(candidate_id: int) -> int:
         # either adjusted column is set, else PUBLISH_PAD_S — see
         # slice_geometry.render_pad_s for the full rationale (the pad exists
         # for the DETECTOR's guess, not to un-trim an explicit operator edit).
-        pad = slice_geometry.render_pad_s(cand['adjusted_start_s'], cand['adjusted_end_s'])
+        pad = (0.0 if amp_ffmpeg is not None  # amp: the approved window, exactly
+               else slice_geometry.render_pad_s(cand['adjusted_start_s'], cand['adjusted_end_s']))
 
         # Target cut (shipped-clip invariant: effective window +/- pad, where
         # pad is 0 on an operator edit) in ABSOLUTE video coordinates, BEFORE
@@ -1270,10 +1323,18 @@ def render_from_slice(candidate_id: int) -> int:
         next_render_seq = int(render_seq_row[0]) + 1 if render_seq_row is not None else 1
 
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / deliver_approved.delivered_name(
-            cand['session_label'], cand['start_s'], cand['category'], candidate_id,
-            next_render_seq,
-        )
+        if amp_ffmpeg is not None:
+            out_path = out_dir / amp_clip_name(sidecar, eff_start_s, eff_end_s)
+        else:
+            out_path = out_dir / deliver_approved.delivered_name(
+                cand['session_label'], cand['start_s'], cand['category'], candidate_id,
+                next_render_seq,
+            )
+
+        # The -ss/-t strings, shared by the encode and amp loudnorm pass 1.
+        ss_text = (f'{offset_s:.3f}' if amp_ffmpeg is None
+                   else f'{max(0.0, offset_s - AMP_SEEK_GUARD_S):.3f}')
+        t_text = f'{cut_duration_s:.3f}'
 
         # `filter_stages` starts as ONLY the D-023 body (no label). Copied
         # EXACTLY from cut_clip.py (operator-proven live on Instagram, D-023).
@@ -1300,9 +1361,14 @@ def render_from_slice(candidate_id: int) -> int:
                 require_subtitles_capability(candidate_id)
 
             # The clip's t=0 and length are the -ss/-t below, not a derivation.
-            srt_text, captions_cue_count = build_caption_srt_text(
-                cur, cand['recording_id'], abs_start_s + offset_s, cut_duration_s
-            )
+            if amp_ffmpeg is None:
+                srt_text, captions_cue_count = build_caption_srt_text(
+                    cur, cand['recording_id'], abs_start_s + offset_s, cut_duration_s
+                )
+            else:
+                srt_text, captions_cue_count = amp_caption_srt_text(
+                    cur, cand['recording_id'], target_start_abs_s, target_end_abs_s
+                )
             if srt_text is None:
                 # No speech in the shipped window. Nothing to burn, nothing
                 # written, and the clip row will say so: requested 1, burned 0,
@@ -1378,7 +1444,7 @@ def render_from_slice(candidate_id: int) -> int:
             amp_audio_args = [
                 '-af',
                 amp_loudnorm_filter(
-                    amp_loudnorm_measure(amp_ffmpeg, slice_path, offset_s, cut_duration_s)
+                    amp_loudnorm_measure(amp_ffmpeg, slice_path, ss_text, t_text)
                 ),
             ]
 
@@ -1424,8 +1490,8 @@ def render_from_slice(candidate_id: int) -> int:
         ffmpeg_cmd = [
             'ffmpeg' if amp_ffmpeg is None else amp_ffmpeg,
             '-y',
-            '-ss', f'{offset_s:.3f}',
-            '-t', f'{cut_duration_s:.3f}',
+            '-ss', ss_text,
+            '-t', t_text,
             '-i', str(slice_path),
             '-filter_complex', filter_complex,
             '-map', '[v]',
