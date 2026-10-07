@@ -207,6 +207,18 @@ AMP_TP_CEILING = -1.0
 AMP_I_TOLERANCE = 0.5
 AMP_TP_MARGIN = 0.1
 AMP_TP_MAX_ATTEMPTS = 3
+# CLPR-AMP-02 fix (his report "video 6 :07 the subtitles leak into the clip",
+# ruling ep1-social-clip-6-at-0-07-subtitles-leak-into-the-clip-2026-10-07):
+# a long cue wraps to more lines than fit between MarginV and the picture, and
+# being bottom-anchored it grows UP onto the picture. Every cue's ink extent is
+# measured by rendering it alone with the exact caption filter on a black
+# 1080x1920 canvas; a cue whose top ink row is not at least AMP_CAPTION_GAP_PX
+# below the picture's bottom row is moved DOWN only, by the fewest MarginV
+# units that clear it, in its own subtitles filter. Every other cue renders
+# exactly as before. Text, wrap, font, size and look are untouched.
+AMP_CAPTION_GAP_PX = 8
+AMP_CAPTION_MARGIN_V = 68
+AMP_FRAME_W, AMP_FRAME_H = 1080, 1920
 # loudnorm's own default LRA target. Raised to the measured LRA when the
 # window's range is wider, so the second pass is never pushed into dynamic
 # range compression by the LRA target alone (only a true-peak overshoot can
@@ -544,7 +556,7 @@ def escape_filter_value(value: str) -> str:
 
 
 def subtitles_filter(srt_path: str, caption_color: str | None = None,
-                     amp: bool = False) -> str:
+                     amp: bool = False, margin_v: int | None = None) -> str:
     """The single filter appended to the D-023 chain when captions are on.
 
     caption_color (clip_candidates.caption_color, D-074) is None on every
@@ -557,6 +569,8 @@ def subtitles_filter(srt_path: str, caption_color: str | None = None,
     style = build_caption_force_style(caption_color)
     if amp:
         style = _swap_once(style, *AMP_CAPTION_STROKE_OFF)
+        if margin_v is not None and margin_v != AMP_CAPTION_MARGIN_V:
+            style = _swap_once(style, f'MarginV={AMP_CAPTION_MARGIN_V}', f'MarginV={margin_v}')
     return (
         f'subtitles=filename={escape_filter_value(str(srt_path))}'
         f':force_style={escape_filter_value(style)}'
@@ -951,8 +965,8 @@ def print_amp_loudnorm_summary(stderr: str) -> None:
         print(f'AMP_LOUDNORM_PASS2 {line}')
 
 
-def amp_caption_srt_text(cur, recording_id: int, window_start_abs_s: float,
-                         window_end_abs_s: float) -> tuple[str | None, int]:
+def amp_caption_cues(cur, recording_id: int, window_start_abs_s: float,
+                     window_end_abs_s: float) -> tuple[str | None, int, list]:
     """Amp mode captions (CLPR-AMP-02 item 4): the recording's caption cues
     (amp_import_moments.py stores the EP1 caption file's cues byte for byte in
     transcript_segments) re-timed to the clip, text VERBATIM. No clamping, no
@@ -978,7 +992,83 @@ def amp_caption_srt_text(cur, recording_id: int, window_start_abs_s: float,
                 'window must land whole in its clip. Refusing to render.'
             )
         cues.append((start - window_start_abs_s, end - window_start_abs_s, str(text)))
-    return build_srt.render_srt(cues), len(cues)
+    return build_srt.render_srt(cues), len(cues), cues
+
+
+def amp_caption_srt_text(cur, recording_id: int, window_start_abs_s: float,
+                         window_end_abs_s: float) -> tuple[str | None, int]:
+    """The clip's verbatim caption SRT and cue count (amp_caption_cues)."""
+    srt, count, _ = amp_caption_cues(cur, recording_id, window_start_abs_s, window_end_abs_s)
+    return srt, count
+
+
+def amp_picture_bottom_row(slice_path: Path) -> int:
+    """The last frame row of the picture the D-023 chain places: the source
+    scaled to 1080 wide (even height), centred vertically in 1920."""
+    proc = run_capture(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                        'stream=width,height', '-of', 'csv=p=0', str(slice_path)])
+    w, h = (int(x) for x in proc.stdout.strip().split(',')[:2])
+    pic_h = int(AMP_FRAME_W * h / w + 0.5) // 2 * 2
+    top = (AMP_FRAME_H - pic_h) // 2
+    return top + pic_h - 1
+
+
+def amp_caption_extent(ffmpeg_bin: str, text: str, caption_color: str | None,
+                       margin_v: int) -> tuple[int, int]:
+    """(top, bottom) ink rows of ONE cue rendered alone, by the exact caption
+    filter, on a black 1080x1920 canvas. Any pixel above 8/255 is ink."""
+    fd, tmp_name = tempfile.mkstemp(prefix='clpr_amp_cue_', suffix='.srt')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(f'1\n00:00:00,000 --> 00:00:05,000\n{text}\n\n')
+        proc = subprocess.run(
+            [ffmpeg_bin, '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+             f'color=c=black:s={AMP_FRAME_W}x{AMP_FRAME_H}:r=24:d=1',
+             '-vf', subtitles_filter(tmp_name, caption_color, amp=True, margin_v=margin_v),
+             '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'],
+            capture_output=True, check=True,
+        )
+    finally:
+        os.unlink(tmp_name)
+    raw = proc.stdout
+    if len(raw) != AMP_FRAME_W * AMP_FRAME_H:
+        raise RuntimeError(f'AMP_CAPTION_MEASURE_FAILED: {len(raw)} bytes for cue {text!r}')
+    rows = [y for y in range(AMP_FRAME_H) if max(raw[y * AMP_FRAME_W:(y + 1) * AMP_FRAME_W]) > 8]
+    if not rows:
+        raise RuntimeError(f'AMP_CAPTION_NO_INK: cue {text!r} rendered no ink')
+    return rows[0], rows[-1]
+
+
+def amp_caption_groups(ffmpeg_bin: str, cues: list, caption_color: str | None,
+                       picture_bottom: int) -> list[tuple[int, list]]:
+    """Group the clip's cues by the MarginV each must render at:
+    AMP_CAPTION_MARGIN_V for every cue that clears the picture, and the
+    largest MarginV that clears it (moved down only, fewest units) for one
+    that would not. Fails loudly when a cue cannot clear the picture while
+    staying inside the frame."""
+    limit = picture_bottom + 1 + AMP_CAPTION_GAP_PX
+    groups: dict[int, list] = {}
+    for i, cue in enumerate(cues, start=1):
+        top, bottom = amp_caption_extent(ffmpeg_bin, cue[2], caption_color, AMP_CAPTION_MARGIN_V)
+        margin_v = AMP_CAPTION_MARGIN_V
+        if top < limit:
+            for margin_v in range(AMP_CAPTION_MARGIN_V - 1, -1, -1):
+                new_top, new_bottom = amp_caption_extent(ffmpeg_bin, cue[2], caption_color, margin_v)
+                if new_top >= limit:
+                    break
+            else:
+                raise RuntimeError(f'AMP_CAPTION_DOES_NOT_FIT: cue {i} {cue[2]!r} cannot clear '
+                                   f'row {limit} even at MarginV=0')
+            if new_bottom > AMP_FRAME_H - 1:
+                raise RuntimeError(f'AMP_CAPTION_DOES_NOT_FIT: cue {i} would end at row {new_bottom}')
+            print(f'AMP_CAPTION_MOVED cue={i} rows={top}-{bottom} -> {new_top}-{new_bottom} '
+                  f'MarginV={AMP_CAPTION_MARGIN_V}->{margin_v} picture_bottom={picture_bottom} '
+                  f'gap_px={new_top - picture_bottom - 1}')
+        else:
+            print(f'AMP_CAPTION_EXTENT cue={i} rows={top}-{bottom} MarginV={margin_v} '
+                  f'gap_px={top - picture_bottom - 1}')
+        groups.setdefault(margin_v, []).append(cue)
+    return sorted(groups.items(), key=lambda kv: -kv[0])
 
 
 def amp_clip_name(sidecar: dict, start_s: float, end_s: float) -> str:
@@ -1225,6 +1315,7 @@ def render_from_slice(candidate_id: int) -> int:
     # D-063: declared out here so the OUTERMOST finally can remove the scratch
     # SRT on literally every exit path, not merely the ones around the encode.
     srt_path: Path | None = None
+    amp_srt_paths: list[Path] = []
     # D-074: same reasoning, for the scratch hook .ass.
     hook_ass_path: Path | None = None
 
@@ -1416,38 +1507,61 @@ def render_from_slice(candidate_id: int) -> int:
                 require_subtitles_capability(candidate_id)
 
             # The clip's t=0 and length are the -ss/-t below, not a derivation.
-            if amp_ffmpeg is None:
+            if amp_ffmpeg is not None:
+                # AMP: verbatim cues, grouped by the MarginV each renders at;
+                # one SRT + one subtitles filter per group.
+                _, captions_cue_count, amp_cues = amp_caption_cues(
+                    cur, cand['recording_id'], target_start_abs_s, target_end_abs_s
+                )
+                groups = amp_caption_groups(amp_ffmpeg, amp_cues, cand['caption_color'],
+                                            amp_picture_bottom_row(slice_path))
+                import build_srt  # deferred: build_srt imports this module
+                for margin_v, group_cues in groups:
+                    group_srt = build_srt.render_srt(group_cues)
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix=f'clpr_c{candidate_id}_', suffix='.srt'
+                    )
+                    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                        fh.write(group_srt)
+                    amp_srt_paths.append(Path(tmp_name))
+                    filter_stages.append(subtitles_filter(
+                        tmp_name, cand['caption_color'], amp=True, margin_v=margin_v
+                    ))
+                    print(f'CAPTIONS_ON candidate={candidate_id} cues={len(group_cues)} '
+                          f'MarginV={margin_v} srt="{tmp_name}"')
+                if groups:
+                    captions_burned = 1
+                else:
+                    print(f'CAPTIONS_NO_SPEECH candidate={candidate_id} cues=0 '
+                          'burn_skipped=1 render_continues=1')
+            else:
                 srt_text, captions_cue_count = build_caption_srt_text(
                     cur, cand['recording_id'], abs_start_s + offset_s, cut_duration_s
                 )
-            else:
-                srt_text, captions_cue_count = amp_caption_srt_text(
-                    cur, cand['recording_id'], target_start_abs_s, target_end_abs_s
-                )
-            if srt_text is None:
-                # No speech in the shipped window. Nothing to burn, nothing
-                # written, and the clip row will say so: requested 1, burned 0,
-                # cues 0. Under-claim beats an empty caption track that claims
-                # nothing was said.
-                print(
-                    f'CAPTIONS_NO_SPEECH candidate={candidate_id} cues=0 '
-                    'burn_skipped=1 render_continues=1'
-                )
-            else:
-                fd, tmp_name = tempfile.mkstemp(
-                    prefix=f'clpr_c{candidate_id}_', suffix='.srt'
-                )
-                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-                    fh.write(srt_text)
-                srt_path = Path(tmp_name)
-                filter_stages.append(subtitles_filter(
-                    srt_path, cand['caption_color'], amp=amp_ffmpeg is not None
-                ))
-                captions_burned = 1
-                print(
-                    f'CAPTIONS_ON candidate={candidate_id} cues={captions_cue_count} '
-                    f'srt="{srt_path}" bytes={len(srt_text.encode("utf-8"))}'
-                )
+                if srt_text is None:
+                    # No speech in the shipped window. Nothing to burn, nothing
+                    # written, and the clip row will say so: requested 1, burned 0,
+                    # cues 0. Under-claim beats an empty caption track that claims
+                    # nothing was said.
+                    print(
+                        f'CAPTIONS_NO_SPEECH candidate={candidate_id} cues=0 '
+                        'burn_skipped=1 render_continues=1'
+                    )
+                else:
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix=f'clpr_c{candidate_id}_', suffix='.srt'
+                    )
+                    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                        fh.write(srt_text)
+                    srt_path = Path(tmp_name)
+                    filter_stages.append(subtitles_filter(
+                        srt_path, cand['caption_color'], amp=amp_ffmpeg is not None
+                    ))
+                    captions_burned = 1
+                    print(
+                        f'CAPTIONS_ON candidate={candidate_id} cues={captions_cue_count} '
+                        f'srt="{srt_path}" bytes={len(srt_text.encode("utf-8"))}'
+                    )
 
         # ---- D-074 hook: fetch the active kit's variant A and splice ONE ----
         # more filter in, chained AFTER captions (order does not matter here:
@@ -1662,6 +1776,9 @@ def render_from_slice(candidate_id: int) -> int:
         # failure between writing it and reaching the encode.
         if srt_path is not None and srt_path.exists():
             srt_path.unlink()
+        for amp_srt in amp_srt_paths:
+            if amp_srt.exists():
+                amp_srt.unlink()
         # D-074: the hook .ass is scratch too, same discipline.
         if hook_ass_path is not None and hook_ass_path.exists():
             hook_ass_path.unlink()
