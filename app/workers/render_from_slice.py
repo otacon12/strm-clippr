@@ -1071,7 +1071,7 @@ def amp_caption_groups(ffmpeg_bin: str, cues: list, caption_color: str | None,
     return sorted(groups.items(), key=lambda kv: -kv[0])
 
 
-def amp_clip_name(sidecar: dict, start_s: float, end_s: float) -> str:
+def amp_clip_name(sidecar: dict, start_s: float, end_s: float, suffix: str = '') -> str:
     """Amp mode file name: <prefix>-<start>-<end>.mp4 from the sidecar's
     amp_clip_prefix (written by amp_import_moments.py, e.g. EP1-SOCIAL-01) and
     the effective window. A sidecar without the key fails loudly."""
@@ -1081,7 +1081,7 @@ def amp_clip_name(sidecar: dict, start_s: float, end_s: float) -> str:
             f'AMP_SIDECAR_NO_PREFIX: sidecar for candidate_id={sidecar.get("candidate_id")} '
             f'has no {AMP_SIDECAR_CLIP_PREFIX}; stage it with workers/amp_import_moments.py.'
         )
-    return f'{prefix}-{start_s:.3f}-{end_s:.3f}.mp4'
+    return f'{prefix}-{start_s:.3f}-{end_s:.3f}{suffix}.mp4'
 
 
 def build_caption_srt_text(cur, recording_id: int, clip_t0_abs_s: float,
@@ -1294,13 +1294,24 @@ def fetch_candidate(cur, candidate_id: int) -> dict:
     }
 
 
-def render_from_slice(candidate_id: int) -> int:
+# CLPR-AMP-04 (ruling ep1-board-caption-button-real-on-off-switch-clean-master-
+# plus-captioned-twin-2026-10-07): amp mode only, --variant nocaps renders the
+# SAME approved candidate through this same path with captions off, named
+# <prefix>-<start>-<end>-NOCAPS.mp4. It writes no clips row: clips holds one
+# render per candidate, and that row is the approved captioned clip.
+AMP_VARIANTS = ('nocaps',)
+
+
+def render_from_slice(candidate_id: int, variant: str | None = None) -> int:
     run_id = f'render_from_slice_{dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
 
     slices_dir = require_env('CLPR_SLICES_DIR')
     # AMP MODE: own output dir (no default), own ffmpeg probed once, both
     # before any database contact. amp_ffmpeg is None with amp mode off.
     amp_ffmpeg: str | None = None
+    if variant is not None and not db.amp_mode():
+        raise RuntimeError(f'AMP_VARIANT_REQUIRES_AMP_MODE: --variant {variant} runs only '
+                           'with CLPR_AMP_MODE=1')
     if db.amp_mode():
         out_dir = Path(require_env(AMP_RENDER_OUT_ENV))
         amp_ffmpeg = resolve_amp_ffmpeg()
@@ -1466,7 +1477,8 @@ def render_from_slice(candidate_id: int) -> int:
 
         out_dir.mkdir(parents=True, exist_ok=True)
         if amp_ffmpeg is not None:
-            out_path = out_dir / amp_clip_name(sidecar, eff_start_s, eff_end_s)
+            out_path = out_dir / amp_clip_name(sidecar, eff_start_s, eff_end_s,
+                                               '-NOCAPS' if variant == 'nocaps' else '')
         else:
             out_path = out_dir / deliver_approved.delivered_name(
                 cand['session_label'], cand['start_s'], cand['category'], candidate_id,
@@ -1496,6 +1508,10 @@ def render_from_slice(candidate_id: int) -> int:
         # ---- D-063 captions: build the SRT and splice ONE filter in ---------
         # Everything in this block is skipped entirely when the flag is 0.
         captions_requested = 1 if cand['burn_captions'] == 1 else 0
+        if variant == 'nocaps':
+            print(f'AMP_VARIANT nocaps candidate={candidate_id} captions_off=1 '
+                  f'(burn_captions={cand["burn_captions"]} not used)')
+            captions_requested = 0
         captions_burned = 0
         captions_cue_count = None
 
@@ -1703,6 +1719,11 @@ def render_from_slice(candidate_id: int) -> int:
             # (charter gate 4: a contract change is a breaking change until
             # every consumer is swept, and the stalest consumer is the row
             # itself).
+            if variant is not None:
+                print(f'RESULT render_from_slice candidate={candidate_id} ok=1 '
+                      f'file="{out_path}" duration_s={duration_s:.3f} variant={variant} '
+                      'clips_row_written=0')
+                return 0
             cur.execute(
                 '''
                 INSERT INTO clips(candidate_id, file_path, duration_s, state, created_by_run, created_at,
@@ -1789,12 +1810,14 @@ def parse_args() -> argparse.Namespace:
         description='Render one approved candidate to 9:16 vertical MP4 from its pre-staged slice (D-053)'
     )
     parser.add_argument('--candidate-id', type=int, required=True)
+    parser.add_argument('--variant', choices=AMP_VARIANTS, default=None,
+                        help='amp mode only: render a variant of the approved clip (nocaps)')
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    return render_from_slice(args.candidate_id)
+    return render_from_slice(args.candidate_id, args.variant)
 
 
 if __name__ == '__main__':
