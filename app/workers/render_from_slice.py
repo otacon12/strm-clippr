@@ -168,6 +168,44 @@ FILTER_COMPLEX_D023_BODY = (
 )
 FILTER_COMPLEX_D023 = FILTER_COMPLEX_D023_BODY + '[v]'
 
+
+def _swap_once(text: str, old: str, new: str) -> str:
+    """`text` with its ONE occurrence of `old` replaced; anything else is a
+    build error, so an amp variant can never silently stop matching the
+    string it was derived from."""
+    if text.count(old) != 1:
+        raise AssertionError(f'expected exactly one {old!r} in {text!r}')
+    return text.replace(old, new)
+
+
+# ---------------------------------------------------------------------------
+# AMP MODE (CLPR-AMP-01; ruling clpr-amp-mode-eight-changes-approved-amp-
+# project-only-2026-10-07, items 2, 3, 6; switch db.amp_mode(), CLPR_AMP_MODE=1).
+# Every value below is used ONLY when amp mode is on; with it off, the argv is
+# the pre-amp one byte for byte.
+#   - ffmpeg: the binary named by CLPR_AMP_FFMPEG, whose `-filters` must list
+#     `subtitles` (probed once per run, before any database contact).
+#   - D-023 unchanged except fps=30 -> fps=24 (and the encode's -r 30 -> -r 24).
+#   - captions: the D-063 force_style with exactly Outline=0, Shadow=0 (a-S1).
+#   - audio: two-pass loudnorm to -14 LUFS integrated, true peak <= -1 dBTP.
+#   - output dir: CLPR_AMP_RENDER_OUT, no default.
+# ---------------------------------------------------------------------------
+AMP_FFMPEG_ENV = 'CLPR_AMP_FFMPEG'
+AMP_RENDER_OUT_ENV = 'CLPR_AMP_RENDER_OUT'
+AMP_FPS = 24
+FILTER_COMPLEX_D023_BODY_AMP = _swap_once(FILTER_COMPLEX_D023_BODY, 'fps=30', f'fps={AMP_FPS}')
+AMP_CAPTION_STROKE_OFF = ('Outline=1.6,Shadow=0.8', 'Outline=0,Shadow=0')
+AMP_LOUDNORM_I = -14.0
+AMP_LOUDNORM_TP = -1.0
+# loudnorm's own default LRA target. Raised to the measured LRA when the
+# window's range is wider, so the second pass is never pushed into dynamic
+# range compression by the LRA target alone (only a true-peak overshoot can
+# do that, and loudnorm reports which mode it used).
+AMP_LOUDNORM_LRA_DEFAULT = 7.0
+AMP_LOUDNORM_LRA_MAX = 50.0
+# loudnorm outputs 192 kHz; resample back for the AAC encode.
+AMP_AUDIO_RATE = 48000
+
 # THE CAPTION STYLE, IN libass UNITS, MEASURED ON THE REAL SERVER RENDERER.
 #
 # Every number here was calibrated against the n8n container's own ffmpeg
@@ -481,17 +519,23 @@ def escape_filter_value(value: str) -> str:
     return ''.join(('\\' + ch) if ch in FILTER_ESCAPE_PASS1 else ch for ch in inner)
 
 
-def subtitles_filter(srt_path: str, caption_color: str | None = None) -> str:
+def subtitles_filter(srt_path: str, caption_color: str | None = None,
+                     amp: bool = False) -> str:
     """The single filter appended to the D-023 chain when captions are on.
 
     caption_color (clip_candidates.caption_color, D-074) is None on every
     pre-D-074 candidate and on any candidate the operator never touched, and
     None reproduces CAPTION_FORCE_STYLE's original literal byte for byte via
     build_caption_force_style -- see that function.
+
+    amp=True (amp mode only) changes exactly Outline and Shadow to 0.
     """
+    style = build_caption_force_style(caption_color)
+    if amp:
+        style = _swap_once(style, *AMP_CAPTION_STROKE_OFF)
     return (
         f'subtitles=filename={escape_filter_value(str(srt_path))}'
-        f':force_style={escape_filter_value(build_caption_force_style(caption_color))}'
+        f':force_style={escape_filter_value(style)}'
     )
 
 
@@ -712,15 +756,18 @@ def hook_subtitles_filter(ass_path) -> str:
     return f'subtitles=filename={escape_filter_value(str(ass_path))}'
 
 
-def ffmpeg_has_subtitles_filter() -> bool:
+def ffmpeg_has_subtitles_filter(ffmpeg_bin: str = 'ffmpeg') -> bool:
     """Does THIS ffmpeg actually carry the subtitles filter (libass)?
 
     Probed, never assumed: the operator's Mac ffmpeg is built without libass
     and physically cannot burn anything, while the n8n container's can. A probe
     that cannot itself fail loudly is not a probe (charter 1.5 gate 2), so a
     failing `ffmpeg -filters` raises rather than quietly reporting False.
+
+    ffmpeg_bin defaults to the PATH 'ffmpeg' every existing caller probes;
+    amp mode passes CLPR_AMP_FFMPEG.
     """
-    proc = run_capture(['ffmpeg', '-hide_banner', '-filters'])
+    proc = run_capture([ffmpeg_bin, '-hide_banner', '-filters'])
     for line in (proc.stdout or '').splitlines():
         parts = line.split()
         # Every filter line is "<flags> <name> <io> <description>".
@@ -761,6 +808,87 @@ def require_subtitles_capability(candidate_id: int, feature: str = 'captions') -
         'libass), or install an ffmpeg build that includes libass on this machine, or '
         'untick captions for this clip in the review UI.'
     )
+
+
+def resolve_amp_ffmpeg() -> str:
+    """Amp mode: the ffmpeg named by CLPR_AMP_FFMPEG, after ONE `-filters`
+    probe proves it has the `subtitles` filter. Unset, unrunnable or
+    without libass fails loudly before any database contact."""
+    ffmpeg_bin = require_env(AMP_FFMPEG_ENV)
+    if not ffmpeg_has_subtitles_filter(ffmpeg_bin):
+        raise RuntimeError(
+            f'AMP_FFMPEG_NO_SUBTITLES: {AMP_FFMPEG_ENV}="{ffmpeg_bin}" on host '
+            f'"{socket.gethostname()}" has no `subtitles` filter in `-filters` (built '
+            'without libass), so it cannot burn captions. Amp mode refuses to render '
+            f'with it: set {AMP_FFMPEG_ENV} to an ffmpeg whose `-filters` lists subtitles.'
+        )
+    return ffmpeg_bin
+
+
+def amp_loudnorm_measure(ffmpeg_bin: str, slice_path: Path, offset_s: float,
+                         cut_duration_s: float) -> dict:
+    """Amp mode, loudnorm pass 1: measure the EXACT window the encode will cut
+    (same -ss/-t/-i). Writes nothing. No audio stream, or a measurement that
+    is not finite (silence), fails loudly."""
+    proc = run_capture([
+        ffmpeg_bin, '-hide_banner', '-nostats',
+        '-ss', f'{offset_s:.3f}',
+        '-t', f'{cut_duration_s:.3f}',
+        '-i', str(slice_path),
+        '-map', '0:a:0',
+        '-af', f'loudnorm=I={AMP_LOUDNORM_I}:TP={AMP_LOUDNORM_TP}:print_format=json',
+        '-f', 'null', '-',
+    ])
+    match = re.search(r'\{\s*"input_i".*?\}', proc.stderr or '', re.S)
+    if not match:
+        raise RuntimeError(
+            f'AMP_LOUDNORM_UNMEASURABLE: loudnorm pass 1 printed no JSON for {slice_path}'
+        )
+    measured = json.loads(match.group(0))
+    keys = ('input_i', 'input_tp', 'input_lra', 'input_thresh', 'target_offset')
+    values = {}
+    for key in keys:
+        try:
+            values[key] = float(measured[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f'AMP_LOUDNORM_UNMEASURABLE: loudnorm pass 1 {key}={measured.get(key)!r}'
+            ) from exc
+        if not math.isfinite(values[key]):
+            raise RuntimeError(
+                f'AMP_LOUDNORM_UNMEASURABLE: loudnorm pass 1 {key}={measured.get(key)!r} '
+                f'(silent or empty audio in the window of {slice_path})'
+            )
+    print(
+        'AMP_LOUDNORM_PASS1 ' + ' '.join(f'{k}={measured[k]}' for k in keys)
+    )
+    return values
+
+
+def amp_loudnorm_filter(measured: dict) -> str:
+    """Amp mode, loudnorm pass 2: the -af chain for the encode."""
+    lra = min(AMP_LOUDNORM_LRA_MAX, max(AMP_LOUDNORM_LRA_DEFAULT, measured['input_lra']))
+    return (
+        f'loudnorm=I={AMP_LOUDNORM_I}:TP={AMP_LOUDNORM_TP}:LRA={lra}'
+        f':measured_I={measured["input_i"]}:measured_TP={measured["input_tp"]}'
+        f':measured_LRA={measured["input_lra"]}:measured_thresh={measured["input_thresh"]}'
+        f':offset={measured["target_offset"]}:linear=true:print_format=summary'
+        f',aresample={AMP_AUDIO_RATE}'
+    )
+
+
+def print_amp_loudnorm_summary(stderr: str) -> None:
+    """Echo loudnorm pass 2's own summary lines (what it output, and whether
+    it ran Linear or fell back to Dynamic) from the encode's stderr."""
+    wanted = ('Output Integrated', 'Output True Peak', 'Output LRA', 'Normalization Type')
+    found = [
+        line.strip() for line in (stderr or '').splitlines()
+        if line.strip().startswith(wanted)
+    ]
+    if not found:
+        raise RuntimeError('AMP_LOUDNORM_NO_SUMMARY: loudnorm pass 2 printed no summary')
+    for line in found:
+        print(f'AMP_LOUDNORM_PASS2 {line}')
 
 
 def build_caption_srt_text(cur, recording_id: int, clip_t0_abs_s: float,
@@ -977,8 +1105,19 @@ def render_from_slice(candidate_id: int) -> int:
     run_id = f'render_from_slice_{dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")}'
 
     slices_dir = require_env('CLPR_SLICES_DIR')
-    out_dir = Path(os.environ.get('CLPR_RENDER_OUT', '/home/node/.n8n-files').strip()
-                   or '/home/node/.n8n-files')
+    # AMP MODE: own output dir (no default), own ffmpeg probed once, both
+    # before any database contact. amp_ffmpeg is None with amp mode off.
+    amp_ffmpeg: str | None = None
+    if db.amp_mode():
+        out_dir = Path(require_env(AMP_RENDER_OUT_ENV))
+        amp_ffmpeg = resolve_amp_ffmpeg()
+        print(
+            f'AMP_MODE on ffmpeg="{amp_ffmpeg}" out_dir="{out_dir}" fps={AMP_FPS} '
+            f'loudnorm_I={AMP_LOUDNORM_I} loudnorm_TP={AMP_LOUDNORM_TP}'
+        )
+    else:
+        out_dir = Path(os.environ.get('CLPR_RENDER_OUT', '/home/node/.n8n-files').strip()
+                       or '/home/node/.n8n-files')
 
     # D-063: declared out here so the OUTERMOST finally can remove the scratch
     # SRT on literally every exit path, not merely the ones around the encode.
@@ -1143,7 +1282,9 @@ def render_from_slice(candidate_id: int) -> int:
         # itself, byte for byte -- the D-074 refactor that lets captions AND
         # the hook chain onto the SAME linear filtergraph changes nothing on
         # the default path (asserted by the inert proof).
-        filter_stages = [FILTER_COMPLEX_D023_BODY]
+        filter_stages = [
+            FILTER_COMPLEX_D023_BODY if amp_ffmpeg is None else FILTER_COMPLEX_D023_BODY_AMP
+        ]
 
         # ---- D-063 captions: build the SRT and splice ONE filter in ---------
         # Everything in this block is skipped entirely when the flag is 0.
@@ -1154,7 +1295,9 @@ def render_from_slice(candidate_id: int) -> int:
         if captions_requested == 1:
             # Capability first: refuse before doing any work on a box that
             # cannot deliver what was asked (this is the Mac, in practice).
-            require_subtitles_capability(candidate_id)
+            # Amp mode already proved its own ffmpeg once (resolve_amp_ffmpeg).
+            if amp_ffmpeg is None:
+                require_subtitles_capability(candidate_id)
 
             # The clip's t=0 and length are the -ss/-t below, not a derivation.
             srt_text, captions_cue_count = build_caption_srt_text(
@@ -1176,7 +1319,9 @@ def render_from_slice(candidate_id: int) -> int:
                 with os.fdopen(fd, 'w', encoding='utf-8') as fh:
                     fh.write(srt_text)
                 srt_path = Path(tmp_name)
-                filter_stages.append(subtitles_filter(srt_path, cand['caption_color']))
+                filter_stages.append(subtitles_filter(
+                    srt_path, cand['caption_color'], amp=amp_ffmpeg is not None
+                ))
                 captions_burned = 1
                 print(
                     f'CAPTIONS_ON candidate={candidate_id} cues={captions_cue_count} '
@@ -1205,8 +1350,10 @@ def render_from_slice(candidate_id: int) -> int:
                 # Capability first, same discipline as captions -- but only
                 # once there is genuinely something to burn, so a machine
                 # without libass never fails a render that would have skipped
-                # the hook anyway (the no-kit case above).
-                require_subtitles_capability(candidate_id, feature='hook')
+                # the hook anyway (the no-kit case above). Amp mode already
+                # proved its own ffmpeg once (resolve_amp_ffmpeg).
+                if amp_ffmpeg is None:
+                    require_subtitles_capability(candidate_id, feature='hook')
 
                 ass_text = build_hook_ass_text(hook_text, cand['hook_color'], cut_duration_s)
                 fd, tmp_name = tempfile.mkstemp(
@@ -1223,6 +1370,17 @@ def render_from_slice(candidate_id: int) -> int:
                 )
 
         filter_complex = ','.join(filter_stages) + '[v]'
+
+        # AMP MODE audio: loudnorm pass 1 on the exact window, BEFORE the temp
+        # output exists, so a failed measurement leaves nothing behind.
+        amp_audio_args: list[str] = []
+        if amp_ffmpeg is not None:
+            amp_audio_args = [
+                '-af',
+                amp_loudnorm_filter(
+                    amp_loudnorm_measure(amp_ffmpeg, slice_path, offset_s, cut_duration_s)
+                ),
+            ]
 
         # D-055: ALWAYS trim — the slice carries SLICE_PAD_S headroom, so
         # rendering it whole would ship a ~20s-too-long clip. The trim is
@@ -1260,8 +1418,11 @@ def render_from_slice(candidate_id: int) -> int:
         os.close(tmp_fd)
         tmp_path = Path(tmp_name)
 
+        # Amp mode changes exactly three things in this argv: the binary,
+        # -r 30 -> -r 24, and the -af loudnorm chain (amp_audio_args, empty
+        # when off). With amp mode off the argv is the pre-amp one.
         ffmpeg_cmd = [
-            'ffmpeg',
+            'ffmpeg' if amp_ffmpeg is None else amp_ffmpeg,
             '-y',
             '-ss', f'{offset_s:.3f}',
             '-t', f'{cut_duration_s:.3f}',
@@ -1274,7 +1435,8 @@ def render_from_slice(candidate_id: int) -> int:
             '-crf', '18',
             '-profile:v', 'high',
             '-pix_fmt', 'yuv420p',
-            '-r', '30',
+            '-r', '30' if amp_ffmpeg is None else str(AMP_FPS),
+            *amp_audio_args,
             '-c:a', 'aac',
             '-b:a', '192k',
             '-movflags', '+faststart',
@@ -1284,6 +1446,8 @@ def render_from_slice(candidate_id: int) -> int:
         try:
             ffmpeg_proc = run_capture(ffmpeg_cmd)
             print(f'FFMPEG_EXIT_CODE {ffmpeg_proc.returncode}')
+            if amp_ffmpeg is not None:
+                print_amp_loudnorm_summary(ffmpeg_proc.stderr)
 
             # The encode succeeded (run_capture raises on a nonzero ffmpeg
             # exit, caught below) -- promote the temp file to out_path. Same
